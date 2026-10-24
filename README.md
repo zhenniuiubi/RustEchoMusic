@@ -41,7 +41,7 @@ cargo build -p echo-app
 ./package.bat      # release 构建 → 复制到 dist\EchoMusic.exe
 ```
 
-输出：`dist/EchoMusic.exe`（约 20 MB）。
+输出：`dist/EchoMusic.exe`（约 26 MB）。该产物不入库，发布时通过 GitHub Release 分发。
 
 release 构建通过 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`
 以 GUI 子系统链接，**启动时不会弹出 cmd 黑窗**（debug 构建保留控制台用于日志）。
@@ -119,3 +119,38 @@ cargo run -p echo-api --example debug      # 各接口原始响应
 | `settings.json` | 主题模式、主题色、音量、播放模式、音质等 |
 | `session.json` | 登录态（token / userid / 昵称 / 头像 / VIP） |
 | `library.json` | 收藏与播放历史 |
+
+## 环境与前置
+
+- Windows（当前仅适配 Windows；`echo-audio` 用 rodio，理论上可跨平台，但 UI 与构建脚本尚未验证其他平台）
+- Rust 1.85+ 与 **MSVC x64 工具链**（VS2022 生成工具 + Windows 10/11 SDK）
+- `build.bat` 里写死了本机的 MSVC / SDK 路径（MSVC `14.44.35207`、SDK `10.0.26100.0`）。
+  若你的版本号不同，改这三行即可（在「VS Installer → 各个组件」或 `C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\` 下确认实际版本）：
+
+  ```bat
+  set "MSVC_ROOT=...\VC\Tools\MSVC\<你的版本>"
+  set "SDK_ROOT=C:\Program Files (x86)\Windows Kits\10"
+  set "LIB=%MSVC_ROOT%\lib\x64;%SDK_ROOT%\Lib\<你的 SDK 版本>\ucrt\x64;..."
+  ```
+
+- 不要用 MSYS2 / Git Bash 的 `link.exe`（会与 MSVC 冲突）。`build.bat` 已把 MSVC 的 `bin\Hostx64\x64` 前置到 PATH 规避此问题。
+
+## 参考与致谢
+
+- [hoowhoami/EchoMusic](https://github.com/hoowhoami/EchoMusic) —— 本项目的原型（Electron + Vue 3 + TS），交互与视觉设计对齐它
+- [KuGouMusicApi](https://github.com/ku-gou/KuGouMusicApi) —— 接口签名与加密方案的参考实现
+- [GPUI](https://github.com/zed-industries/zed)（Zed 编辑器的 UI 框架）—— 本项目全部界面自绘基于它
+- rodio / symphonia / reqwest / qrcode 等 crate
+
+> 参考代码（原型与 KuGouMusicApi）**不包含在本仓库中**，请到各自原仓库查看，并遵守它们的许可协议。
+
+## 免责声明
+
+本项目是个人学习用途的桌面客户端实现，与酷狗音乐官方无任何关联，不使用任何官方 SDK 或授权接口。
+所涉及的接口调用均为对客户端已有公开行为的复现，**请勿用于任何商业或违法用途**。
+音乐版权归各自权利人所有，本项目不存储、不分发任何音频文件。
+
+## 许可
+
+尚未选择开源许可证，默认**保留所有权利**（即 GitHub 的默认状态，他人不可复制、分发或修改）。
+如果你希望开源，可自行添加 `LICENSE` 文件（如 MIT）并在此处注明。
