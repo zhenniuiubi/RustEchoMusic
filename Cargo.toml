@@ -1,0 +1,85 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/echo-core",
+    "crates/echo-api",
+    "crates/echo-audio",
+    "crates/echo-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/hoowhoami/EchoMusic"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+# KRC 歌词解密：base64 → XOR → zlib inflate
+flate2 = "1"
+futures = "0.3"
+log = "0.4"
+parking_lot = "0.12"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+    "gzip",
+    "brotli",
+    "deflate",
+    "blocking",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+smallvec = "1"
+smol = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+url = "2"
+unicode-segmentation = "1"
+
+# GPUI (Zed UI framework)
+gpui = { version = "0.2.2", features = ["windows-manifest"] }
+
+# --- Windows 平台能力（窗口图标 / 托盘 / 最大化还原）---
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# 系统媒体控制（SMTC）：只有 windows crate 提供 WinRT 绑定
+windows = { version = "0.61", features = [
+    "Media",
+    "Media_Control",
+    "Storage_Streams",
+    "Win32_System_WinRT",
+] }
+raw-window-handle = "0.6"
+
+# --- audio ---
+cpal = "0.16"
+rodio = "0.21"
+symphonia = { version = "0.5", features = ["all-codecs", "all-formats"] }
+
+# --- image / misc ---
+image = "0.25"
+md-5 = "0.10"
+base64 = "0.22"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+rsa = { version = "0.9", features = ["sha2"] }
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

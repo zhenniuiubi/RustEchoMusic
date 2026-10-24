@@ -1,0 +1,18 @@
+[package]
+name = "echo-audio"
+description = "EchoMusic audio playback engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+echo-core = { path = "../echo-core" }
+
+anyhow.workspace = true
+cpal.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+rodio.workspace = true
+serde.workspace = true
+thiserror.workspace = true

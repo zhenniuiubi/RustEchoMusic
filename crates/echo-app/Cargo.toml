@@ -1,0 +1,37 @@
+[package]
+name = "echo-app"
+description = "EchoMusic desktop application (gpui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "echo-music"
+path = "src/main.rs"
+
+[dependencies]
+echo-api = { path = "../echo-api" }
+echo-audio = { path = "../echo-audio" }
+echo-core = { path = "../echo-core" }
+
+anyhow.workspace = true
+chrono.workspace = true
+env_logger = "0.11"
+futures.workspace = true
+gpui.workspace = true
+image.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+tokio.workspace = true
+unicode-segmentation.workspace = true
+qrcode = { version = "0.14.1", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+windows.workspace = true
+raw-window-handle.workspace = true

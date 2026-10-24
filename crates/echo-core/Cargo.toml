@@ -1,0 +1,19 @@
+[package]
+name = "echo-core"
+description = "EchoMusic core: models, settings, persistence and shared utilities"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+log.workspace = true
+md-5.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
