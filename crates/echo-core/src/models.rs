@@ -335,25 +335,6 @@ impl Lyric {
         }
         found
     }
-
-    /// 一行里当前唱到第几个字（用于逐字高亮）。
-    pub fn word_index_at(&self, line: usize, ms: f64) -> Option<usize> {
-        let line = self.lines.get(line)?;
-        if line.words.is_empty() {
-            return None;
-        }
-        let t = (ms * 1000.0) as i64 + self.offset_ms;
-        let base = line.time_ms as i64;
-        let mut found = None;
-        for (i, w) in line.words.iter().enumerate() {
-            if base + w.start_ms as i64 <= t {
-                found = Some(i);
-            } else {
-                break;
-            }
-        }
-        found
-    }
 }
 
 /// MV 信息（`/kmr/v1/audio/mv`）。
@@ -369,4 +350,21 @@ pub struct MvInfo {
     pub duration: u64,
     pub hit: u64,
     pub desc: String,
+}
+
+/// MV 搜索结果条目（`/v1/search/mv`，complexsearch）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MvMeta {
+    pub mvhash: String,
+    pub mv_id: String,
+    pub title: String,
+    pub singer: String,
+    /// 秒
+    pub duration: u64,
+    /// 播放量（HistoryHeat）
+    pub heat: u64,
+    /// 清晰度标记（如 "1080P"）
+    pub quality: String,
+    /// 发布日期（如 2003-07-31）
+    pub publish_date: String,
 }

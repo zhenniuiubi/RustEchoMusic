@@ -384,6 +384,65 @@ impl KuGouClient {
         Ok(crate::normalize::parse_artist_list(&list))
     }
 
+    /// 搜索 MV（`/v1/search/mv`，complexsearch；第三期搜索补全）。
+    pub async fn search_mvs(
+        &self,
+        keyword: &str,
+        page: i64,
+        pagesize: i64,
+    ) -> anyhow::Result<Vec<echo_core::MvMeta>> {
+        let mut spec = RequestSpec {
+            url: "/v1/search/mv".into(),
+            encrypt_type: EncryptType::Android,
+            ..Default::default()
+        };
+        spec.params.insert("keyword".into(), keyword.into());
+        spec.params.insert("page".into(), page.to_string());
+        spec.params.insert("pagesize".into(), pagesize.to_string());
+        spec.params.insert("platform".into(), "AndroidFilter".into());
+        spec.x_router = Some("complexsearch.kugou.com".into());
+
+        let res = self.request(spec).await?;
+        let list = res
+            .pointer("/data/lists")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mvs = list
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        let s = |k: &str| {
+                            m.get(k)
+                                .and_then(|x| x.as_str())
+                                .unwrap_or_default()
+                                .to_string()
+                        };
+                        let mvhash = s("MvHash");
+                        let title = s("MvName");
+                        if mvhash.is_empty() || title.is_empty() {
+                            return None;
+                        }
+                        Some(echo_core::MvMeta {
+                            mvhash,
+                            mv_id: match m.get("MvID") {
+                                Some(x) => x.to_string().trim_matches('"').to_string(),
+                                None => String::new(),
+                            },
+                            title,
+                            singer: s("SingerName"),
+                            duration: m.get("Duration").and_then(|x| x.as_u64()).unwrap_or(0),
+                            heat: m.get("HistoryHeat").and_then(|x| x.as_u64()).unwrap_or(0),
+                            quality: s("MvHashMark"),
+                            publish_date: s("PublishDate"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(mvs)
+    }
+
     /// 歌单详情（原 getPlaylistDetail → `/v3/get_list_info`）。
     pub async fn playlist_detail(&self, global_collection_id: &str) -> anyhow::Result<Option<Playlist>> {
         let auth = self.auth();
@@ -1830,28 +1889,6 @@ impl KuGouClient {
         Ok(ComplexSearch { songs, playlists, albums, artists })
     }
 
-    /// 免费听（概念版）：`/concepts/v1/ai/recommend_song`。
-    pub async fn free_listen_songs(&self, page: i64, pagesize: i64) -> anyhow::Result<Vec<Song>> {
-        let spec = RequestSpec {
-            url: "/concepts/v1/ai/recommend_song".into(),
-            body: Some(serde_json::json!({
-                "apiver": 2,
-                "source": 2,
-                "page": page,
-                "pagesize": pagesize,
-            })),
-            encrypt_type: EncryptType::Android,
-            ..Default::default()
-        };
-        let res = self.request(spec).await?;
-        let list = res
-            .pointer("/data/list")
-            .or_else(|| res.pointer("/data/song_list"))
-            .or_else(|| res.pointer("/data"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        Ok(parse_songs(&list))
-    }
 
     /// 歌曲对应的 MV（`/kmr/v1/audio/mv`，x-router openapi.kugou.com）。
     pub async fn audio_mv(&self, album_audio_id: i64) -> anyhow::Result<Option<echo_core::MvInfo>> {

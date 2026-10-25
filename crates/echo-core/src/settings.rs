@@ -51,6 +51,45 @@ pub enum ThemeMode {
     System,
 }
 
+/// 主窗口背景特效（Windows Mica 云母 / Desktop Acrylic 亚克力）。
+///
+/// 具体落在哪种系统材质由 `echo-app` 的 `windows_backdrop` 模块按系统版本
+/// 决定（Win11 22H2+ 走 DWM 系统背景 API，更老的系统降级磨砂或关闭）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackdropMode {
+    /// 跟随系统（Win11 22H2+ 由 DWM 按系统设置决定；其余系统降级为磨砂）
+    #[default]
+    System,
+    /// 云母（Mica）
+    Mica,
+    /// 亚克力（Desktop Acrylic）
+    Acrylic,
+    /// 关闭特效（普通不透明背景）
+    Off,
+}
+
+impl BackdropMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            BackdropMode::System => "跟随系统",
+            BackdropMode::Mica => "云母 (Mica)",
+            BackdropMode::Acrylic => "亚克力 (Acrylic)",
+            BackdropMode::Off => "关闭特效",
+        }
+    }
+
+    /// 设置页展示用的简短标签。
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            BackdropMode::System => "跟随系统",
+            BackdropMode::Mica => "云母",
+            BackdropMode::Acrylic => "亚克力",
+            BackdropMode::Off => "关闭",
+        }
+    }
+}
+
 /// 应用设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -85,6 +124,8 @@ pub struct Settings {
     pub desktop_lyric: bool,
     /// 桌面歌词窗口位置（x, y；None 时自动居中贴底）
     pub desktop_lyric_pos: Option<(f64, f64)>,
+    /// 主窗口背景特效模式（Windows Mica / Acrylic）
+    pub backdrop: BackdropMode,
 }
 
 impl Default for Settings {
@@ -107,6 +148,7 @@ impl Default for Settings {
             output_device: String::new(),
             desktop_lyric: false,
             desktop_lyric_pos: None,
+            backdrop: BackdropMode::default(),
         }
     }
 }

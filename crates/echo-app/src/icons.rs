@@ -62,7 +62,18 @@ pub fn icon_svg(name: &str) -> Option<&'static str> {
         "icons/restore.svg" => icon!(
             r#"<rect x="8" y="8" width="12" height="12" rx="1"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8"/>"#
         ),
+        // 桌面歌词开关：一个 A（歌词首字母）
+        "icons/lyric.svg" => icon!(r#"<path d="M4 20 12 5l8 15"/><path d="M7.5 14.5h9"/>"#),
         "icons/close.svg" => icon!(r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#),
+        "icons/expand.svg" => icon!(
+            r#"<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>"#),
+
+        "icons/pip.svg" => icon!(
+            r#"<rect x="3" y="5" width="18" height="14" rx="2"/><rect x="12" y="11" width="8" height="7" rx="1" fill="currentColor" stroke="none"/>"#
+        ),
+        "icons/pin.svg" => icon!(
+            r#"<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z"/>"#
+        ),
         "icons/plus.svg" => icon!(r#"<path d="M12 5v14"/><path d="M5 12h14"/>"#),
         "icons/chevron-down.svg" => icon!(r#"<path d="m6 9 6 6 6-6"/>"#),
         "icons/music-note.svg" => icon!(r#"<circle cx="8" cy="18" r="3"/><circle cx="20" cy="16" r="3"/><path d="M11 18V5l12-2v13"/>"#),

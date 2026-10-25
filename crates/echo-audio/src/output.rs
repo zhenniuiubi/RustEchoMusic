@@ -36,8 +36,26 @@ pub struct CallbackCtl {
     pub rt_tried: AtomicBool,
     /// 曲目已解码完、环形缓冲正在放水（此时的「空」是正常收尾，不算欠载）
     pub draining: AtomicBool,
+    /// 输出流报错（设备断开 / 失效等）：由流错误回调置位，控制线程消费后自动暂停
+    pub stream_failed: AtomicBool,
+    /// 实时频谱：16 个对数频段的归一化能量（f32 bits，0..1，仅回调线程写）
+    pub spec_pow: [AtomicU32; 16],
+    /// Goertzel 滤波器组状态（s1/s2 交错，f32 bits；仅回调线程读写）
+    spec_st: [AtomicU32; 32],
+    /// 滤波器组已推进的样本数（半采样率计数）
+    spec_n: AtomicU32,
+    /// Goertzel 系数（2cos w，构造时按 24kHz 半采样率算好）
+    spec_coeff: [f32; 16],
     pub diag: Diag,
 }
+
+/// 频谱频段中心频率（Hz，对数分布 45Hz–11kHz；按半采样率 24kHz 设计）。
+const SPEC_FREQS: [f32; 16] = [
+    45.0, 66.0, 96.0, 140.0, 205.0, 299.0, 437.0, 638.0, 932.0, 1361.0, 1987.0, 2901.0, 4235.0,
+    6184.0, 9028.0, 11000.0,
+];
+/// 每段窗口长度（推进样本数，半采样率下 ≈ 21ms 窗）
+const SPEC_WINDOW: u32 = 512;
 
 impl CallbackCtl {
     pub fn new(volume: f64) -> Self {
@@ -50,6 +68,13 @@ impl CallbackCtl {
             speed: AtomicU32::new(1.0f32.to_bits()),
             rt_tried: AtomicBool::new(false),
             draining: AtomicBool::new(false),
+            stream_failed: AtomicBool::new(false),
+            spec_pow: std::array::from_fn(|_| AtomicU32::new(0)),
+            spec_st: std::array::from_fn(|_| AtomicU32::new(0)),
+            spec_n: AtomicU32::new(0),
+            spec_coeff: std::array::from_fn(|i| {
+                2.0 * (std::f32::consts::TAU * SPEC_FREQS[i] / 48_000.0).cos()
+            }),
             diag: Diag::default(),
         }
     }
@@ -95,6 +120,47 @@ impl CallbackCtl {
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }
+
+    /// 实时频谱：喂一个样本进 Goertzel 滤波器组（调用方按半采样率节流）。
+    ///
+    /// 每段窗口走满后取能量（对数刻度 0..1，带峰值衰减），供 UI 画柱。
+    /// 全程只碰原子量、无分配，RT 安全。
+    fn spec_feed(&self, v: f32) {
+        let mut power = [0f32; 16];
+        let mut done = false;
+        for i in 0..16 {
+            let s1 = f32::from_bits(self.spec_st[i * 2].load(Ordering::Relaxed));
+            let s2 = f32::from_bits(self.spec_st[i * 2 + 1].load(Ordering::Relaxed));
+            let s0 = v + self.spec_coeff[i] * s1 - s2;
+            self.spec_st[i * 2].store(s1.to_bits(), Ordering::Relaxed);
+            self.spec_st[i * 2 + 1].store(s0.to_bits(), Ordering::Relaxed);
+            power[i] = s0 * s0 + s1 * s1 - self.spec_coeff[i] * s0 * s1;
+        }
+        let n = self.spec_n.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= SPEC_WINDOW {
+            self.spec_n.store(0, Ordering::Relaxed);
+            done = true;
+        }
+        if done {
+            for i in 0..16 {
+                // 对数映射：功率 1e-9..1e-2 → 0..1；峰值缓降避免闪烁
+                let lvl = ((power[i] + 1e-12).log10() + 9.0) / 7.0;
+                let lvl = lvl.clamp(0.0, 1.0);
+                let prev = f32::from_bits(self.spec_pow[i].load(Ordering::Relaxed));
+                let next = lvl.max(prev * 0.78);
+                self.spec_pow[i].store(next.to_bits(), Ordering::Relaxed);
+                self.spec_st[i * 2].store(0, Ordering::Relaxed);
+                self.spec_st[i * 2 + 1].store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// 读取当前频谱（16 段 0..1）。
+    pub fn spectrum(&self) -> [f32; 16] {
+        std::array::from_fn(|i| {
+            f32::from_bits(self.spec_pow[i].load(Ordering::Relaxed))
+        })
+    }
 }
 
 /// 已打开的输出设备（持有 `Stream` 保活，drop 即停）。
@@ -112,10 +178,36 @@ pub struct OutputDevice {
 ///
 /// 环形缓冲在这里创建：容量需要按设备采样率/声道数换算（默认装 2 秒）。
 pub fn open(ctl: Arc<CallbackCtl>, want_frames: u32, ring_secs: f32) -> Result<OutputDevice, String> {
+    open_named(ctl, want_frames, ring_secs, None)
+}
+
+/// 按设备名打开输出设备（`None` = 系统默认；找不到同名设备时回退默认）。
+pub fn open_named(
+    ctl: Arc<CallbackCtl>,
+    want_frames: u32,
+    ring_secs: f32,
+    device_name: Option<&str>,
+) -> Result<OutputDevice, String> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| "找不到默认输出设备".to_string())?;
+    let device = match device_name {
+        Some(name) if !name.is_empty() => {
+            let found = host
+                .output_devices()
+                .ok()
+                .and_then(|mut ds| ds.find(|d| d.name().ok().as_deref() == Some(name)));
+            match found {
+                Some(d) => d,
+                None => {
+                    log::warn!("输出设备「{name}」不存在，回退系统默认");
+                    host.default_output_device()
+                        .ok_or_else(|| "找不到默认输出设备".to_string())?
+                }
+            }
+        }
+        _ => host
+            .default_output_device()
+            .ok_or_else(|| "找不到默认输出设备".to_string())?,
+    };
     let supported = device
         .default_output_config()
         .map_err(|e| format!("读取默认输出配置失败: {e}"))?;
@@ -181,33 +273,47 @@ fn build(
     ctl: Arc<CallbackCtl>,
     channels: u16,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
+    // 错误回调：设备断开/失效等。立刻静音并置标志，控制线程消费后自动暂停
+    // （P1「设备断开自动暂停」；不做自动重连，恢复由用户在设置里重选设备）
+    let err_ctl = ctl.clone();
+    let on_error = move |e: cpal::StreamError| {
+        log::error!("audio stream error: {e}");
+        err_ctl.stream_failed.store(true, Ordering::Relaxed);
+        err_ctl.set_paused(true);
+    };
     match format {
         cpal::SampleFormat::F32 => device.build_output_stream(
             cfg,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| fill(data, &ring, &ctl, channels),
-            move |e| log::error!("audio stream error: {e}"),
+            on_error,
             None,
         ),
         cpal::SampleFormat::I16 => device.build_output_stream(
             cfg,
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| fill(data, &ring, &ctl, channels),
-            move |e| log::error!("audio stream error: {e}"),
+            on_error,
             None,
         ),
         cpal::SampleFormat::U16 => device.build_output_stream(
             cfg,
             move |data: &mut [u16], _: &cpal::OutputCallbackInfo| fill(data, &ring, &ctl, channels),
-            move |e| log::error!("audio stream error: {e}"),
+            on_error,
             None,
         ),
         other => {
             log::warn!("不支持的设备采样格式 {other:?}，尝试按 f32 打开");
+            let err_ctl = ctl.clone();
+            let on_error = move |e: cpal::StreamError| {
+                log::error!("audio stream error: {e}");
+                err_ctl.stream_failed.store(true, Ordering::Relaxed);
+                err_ctl.set_paused(true);
+            };
             device.build_output_stream(
                 cfg,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     fill(data, &ring, &ctl, channels)
                 },
-                move |e| log::error!("audio stream error: {e}"),
+                on_error,
                 None,
             )
         }
@@ -281,6 +387,10 @@ where
             let a = scratch[i0.min(got - 1)];
             let b = scratch[(i0 + 1).min(got - 1)];
             let v = a + (b - a) * frac;
+            // 频谱：每 2 个输出样本喂 1 个（半采样率足够 16 段可视化）
+            if (written + i) & 1 == 0 {
+                ctl.spec_feed(v);
+            }
             // 淡变（逐样本推进，步长极小，听感上是平滑的）
             if fade != fade_target {
                 if fade < fade_target {

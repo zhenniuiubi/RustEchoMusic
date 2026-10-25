@@ -11,11 +11,11 @@ pub use device::DeviceIdentity;
 pub use library::{Library, LibraryStore, ListeningStats, PlayLog};
 pub use queue::{QueueStore, SavedQueue};
 pub use models::{
-    Album, Artist, Lyric, LyricLine, LyricWord, MvInfo, Playlist, RankMeta, Song,
+    Album, Artist, Lyric, LyricLine, LyricWord, MvInfo, MvMeta, Playlist, RankMeta, Song,
     SongArtist, SongTag, User,
 };
 pub use session::{Session, SessionStore};
-pub use settings::{PlayMode, Settings, SettingsStore, ThemeMode};
+pub use settings::{BackdropMode, PlayMode, Settings, SettingsStore, ThemeMode};
 
 use std::path::PathBuf;
 

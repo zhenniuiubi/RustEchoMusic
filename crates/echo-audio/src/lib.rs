@@ -88,6 +88,8 @@ enum Cmd {
     Pause,
     Stop,
     Seek(f64),
+    /// 运行中切换输出设备（P0：不再需要重启）。`None` = 回到系统默认。
+    SwitchDevice(Option<String>),
     Tick,
 }
 
@@ -179,6 +181,14 @@ impl AudioEngine {
         self.send(Cmd::Seek(seconds.max(0.0)));
     }
 
+    /// 运行中切换输出设备（`None`/空 = 回到系统默认）。
+    ///
+    /// 切换会重建输出流；正在播放的曲目用内存里缓存的音频字节在新设备上
+    /// 从当前位置继续（采样率不同的设备会重新解码归一）。
+    pub fn switch_device(&self, name: Option<&str>) {
+        self.send(Cmd::SwitchDevice(name.map(str::to_string)));
+    }
+
     /// 设置音量 0.0 - 1.0（直接写原子，回调下一帧生效）。
     pub fn set_volume(&self, volume: f64) {
         self.ctl.set_volume(volume);
@@ -194,6 +204,11 @@ impl AudioEngine {
 
     pub fn speed(&self) -> f64 {
         self.ctl.speed() as f64
+    }
+
+    /// 当前实时频谱（16 段 0..1；第四期可视化）。
+    pub fn spectrum(&self) -> [f32; 16] {
+        self.ctl.spectrum()
     }
 
     /// 淡入（新曲目开始时调用，避免开头爆音）。
@@ -258,7 +273,7 @@ fn control_loop(
     active_request: Arc<Mutex<u64>>,
     ctl: Arc<CallbackCtl>,
 ) -> anyhow::Result<()> {
-    let out = match output::open(ctl.clone(), want_buffer_frames(), RING_SECS) {
+    let mut out = match output::open(ctl.clone(), want_buffer_frames(), RING_SECS) {
         Ok(o) => o,
         Err(e) => {
             log::error!("音频输出初始化失败: {e}");
@@ -266,7 +281,7 @@ fn control_loop(
             return Ok(());
         }
     };
-    let ring = out.ring.clone();
+    let mut ring = out.ring.clone();
     log::info!(
         "audio engine ready: {}Hz {}ch ring={} 样本",
         out.sample_rate,
@@ -277,6 +292,8 @@ fn control_loop(
     let mut state = PlaybackState::Idle;
     let mut want_play = false;
     let mut decoder: Option<DecoderHandle> = None;
+    // 当前曲目的音频字节缓存：设备切换后用它在新设备上原地续播
+    let mut loaded_bytes: Option<Vec<u8>> = None;
     // 当前曲目已经播放的起点（seek 后会变化），进度 = base + played/rate
     let mut seek_base = 0.0f64;
     let mut target_ms = decode::TARGET_MIN_MS;
@@ -365,6 +382,7 @@ fn control_loop(
                     out.sample_rate,
                     target_ms,
                 ));
+                loaded_bytes = Some(bytes.clone());
                 let join = decode::spawn(bytes, shared.clone(), ring.clone());
                 decoder = Some(DecoderHandle {
                     shared,
@@ -406,6 +424,7 @@ fn control_loop(
                 if let Some(mut d) = decoder.take() {
                     d.stop();
                 }
+                loaded_bytes = None;
                 ring.clear();
                 ctl.set_paused(true);
                 seek_base = 0.0;
@@ -429,7 +448,101 @@ fn control_loop(
                 let _ = event_tx.send(PlayerEvent::Position(seconds));
             }
 
+            Cmd::SwitchDevice(name) => {
+                // 记录现场：位置 + 是否需要续播
+                let played = ctl.diag.played_frames.load(Ordering::Relaxed);
+                let pos = seek_base + played as f64 / out.sample_rate as f64;
+                let resume = want_play && decoder.is_some();
+                // 旧解码线程写的是旧环形缓冲，必须先停
+                if let Some(mut d) = decoder.take() {
+                    d.stop();
+                }
+                ctl.set_paused(true);
+                // 先开新设备再丢旧的：开失败可以原样保留当前输出
+                match output::open_named(
+                    ctl.clone(),
+                    want_buffer_frames(),
+                    RING_SECS,
+                    name.as_deref(),
+                ) {
+                    Ok(new_out) => {
+                        log::info!(
+                            "输出设备已切换: {}（{}Hz {}ch）",
+                            name.as_deref().unwrap_or("系统默认"),
+                            new_out.sample_rate,
+                            new_out.channels
+                        );
+                        out = new_out;
+                        ring = out.ring.clone();
+                        idle_since = None;
+                        stream_paused = false;
+                        if let Some(bytes) = loaded_bytes.clone() {
+                            // 新设备采样率可能不同：用缓存字节重建解码，从原位置继续
+                            let shared = Arc::new(decode::DecodeShared::new(
+                                out.channels,
+                                out.sample_rate,
+                                target_ms,
+                            ));
+                            let join = decode::spawn(bytes, shared.clone(), ring.clone());
+                            decoder = Some(DecoderHandle {
+                                shared,
+                                join: Some(join),
+                            });
+                            seek_base = pos;
+                            ctl.diag.played_frames.store(0, Ordering::Relaxed);
+                            prebuf_ms = target_ms.min(SEEK_PREBUF_MS);
+                            ctl.draining.store(false, Ordering::Relaxed);
+                            if resume {
+                                emit_state!(PlaybackState::Loading); // tick 预滚完成后自动放行
+                            } else {
+                                emit_state!(PlaybackState::Paused);
+                            }
+                        } else if resume {
+                            // 没有可续播的字节（不该发生），退回暂停
+                            want_play = false;
+                            emit_state!(PlaybackState::Paused);
+                        } else if matches!(state, PlaybackState::Stopped | PlaybackState::Idle) {
+                            // 空闲切换：状态不变，只换设备
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("切换输出设备失败（保留当前设备）: {e}");
+                        let _ = event_tx.send(PlayerEvent::Error(format!("切换输出设备失败: {e}")));
+                        if resume && decoder.is_none() {
+                            // 解码已停但新设备没开成：有缓存字节就在旧设备上重建
+                            if let Some(bytes) = loaded_bytes.clone() {
+                                let shared = Arc::new(decode::DecodeShared::new(
+                                    out.channels,
+                                    out.sample_rate,
+                                    target_ms,
+                                ));
+                                let join = decode::spawn(bytes, shared.clone(), ring.clone());
+                                decoder = Some(DecoderHandle {
+                                    shared,
+                                    join: Some(join),
+                                });
+                                seek_base = pos;
+                                prebuf_ms = target_ms.min(SEEK_PREBUF_MS);
+                                emit_state!(PlaybackState::Loading);
+                            }
+                        }
+                    }
+                }
+            }
+
             Cmd::Tick => {
+                // ---- 输出流故障（设备断开/失效）→ 自动暂停 ----
+                if ctl.stream_failed.swap(false, Ordering::Relaxed) {
+                    want_play = false;
+                    ctl.set_paused(true);
+                    if matches!(state, PlaybackState::Playing | PlaybackState::Loading) {
+                        emit_state!(PlaybackState::Paused);
+                    }
+                    let _ = event_tx.send(PlayerEvent::Error(
+                        "音频输出设备已断开或异常，播放已自动暂停".into(),
+                    ));
+                }
+
                 // ---- 解码错误 ----
                 if let Some(d) = decoder.as_ref() {
                     if let Some(err) = d.shared.error.lock().unwrap().take() {

@@ -19,8 +19,6 @@ pub enum Page {
     Fm,
     /// 歌词页（当前播放曲目的歌词）
     Lyric,
-    /// 免费听（概念版推荐流）
-    FreeListen,
     Cloud,
     History,
     Purchased,
@@ -59,7 +57,6 @@ impl Page {
             Page::Favorites => "我最喜爱".into(),
             Page::Fm => "私人FM".into(),
             Page::Lyric => "歌词".into(),
-            Page::FreeListen => "免费听".into(),
             Page::Cloud => "音乐云盘".into(),
             Page::History => "播放历史".into(),
             Page::Purchased => "已购音乐".into(),
@@ -164,11 +161,15 @@ pub struct SearchData {
     /// 单曲搜索进行中（用于加载动画）
     pub loading: bool,
     pub songs: Arc<Vec<Song>>,
-    /// 0 单曲 / 1 歌单 / 2 歌手 / 3 专辑
+    /// 0 单曲 / 1 歌单 / 2 歌手 / 3 专辑 / 4 歌词 / 5 MV
     pub tab: usize,
     pub playlists: Vec<Playlist>,
     pub artists: Vec<echo_core::Artist>,
     pub albums: Vec<echo_core::Album>,
+    /// MV 搜索结果（第三期搜索补全）
+    pub mvs: Vec<echo_core::MvMeta>,
+    /// 歌词搜索候选（第三期搜索补全）
+    pub lyrics: Vec<echo_api::lyrics::LyricCandidate>,
     /// 已加载过的分类 tab（避免重复请求）
     pub loaded_tabs: Vec<usize>,
 }
@@ -271,6 +272,11 @@ pub struct RankView {
 /// 应用状态（单 Entity，所有 UI 读取它）。
 pub struct AppStore {
     pub settings: SettingsStore,
+    /// 当前生效的背景特效模式：启动时 = 设置值（可被 ECHO_BACKDROP 环境变量
+    /// 覆盖），切换设置时由 `set_backdrop_mode` 同步更新。
+    /// UI 配色和 DWM 应用都必须读它，否则环境变量覆盖时会出现
+    /// 「DWM 已关材质、UI 还在半透明」的壁纸透底。
+    pub backdrop_effective: echo_core::BackdropMode,
     pub client: Arc<KuGouClient>,
     pub engine: Arc<AudioEngine>,
     pub player: PlayerState,
@@ -314,10 +320,6 @@ pub struct AppStore {
     /// 歌词归属的歌曲 key（避免切歌时串台）
     pub lyric_key: String,
     pub lyric_loading: bool,
-    /// 免费听
-    pub free_listen: Arc<Vec<Song>>,
-    pub free_listen_loaded: bool,
-    pub free_listen_loading: bool,
     /// 播放条「更多」菜单是否展开
     pub player_menu: bool,
     /// 睡眠定时器的截止时刻（unix 秒），None = 未设置
@@ -368,6 +370,8 @@ pub struct AppStore {
     pub search_input: String,
     /// 全局提示（toast 文本，空则不显示）
     pub toast: String,
+    /// 最近一次 Position 事件的时间（歌词扫光按耗时外推，30fps 平滑推进）
+    pub position_at: std::time::Instant,
     /// 播放条进度条 bounds（canvas 记录，点击 seek 用）
     pub progress_bounds_slot: std::sync::Arc<parking_lot::Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
     /// 音量滑条 bounds（canvas 记录）
@@ -404,6 +408,8 @@ pub struct AppStore {
     pub sidebar_tab: usize,
     /// 主题切换动画：切换前的配色 + 起始时间
     pub theme_anim: Option<(Theme, std::time::Instant)>,
+    /// 开光灯圆形揭示进行中（此时 theme() 返回 hold 旧主题）
+    pub theme_reveal: Option<ThemeReveal>,
     /// 每日 VIP 领取中
     pub vip_claiming: bool,
     /// 每日 VIP 领取状态文案（空则不显示）
@@ -418,7 +424,7 @@ impl Global for AppStore {}
 
 impl AppStore {
     /// 目标配色（不做过渡）。
-    fn target_theme(&self) -> Theme {
+    pub(crate) fn target_theme(&self) -> Theme {
         let s = self.settings.get();
         let accent = parse_color(&s.theme_color);
         match s.theme_mode {
@@ -433,6 +439,10 @@ impl AppStore {
 
     /// 当前配色（浅/深切换时在 `THEME_TRANSITION_SECS` 内平滑过渡）。
     pub fn theme(&self) -> Theme {
+        // 开光灯揭示进行中：保持旧主题（圆盖满后由 finish 切换）
+        if let Some(r) = &self.theme_reveal {
+            return r.hold.clone();
+        }
         let target = self.target_theme();
         match &self.theme_anim {
             Some((from, started)) => {
@@ -460,6 +470,14 @@ impl AppStore {
         self.theme_anim = None;
     }
 
+    /// 系统材质（Mica / Acrylic / 磨砂降级）是否真的垫在主窗口后面。
+    ///
+    /// true 时主窗口的基础背景画成半透明，透明像素透出系统材质；
+    /// false（关闭特效 / 系统不支持）保持不透明配色。
+    pub fn backdrop_active(&self) -> bool {
+        crate::windows_backdrop::material_visible(self.backdrop_effective)
+    }
+
     /// 是否存在任一列表加载态（驱动加载动画持续重绘）。
     pub fn any_loading(&self) -> bool {
         self.fm_loading
@@ -472,6 +490,8 @@ impl AppStore {
             || self.album_loading
             || self.rank_loading
             || self.search.loading
+            // 切歌/缓冲时也要转：播放键上的加载圈按墙钟推进，需要持续重绘
+            || self.player.loading
     }
 
     /// 把当前队列快照落盘（切歌 / 换队列 / 清空时调用）。
@@ -528,6 +548,19 @@ impl AppStore {
 pub struct AppGlobal {
     #[allow(dead_code)]
     pub store: gpui::WeakEntity<AppStore>,
+    /// 主窗口句柄：设置页切换背景特效时，从点击回调（只有 `&mut App`）
+    /// 里拿它回到窗口线程改 DWM 属性。
+    pub main_window: Option<gpui::AnyWindowHandle>,
 }
 
 impl Global for AppGlobal {}
+
+/// 主题「开关灯」圆形揭示过渡（起点 = 切换开关位置）。
+#[derive(Clone)]
+pub struct ThemeReveal {
+    /// 圆心（窗口逻辑坐标）
+    pub origin: gpui::Point<gpui::Pixels>,
+    /// 揭示期间保持的旧主题（结束时清空，新主题接管）
+    pub hold: Theme,
+    pub started: std::time::Instant,
+}

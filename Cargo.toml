@@ -46,23 +46,31 @@ unicode-segmentation = "1"
 # GPUI (Zed UI framework)
 gpui = { version = "0.2.2", features = ["windows-manifest"] }
 
-# --- Windows 平台能力（窗口图标 / 托盘 / 最大化还原）---
+# --- Windows 平台能力（窗口图标 / 托盘 / 最大化还原 / Mica·Acrylic 背景）---
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input",
     "Win32_UI_Shell",
+    "Win32_UI_Controls",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # 系统媒体控制（SMTC）：只有 windows crate 提供 WinRT 绑定
 windows = { version = "0.61", features = [
+    "Foundation",
     "Media",
     "Media_Control",
     "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_Com",
     "Win32_System_WinRT",
+    # 任务栏缩略图工具栏（ITaskbarList3 / THUMBBUTTON / SetWindowSubclass）
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 raw-window-handle = "0.6"
 

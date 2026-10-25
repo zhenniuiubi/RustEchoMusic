@@ -205,7 +205,8 @@ pub fn decode_krc(b64: &str) -> anyhow::Result<String> {
 
 /// 解析 KRC 文本：`[1234,567]你<1234,100>好`
 pub fn parse_krc(text: &str) -> Lyric {
-    let mut lines = Vec::new();
+    // 每行连同它的「行时长」一起攒着：逐字时长要用它兜底
+    let mut rows: Vec<(LyricLine, u64)> = Vec::new();
     let mut offset_ms = 0i64;
 
     for raw in text.lines() {
@@ -231,18 +232,60 @@ pub fn parse_krc(text: &str) -> Lyric {
         let Some((head, body)) = split_time_head(line) else {
             continue;
         };
-        let (time_ms, _dur) = head;
+        let (time_ms, dur) = head;
         let (plain, words) = parse_krc_words(body);
         if plain.is_empty() {
             continue;
         }
-        lines.push(LyricLine {
-            time_ms,
-            text: plain,
-            words,
-        });
+        rows.push((
+            LyricLine {
+                time_ms,
+                text: plain,
+                words,
+            },
+            dur,
+        ));
     }
-    lines.sort_by_key(|l| l.time_ms);
+    rows.sort_by_key(|(l, _)| l.time_ms);
+
+    // ===== 逐字时长归一化 =====
+    // **酷狗 KRC 的逐字标签普遍是 `<start,0>`，时长全是 0**（实测：
+    // `小(0+0) 苹(121+0) 果(242+0)`）。时长是 0 的话，逐字填充只能算成
+    // 「未唱 / 已唱」两态，看起来就是整字硬切、没有任何渐变。
+    // 这里按「下一个字的开始时间」把它补出来；行内最后一个字用行时长
+    // （或下一行开始时间）兜底，实在没有就给 400ms。
+    let times: Vec<u64> = rows.iter().map(|(l, _)| l.time_ms).collect();
+    for i in 0..rows.len() {
+        let line_dur = rows[i].1;
+        let line_t = times[i];
+        let next_line_t = times.get(i + 1).copied();
+        let starts: Vec<u64> = rows[i].0.words.iter().map(|w| w.start_ms).collect();
+        for j in 0..starts.len() {
+            if rows[i].0.words[j].dur_ms > 0 {
+                continue;
+            }
+            let new_dur = match starts.get(j + 1).copied() {
+                Some(s) if s > starts[j] => s - starts[j],
+                _ => {
+                    let total = if line_dur > 0 {
+                        line_dur
+                    } else if let Some(nt) = next_line_t {
+                        nt.saturating_sub(line_t)
+                    } else {
+                        0
+                    };
+                    if total > starts[j] {
+                        total - starts[j]
+                    } else {
+                        400
+                    }
+                }
+            };
+            rows[i].0.words[j].dur_ms = new_dur;
+        }
+    }
+
+    let lines: Vec<LyricLine> = rows.into_iter().map(|(l, _)| l).collect();
     Lyric {
         word_time: lines.iter().any(|l| !l.words.is_empty()),
         lines,
@@ -265,46 +308,47 @@ fn split_time_head(line: &str) -> Option<((u64, u64), &str)> {
 
 /// KRC 逐字部分：`<start,dur>字<start,dur>字…` → ("字字…", [字时间轴])。
 ///
-/// `<start,dur>` 是时间标签，标签**后面到下一个 `<` 之间**的文本才是字。
+/// 时间标签在字的**前面**：`<a,b>` 后面到下一个 `<` 之间的文本才是这个标签对应的字。
+/// （早期实现把标签前面的文本配给当前标签：一是每个字的起唱时间整体错后一个字，
+/// 二是行尾最后一个字没有标签可配、只进了纯文本，于是「正在唱的那一行」
+/// ——它按 words 渲染——永远少最后一个字。）
 fn parse_krc_words(body: &str) -> (String, Vec<LyricWord>) {
     let mut plain = String::new();
     let mut words: Vec<LyricWord> = Vec::new();
     let mut rest = body;
 
-    loop {
-        match rest.find('<') {
-            Some(pos) => {
-                let text = &rest[..pos];
-                rest = &rest[pos + 1..];
-                let Some(end) = rest.find('>') else {
-                    plain.push_str(text);
-                    plain.push_str(rest);
-                    break;
-                };
-                let tag = &rest[..end];
-                rest = &rest[end + 1..];
-                let (start_ms, dur_ms) = match tag.split_once(',') {
-                    Some((a, b)) => (
-                        a.trim().parse().unwrap_or(0u64),
-                        b.trim().parse().unwrap_or(0u64),
-                    ),
-                    None => (0, 0),
-                };
-                if !text.is_empty() {
-                    plain.push_str(text);
-                    words.push(LyricWord {
-                        start_ms,
-                        dur_ms,
-                        text: text.to_string(),
-                    });
-                }
-            }
-            None => {
-                plain.push_str(rest);
-                break;
-            }
+    // 标签之前一般没有裸文本，有就并进整行文本（不进逐字时间轴）
+    while let Some(open) = rest.find('<') {
+        plain.push_str(&rest[..open]);
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('>') else {
+            plain.push_str(rest);
+            rest = "";
+            break;
+        };
+        let tag = &rest[..close];
+        rest = &rest[close + 1..];
+        let (start_ms, dur_ms) = match tag.split_once(',') {
+            Some((a, b)) => (
+                a.trim().parse().unwrap_or(0u64),
+                b.trim().parse().unwrap_or(0u64),
+            ),
+            None => (0, 0),
+        };
+        // 这个标签管到哪里：下一个 '<' 之前
+        let end = rest.find('<').unwrap_or(rest.len());
+        let text = &rest[..end];
+        rest = &rest[end..];
+        if !text.is_empty() {
+            plain.push_str(text);
+            words.push(LyricWord {
+                start_ms,
+                dur_ms,
+                text: text.to_string(),
+            });
         }
     }
+    plain.push_str(rest);
     (plain, words)
 }
 
@@ -374,4 +418,64 @@ fn parse_lrc_time(s: &str) -> Option<u64> {
         None => 0,
     };
     Some(m * 60_000 + sec * 1000 + ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 逐字解析：标签在字**前面**，行尾最后一个字不能丢、时间不能错位。
+    #[test]
+    fn krc_words_align_with_tags() {
+        let lyric = parse_krc("[1000,900]<0,300>作<300,300>词<600,300>方");
+        assert_eq!(lyric.lines.len(), 1);
+        let line = &lyric.lines[0];
+        assert_eq!(line.text, "作词方");
+        let words: Vec<(&str, u64, u64)> = line
+            .words
+            .iter()
+            .map(|w| (w.text.as_str(), w.start_ms, w.dur_ms))
+            .collect();
+        assert_eq!(
+            words,
+            vec![("作", 0, 300), ("词", 300, 300), ("方", 600, 300)],
+            "逐字时间轴必须与字一一对应，且包含行尾最后一个字"
+        );
+        // 纯文本一定是逐字文本拼起来的（正在唱的那一行按 words 渲染，少一个字就露馅）
+        let joined: String = line.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(joined, line.text);
+    }
+
+    /// 没有逐字标签时只出纯文本（退回整行高亮）。
+    #[test]
+    fn krc_line_without_words() {
+        let lyric = parse_krc("[1000,900]纯文本歌词");
+        assert_eq!(lyric.lines[0].text, "纯文本歌词");
+        assert!(lyric.lines[0].words.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod word_dur_tests {
+    use super::*;
+
+    /// 酷狗 KRC 的逐字标签时长常为 0（`<121,0>`）。必须按下一个字的开始时间
+    /// 把时长补出来，否则逐字填充只剩「未唱/已唱」两态，看不到渐变。
+    #[test]
+    fn krc_word_dur_filled_from_next_start() {
+        let lyric = parse_krc("[0,1000]<0,0>你<500,0>好");
+        let ws = &lyric.lines[0].words;
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0].start_ms, 0);
+        assert_eq!(ws[0].dur_ms, 500, "第一个字的时长应等于下一个字的开始时间");
+        assert!(ws[1].dur_ms > 0, "行尾字也要有非零时长（用行时长兜底）");
+    }
+
+    /// 已经有合法时长的不动。
+    #[test]
+    fn krc_word_dur_kept_when_present() {
+        let lyric = parse_krc("[0,1000]<0,300>你<300,300>好");
+        assert_eq!(lyric.lines[0].words[0].dur_ms, 300);
+        assert_eq!(lyric.lines[0].words[1].dur_ms, 300);
+    }
 }

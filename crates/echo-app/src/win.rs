@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
 };
@@ -83,8 +84,14 @@ pub fn app_icon() -> Option<HICON> {
 /// PNG → HICON：32bpp 顶朝下 DIB + 全 0 的 AND 掩码（靠 alpha 做透明）。
 fn create_icon(png: &[u8]) -> Option<HICON> {
     let img = image::load_from_memory(png).ok()?.to_rgba8();
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    if w <= 0 || h <= 0 {
+    rgba_to_icon(img.width() as i32, img.height() as i32, img.as_raw())
+}
+
+/// RGBA（非预乘，行序自上而下）→ HICON。
+///
+/// 任务栏缩略图按钮那种 32×32 小图标直接在内存里画像素，再走这条路变成 HICON。
+pub fn rgba_to_icon(w: i32, h: i32, rgba: &[u8]) -> Option<HICON> {
+    if w <= 0 || h <= 0 || rgba.len() < (w * h * 4) as usize {
         return None;
     }
 
@@ -118,14 +125,18 @@ fn create_icon(png: &[u8]) -> Option<HICON> {
 
         // BGRA + 预乘 alpha（避免图标边缘出现白边）
         let dst = std::slice::from_raw_parts_mut(bits as *mut u8, (w * h * 4) as usize);
-        for (i, px) in img.pixels().enumerate() {
-            let [r, g, b, a] = px.0;
-            let a16 = a as u16;
+        for i in 0..(w * h) as usize {
             let o = i * 4;
-            dst[o] = ((b as u16 * a16) / 255) as u8;
-            dst[o + 1] = ((g as u16 * a16) / 255) as u8;
-            dst[o + 2] = ((r as u16 * a16) / 255) as u8;
-            dst[o + 3] = a;
+            let (r, g, b, a) = (
+                rgba[o] as u16,
+                rgba[o + 1] as u16,
+                rgba[o + 2] as u16,
+                rgba[o + 3] as u16,
+            );
+            dst[o] = ((b * a) / 255) as u8;
+            dst[o + 1] = ((g * a) / 255) as u8;
+            dst[o + 2] = ((r * a) / 255) as u8;
+            dst[o + 3] = a as u8;
         }
 
         // 1bpp 掩码，每行按 16 位对齐
@@ -191,6 +202,33 @@ pub fn show_window(hwnd_raw: isize) {
     }
 }
 
+/// 按原始 HWND 请求「还原 / 显示」（不进入 gpui 的 window 上下文）。
+///
+/// 用 `SC_RESTORE` 而不是直接 `ShowWindow`：ShowWindow 会**同步**派发 `WM_SIZE`，
+/// 而 gpui 的 resize 回调又是 `window.update(...)`，在自己的事件/布局周期里调它会重入
+/// （日志里是 “RefCell already borrowed”）。投递系统命令让窗口线程自己处理就绕开了。
+/// `SC_RESTORE` 对 `SW_HIDE` 掉的窗口同样生效——还原会把窗口显示出来。
+pub fn post_restore(hwnd_raw: isize) {
+    if hwnd_raw == 0 {
+        return;
+    }
+    unsafe {
+        PostMessageW(hwnd_raw as HWND, WM_SYSCOMMAND, SC_RESTORE as WPARAM, 0);
+    }
+    log::info!("post_restore -> post SC_RESTORE");
+}
+
+/// 按原始 HWND 请求最大化（不进入 gpui 的 window 上下文，可从任意回调里调）。
+pub fn post_maximize(hwnd_raw: isize) {
+    if hwnd_raw == 0 {
+        return;
+    }
+    unsafe {
+        PostMessageW(hwnd_raw as HWND, WM_SYSCOMMAND, SC_MAXIMIZE as WPARAM, 0);
+    }
+    log::info!("post_maximize -> post SC_MAXIMIZE");
+}
+
 /// 当前是否处于最大化状态。
 ///
 /// 直接问系统（而不是自己记标志位）：Win+Up、双击标题栏、边缘吸附导致的
@@ -225,8 +263,103 @@ pub fn start_drag(window: &Window) {
     }
 }
 
-/// 请求「最大化 / 还原」。
+/// 隐藏系统窗口边框（透明浮窗用：DWMWA_BORDER_COLOR = DWMWA_COLOR_NONE）。
+pub fn hide_border(window: &Window) {
+    if let Some(h) = hwnd(window) {
+        // 属性 34 = DWMWA_BORDER_COLOR
+        // **DWMWA_COLOR_NONE = 0xFFFFFFFE**（0xFFFFFFFF 是 DWMWA_COLOR_DEFAULT，
+        // 等于「没设置」，这就是之前边框一直去不掉的原因）
+        let none: u32 = 0xFFFF_FFFE;
+        let hr = unsafe {
+            DwmSetWindowAttribute(h, 34, &none as *const _ as *const _, 4)
+        };
+        if hr != 0 {
+            log::debug!("隐藏窗口边框失败 (HRESULT=0x{hr:08x})");
+        }
+        // 属性 2 = DWMWA_NCRENDERING_POLICY，1 = DWMNCRP_DISABLED。
+        // 关掉非客户区渲染：DWM 不再画那圈 1px 的窗口描边/阴影，
+        // 桌面歌词在鼠标没移入时才是「纯文字浮在桌面上」。
+        let policy: u32 = 1;
+        let hr2 = unsafe {
+            DwmSetWindowAttribute(h, 2, &policy as *const _ as *const _, 4)
+        };
+        if hr2 != 0 {
+            log::debug!("关闭非客户区渲染失败 (HRESULT=0x{hr2:08x})");
+        }
+    }
+}
+
+/// 去掉窗口系统边框的**视觉**部分（桌面歌词这类透明浮窗用）。
 ///
+/// 只改 DWM 的绘制属性，**不动 `WS_CAPTION/WS_THICKFRAME`**：
+/// 摘窗口样式会让 gpui 拿不到客户区尺寸，窗口直接被压成 0×0 然后被
+/// `remove_window` 掉（实测）。同理 **不能用 `DwmExtendFrameIntoClientArea`**，
+/// 它会把窗口区/客户区搞成两套坐标，gpui 的 resize 一样会算错。
+pub fn remove_window_frame(window: &Window) {
+    if let Some(h) = hwnd(window) {
+        // **不要摘 WS_CAPTION/WS_THICKFRAME**：gpui 靠客户区尺寸算布局，
+        // 摘掉后窗口会被压成 0×0 然后 `remove_window` 掉（实测）。
+        // DWM 那边的「无边框 + 无圆角」足够干净了。
+        hide_border(window);
+        // 33 = DWMWA_WINDOW_CORNER_PREFERENCE，1 = DWMWCP_DONOTROUND
+        let round: u32 = 1;
+        let hr = unsafe { DwmSetWindowAttribute(h, 33, &round as *const _ as *const _, 4) };
+        if hr != 0 {
+            log::debug!("关闭窗口圆角失败 (HRESULT=0x{hr:08x})");
+        }
+    }
+}
+
+/// 鼠标此刻是否落在窗口矩形内。
+///
+/// gpui 0.2.2 的 Windows 端**没有处理 `WM_MOUSELEAVE`**，鼠标移出窗口后
+/// `on_hover` 不会回调 `false`——浮窗里「hover 才显示的控制条」就会一直挂着。
+/// 所以自己按光标位置判断（只需要原始 HWND，不必进 gpui 的 window 上下文）。
+pub fn cursor_in_rect(hwnd_raw: isize) -> bool {
+    if hwnd_raw == 0 {
+        return false;
+    }
+    let h = hwnd_raw as HWND;
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt) == 0 {
+            return false;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(h, &mut r) == 0 {
+            return false;
+        }
+        pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+    }
+}
+
+/// 当前是否处于置顶状态（浮窗的置顶按钮读它显示状态）。
+pub fn is_topmost(window: &Window) -> bool {
+    match hwnd(window) {
+        Some(h) => unsafe { (GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST) != 0 },
+        None => false,
+    }
+}
+
+/// 窗口置顶 / 取消置顶（mini 播放器、桌面歌词浮窗用）。
+pub fn set_topmost(window: &Window, on: bool) {
+    if let Some(h) = hwnd(window) {
+        unsafe {
+            SetWindowPos(
+                h,
+                if on { HWND_TOPMOST } else { HWND_NOTOPMOST },
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        log::debug!("set_topmost({on})");
+    }
+}
+
+/// 请求「最大化 / 还原」。///
 /// **绝对不能在本进程内同步改窗口大小**：`ShowWindow`/`SetWindowPos` 会同步派发
 /// `WM_SIZE`，而 gpui 的 resize 回调是 `window.update(...)`，重入时会失败
 /// （被 `log_err` 吞掉），于是窗口铺开了、布局却还是旧的 ——
@@ -278,7 +411,8 @@ pub fn set_tray_tip(tip: &str) {
     }
 }
 
-fn send(ev: TrayEvent) {
+/// 投递托盘事件到主线程（SMTC 按键等内部模块也复用）。
+pub(crate) fn send(ev: TrayEvent) {
     if let Some(st) = TRAY.get() {
         if let Ok(tx) = st.tx.lock() {
             let _ = tx.send(ev);
@@ -621,4 +755,27 @@ pub enum MediaKey {
     Next,
     Prev,
     Stop,
+}
+
+/// 从任务栏（和 Alt-Tab）隐藏窗口（mini 模式：任务栏只留主窗口/托盘）。
+///
+/// WS_EX_TOOLWINDOW 的副作用是同时从 Alt-Tab 消失——对 mini 小窗正合适。
+pub fn hide_from_taskbar(window: &Window) {
+    if let Some(h) = hwnd(window) {
+        unsafe {
+            let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
+            let new = (ex & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
+            SetWindowLongPtrW(h, GWL_EXSTYLE, new as isize);
+            SetWindowPos(
+                h,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+        log::debug!("mini 窗口已从任务栏隐藏");
+    }
 }

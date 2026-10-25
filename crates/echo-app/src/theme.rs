@@ -43,6 +43,9 @@ fn hex(h: u32) -> Hsla {
 /// 主题配色过渡时长（秒）。
 pub const THEME_TRANSITION_SECS: f32 = 0.26;
 
+//// 开光灯圆形揭示时长（秒）。
+pub const THEME_REVEAL_SECS: f32 = 0.55;
+
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -119,3 +122,4 @@ pub fn parse_color(s: &str) -> Hsla {
     let s = s.trim_start_matches('#');
     u32::from_str_radix(s, 16).map(hex).unwrap_or_else(|_| hex(0xf55e55))
 }
+

@@ -420,7 +420,7 @@ ECHO_SMOKE=login    ./target/debug/echo-music.exe
 | **音效（部分）** | 播放倍速 0.75–2.0x（环形缓冲按倍率啃 + 线性重采样；**变调**，WSOLA 留待后续）、切歌/暂停/播放**淡入淡出**（回调内逐样本包络，130ms） |
 | **系统集成** | 全局媒体键（`GetAsyncKeyState` 轮询播放/暂停/上下首/停止，gpui 拿不到 WndProc 故不用 RegisterHotKey）、**开机自启**（直写 HKCU Run 注册表，不用 reg.exe）、音频输出设备枚举与选择（`cpal` 设备名，重启生效） |
 | **mini 播放器** | 独立窗口（封面/标题/上一首/播放/下一首），与主窗口共享 AppStore |
-| **免费听** | `/concepts/v1/ai/recommend_song`，`Page::FreeListen` + 换一批/播放全部 |
+| ~~免费听~~ | 2026-10-25 按需求移除（页面、侧栏入口、状态与 API 一并删除） |
 | **MV** | `/kmr/v1/audio/mv`，播放条「更多 → 查看 MV」卡片（封面/播放量），浏览器打开 MV 页 |
 | **听歌统计** | `library.plays` 播放流水（带时间戳，3000 条上限），历史页统计卡：近 7 日柱状图、偏好时段、常听歌手 Top5、清空统计 |
 | **歌单管理** | 新建歌单（`/cloudlist.service/v5/add_list`）、删除/取消收藏（`/v2/delete_list`，云歌单加密协议 `cloudlist_post`：AES seed + RSA p + key）；侧栏「自建歌单」列出登录用户歌单（`/v7/get_all_list`）可点开/删除 |
@@ -440,5 +440,133 @@ ECHO_SMOKE=login    ./target/debug/echo-music.exe
 | SQLite | rusqlite 未在本地依赖缓存中，仍用 JSON（settings/queue/library/session/device） |
 | 应用更新 | 无更新服务端，未实现 |
 | 实时频谱 | 自写 FFT + 可视化未做（P2 顺延） |
-| SMTC 系统媒体控件 | `windows` crate（WinRT）已引入依赖但未接，先用媒体键轮询顶上（第四期补） |
-| 输出设备切换 | 保存后**重启生效**（运行中重建输出流待做） |
+| 输出设备切换 | ~~保存后重启生效~~ → 第三期收尾已改为运行中热切换（见下） |
+
+---
+
+## 十二、第三期收尾（2026-10-25）
+
+### 本轮交付
+
+| 模块 | 实现 |
+|---|---|
+| **SMTC 系统媒体控制** | `smtc.rs`（新）：`ISystemMediaTransportControlsInterop::GetForWindow` 挂接主窗口；专用 "smtc" 线程（CoInitializeEx MTA）持有全部 WinRT 对象；元数据（标题/歌手/封面缩略图，封面按 URL 拉取写临时文件走 `file://` Uri）、播放状态（Playing/Paused）、时间轴（4Hz 进度同步，线程内去重）全部跟随播放器事件；蓝牙耳机/键盘/任务栏浮层的 播放/暂停/上一首/下一首 按键事件经托盘事件通道（`win::send`）回主线程，与托盘菜单共用处理。**系统侧验证**：`examples/smtc_probe.rs` 读 GlobalSystemMediaTransportControlsSessionManager 实测 `app=echo-music.exe title=晴天 artist=周杰伦 status=Playing` |
+| **输出设备热切换** | `Cmd::SwitchDevice`：控制线程内先开新设备（失败保留旧的）再换流；正在播放的曲目用内存缓存的音频字节在新设备上重新解码归一、从原位置继续（seek_base 保留，预滚后自动放行）。设置页点击立即生效（toast「输出设备：xxx」），启动时按设置自动切换；`output::open_named` 按设备名打开，找不到同名回退默认 |
+| **设备断开自动暂停** | cpal 流错误回调置 `stream_failed` 标志并立刻静音，控制线程 Tick 消费 → 自动暂停 + toast「音频输出设备已断开或异常」；重选设备即可恢复 |
+
+### 实测结果
+
+- `ECHO_SMOKE=devswitch`：自动播放晴天 → `输出设备已切换: 系统默认（48000Hz 2ch）` → 缓存字节重解码（44100→48000）→ 播放继续、无错误事件
+- SMTC 探针：sessions=1，元数据/状态与播放器一致
+- 启动日志：`SMTC 已就绪（任务栏/蓝牙媒体控件）`，无 panic
+
+### 降级 / 待校准（移入第四期）
+
+| 项 | 说明 |
+|---|---|
+| 歌词翻译/音译 | 实测酷狗歌词服务：`fmt=trans` 无效（status=400）、搜索候选列表不含独立翻译版（Lemon 候选全为日语原版）；翻译走独立接口需抓包校准，`Lyric.has_translation` 字段已预留 |
+| WASAPI 独占 | cpal 不暴露独占模式，需直连 WASAPI（第四期） |
+| 可自定义全局快捷键 | 媒体键轮询已覆盖播放控制；自定义绑定需 RegisterHotKey 线程 + 设置 UI（第四期） |
+| 变速不变调 | 简单重采样变调；WSOLA 待换（第四期） |
+| SQLite / 应用更新 / 实时频谱 | 维持 P2 顺延 |
+| 搜索结果 VIP 标签 | `/v2/get_res_privilege` 与 `/lite` 双双 502（服务端不可用），无法按需补齐；搜索接口本身不返回 privilege 字段 |
+
+### 搜索补全（2026-10-25 追加，P1 收尾）
+
+- **MV 搜索**：`/v1/search/mv`（complexsearch，Android 签名）→ `echo_core::MvMeta`（MvHash/MvName/SingerName/Duration/HistoryHeat/MvHashMark）。搜索页第 6 个 tab，行内显示 标题/歌手/清晰度标记/时长/播放量（`format_heat`：万/亿），点击浏览器打开 mvweb（与播放条 MV 卡片一致）。
+- **歌词搜索**：复用 `lyric_candidates`（lyrics.kugou.com/search），第 5 个 tab 显示候选（标题/歌手/时长），点击跳转对应歌曲搜索。
+- 冒烟：`ECHO_SMOKE=search-mv` / `search-lyric`，截图 `test-output/shot-search-*.png`（MV 10 行、含 1080P 标记与 1.1亿 播放量；歌词候选带时长）。
+
+### 实时频谱（2026-10-25 追加，第四期启动）
+
+- **实现**：音频回调内 Goertzel 滤波器组（16 个对数频段 45Hz–11kHz，半采样率推进，512 样本窗 ≈21ms），能量对数映射 0..1 + 峰值缓降（0.78/窗）；全程只碰原子量、无分配，RT 安全。`AudioEngine::spectrum()` 读取。
+- **UI**：播放条音量键左侧 64×26 canvas 画 16 根频谱柱（活动段主题色、静默段进度槽色）；播放中由 50ms 重绘泵驱动（复用加载动画泵，`playing` 时也触发）。
+- 冒烟：`ECHO_SMOKE=queue` 自动播放，截图 `test-output/shot-spectrum.png` 可见柱状频谱随音乐起伏。
+
+### 浮窗交互收敛（2026-10-25，按用户要求）
+
+- **mini 播放器**：只保留 拖动（整窗）+ 置顶 + 关闭；移除 上一首/播放/下一首 按钮，新增右上关闭按钮（复用桌面歌词的 closed 标志关窗机制）。
+- **桌面歌词**：只保留 拖动（整窗）+ 置顶；关闭仍走设置页开关。
+- 实现：`win::set_topmost`（SetWindowPos HWND_TOPMOST/NOTOPMOST）在两浮窗创建时置顶；两窗口 `is_resizable: false`；根节点 `window_control_area(Drag)` + `start_drag`（与主窗口标题栏同机制）。
+- 顺带修复：`desktop_lyric=true` 启动时自动恢复桌面歌词浮窗（之前只能手动开，重启即丢）。
+- 验证：`ECHO_SMOKE=mini` + 设置开桌面歌词 → Win32 枚举确认两浮窗 `topmost=True resizable=False`，截图 `test-output/float-*.png`（mini 336×73 仅关闭按钮；歌词 616×129）。
+
+### 浮窗反馈修正（2026-10-25 第二轮，对齐原 EchoMusic）
+
+- **mini 播放器**：恢复播放控制（上一首/播放暂停/下一首）+ 新增 收藏红心（复用 `liked::toggle_like`，登录走云歌单、未登录走本地）+ 置顶切换按钮（`win::is_topmost` 读状态、点击 `set_topmost` 反转）+ 关闭 + 整窗拖动；窗口加宽到 400px。
+- **播放条封面点击 → 歌词页**（`pb-cover`，hover 微透明提示可点）。
+- **桌面歌词**：去掉 0.72 底色（默认全透明，文字直接浮在壁纸上）；右上角新增 置顶切换 + 关闭 半透明圆钮（关闭同时把 `desktop_lyric` 设置落回关）；当前行卡拉OK逐字高亮（KRC 逐字时间轴：已唱主题色/未唱白色，无逐字时间轴时整行主题色）。
+- 验证：截图 `test-output/float-0.png`（mini：封面/红心/上下首/播放/置顶/关闭 齐全）、`float-1.png`（歌词：透明底 + 卡拉OK分色 + 右上双钮）。
+
+### 浮窗第三轮反馈修正（2026-10-25）
+
+- **AMLL 逐字渐变**：歌词页与桌面歌词的当前行改为字内颜色渐变（`theme::mix`：未唱→已唱按 `字进度 = (t-起)/时长` 插值），不再是整字跳变。
+- **浮窗按钮点不动修复**：根因是根节点挂的 `on_mouse_down(start_drag)`——它发的 `WM_NCLBUTTONDOWN` 进入系统模态移动循环，吞掉按钮的 mouse-up。两个浮窗改为只依赖 `window_control_area(Drag)` 命中测试拖动，置顶/关闭/mini 控制恢复可点。
+- **桌面歌词**：`DWMWA_BORDER_COLOR=DWMWA_COLOR_NONE` 去掉透明窗口的系统边框。
+- **mini 模式入口**：标题栏「最小化」左侧新增画中画按钮（带间距）：打开 mini 并隐藏主窗口，播放不受影响；关 mini 自动唤回主窗口。
+- **去掉播放条频谱**（用户要求），重绘泵恢复仅加载态触发；云母背景透明度 0.62→0.75 改善文字清晰度。
+
+### mini 切歌修复（2026-10-25 第四轮）
+
+根因：上一轮把 `window_control_area(Drag)` 标在整个浮窗根节点上——系统命中测试把**根的子元素（按钮）区域也算进标题栏拖动区**，所有按钮点击失效。修复：重构两浮窗为「拖动区 + 控制区」兄弟节点结构——
+- mini：左侧（封面+歌名）为拖动区，右侧 6 按钮为独立控制区；
+- 桌面歌词：底层满幅拖动层（只含歌词文本），右上控制钮为其兄弟节点并 `occlude()` 阻断命中穿透。
+
+### mini 第五轮调整（2026-10-25）
+
+- 窗口改短：320×52（最小 280×44）；关闭按钮移到右上角（独立 occlude）；置顶换 lucide 标准图钉图标。
+- 拖动重构为「底层满幅拖动层（window_control_area）+ 前景内容」：封面/文字区域点击穿透到底层即系统标题栏拖动，控制行与关闭钮 occlude 不受影响。
+
+### AMLL 真·扫光（2026-10-25）
+
+- 歌词页与桌面歌词：当前行改为双层文本扫光——底色整词 + 主题色副本用 `w(relative(进度))` 裁剪叠加，填充边界在**字内**平滑移动（之前只是整字混色）。
+- 动画泵：仅在「播放中且停在歌词页 / 桌面歌词开着」时以 ~30fps 重绘对应窗口，其余 300ms 空转轮询，不影响其他页面清晰度。
+
+### mini 任务栏隐藏（2026-10-25）
+
+- `win::hide_from_taskbar`：置 `WS_EX_TOOLWINDOW` 并去 `WS_EX_APPWINDOW` + `SWP_FRAMECHANGED` 生效；mini 窗口创建时调用。
+- 实测：mini 窗口 EXSTYLE `tool=True`（任务栏/Alt-Tab 均不显示），主窗口不变。mini 模式下任务栏只剩主窗口（隐藏后则全无，仅托盘）。
+
+### 第六轮反馈（2026-10-25）
+
+- 云母透明度回调 0.55→0.72（0.55 观感成了纯透明；云母材质本身淡雅，要明显磨砂请用亚克力模式）。
+- mini：播放圆钮 hover 改为轻微变暗（原来 hover 的 bg_hover 会把强调色背景盖成灰）；窗口 320→256px（缩短 1/5）。
+- 歌词页满屏改版：整页居中、当前行 23px 大字 + 逐词扫光、邻行按距离渐隐（AMLL 观感，截图 shot-lyric-full.png）。
+- Rust 生态无现成 AMLL 实现（amll-dev 全家桶为 TS/Web），自研双层裁剪扫光即最终方案。
+
+### AMLL 组件化 + 弹跳（2026-10-25）
+
+- 新增 `crates/echo-app/src/amll.rs`：独立 AMLL 渲染组件（只依赖 gpui：`AmllConfig`(base/accent/字号/弹跳参数) + `line(words, cfg, id_prefix, bounce)` + 逐词 `word`）。扫光（双层裁剪）与弹跳都封装在内，未来可直接抽 crate。
+- 弹跳实现：词激活瞬间元素 id 翻转 → `with_animation` 触发一次 420ms 字号脉冲（`bounce_wave` 阻尼波形，峰值 +20%；gpui 无 scale 变换，用 text_size 等效）。
+- 歌词页与桌面歌词统一走 `amll::line`（歌词页 23px、桌面 22px，均开弹跳）。
+
+### 歌词页 v2 + 两 bug 修复（2026-10-25）
+
+- 布局对齐原 EchoMusic 播放页：左侧 280px 大封面 + 歌名/歌手，右侧歌词列（当前行 24px + 逐词扫光/弹跳，邻行距离渐隐，左对齐，点击跳播）。
+- 修「点击才有逐词效果」：新增 `AppStore.position_at`，渲染时按耗时外推播放位置（`position + elapsed`），30fps 泵下扫光连续推进，不再依赖 4Hz Position 事件触发重绘。
+- 修抖动：弹跳（字号脉冲）从整词移到扫光层内部——层为 absolute、不参与布局，脉冲不再引起整行重排。
+
+### 主题开关灯圆形揭示（2026-10-25）
+
+- `AppStore.theme_reveal: Option<ThemeReveal>`（origin/hold/started）：揭示期间 `theme()` 返回旧主题，新主题底色画成圆形 quad（`fill().corner_radii(全径)`）从开关位置扩散（550ms ease-out cubic），盖满即清 reveal 完成换装。
+- 切换入口带点击坐标：侧栏日/月按钮（MouseDownEvent.position）、设置页模式按钮（ClickEvent.down.position）。
+- 实测：消息点击「深色」→ 揭示中间帧可见以按钮为圆心的深色圆盘正在扩张（reveal-mid.png）、结束时全窗深色（reveal-end.png）、theme_mode 落盘 dark，反向恢复 light。
+
+### 播放页 v3：沉浸式全屏接管（2026-10-25）
+
+- `Root::render` 分发：歌词页不再进内容区，直接铺满整个窗口（盖住侧栏/标题栏/播放条）。
+- 背景：当前封面 Cover 铺满 + 0.5 透明度 + 黑色 0.55 压暗（gpui 无模糊，压暗近似 AMLL 模糊背景）。
+- 左列：300px 大封面 + 歌名/歌手 + 返回（回首页）/ 全屏（`window.toggle_fullscreen`，新增 expand 图标）按钮。
+- 右列 AMLL：未唱暗白 0.42、已唱亮白扫光、当前行 26px、邻行距离渐隐、点击跳播、位置外推平滑推进。截图 shot-player-v3.png。
+
+### 播放页 v4：页内播放控制（2026-10-25「继续」轮）
+
+- 左列底部新增控制组：可点击 seek 的进度条（canvas，与主播放条共用 bounds 槽）+ 当前/总时长 + 上一首/播放暂停/下一首（白底大圆播放钮）。
+- duration 加入渲染读取（进度条比例与时间显示）。
+- 截图 shot-player-v4.png。
+
+### 播放页 v5：Esc/拖动/桌面歌词配色统一（2026-10-25）
+
+- Esc 退出播放页（回首页）；空格播放/暂停（与主界面一致）。实测：PostMessage 发 WM_KEYDOWN(VK_ESCAPE) 后窗口回到首页（esc-after.png）。
+- 播放页顶部 8px 拖动条（window_control_area Drag，与主窗口标题栏同机制），沉浸模式下可拖动窗口。
+- 桌面歌词换 AMLL 统一配色：未唱暗白 0.45、已唱亮白扫光（原为主题色填充）；置顶按钮状态色保留主题色。float-1.png。

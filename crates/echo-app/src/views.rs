@@ -98,6 +98,33 @@ where
         .child(label)
 }
 
+/// 播放页顶栏的图标按钮（小圆角 + hover 高亮）。
+///
+/// `occlude()` 很关键：顶栏按钮和整行拖动条是重叠的兄弟节点，
+/// 不阻断命中测试的话点按钮会同时触发下面的「拖窗口」。
+fn pp_icon_btn(
+    id: &'static str,
+    path: &'static str,
+    size: f32,
+    color: Hsla,
+    hover_bg: Hsla,
+    action: impl Fn(&mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .size(px(size))
+        .rounded(px(7.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .occlude()
+        .hover(move |el| el.bg(hover_bg))
+        .on_click(move |_, window, cx| action(window, cx))
+        .child(icon(path, size * 0.5, color))
+}
+
 // ==================== 数据加载 ====================
 
 /// 列表加载动画最短展示时长：加载太快时动画一闪而过，用户感知不到。
@@ -1777,228 +1804,638 @@ impl Root {
             .into_any_element()
     }
 
-    /// 歌词页：整页歌词 + 当前行高亮（逐字歌词时逐字高亮）。
-    pub(crate) fn render_lyric(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.store.read(cx).theme();
-        let (lyric, loading, position, playing) = {
+    /// 播放页（沉浸式）：铺满整个窗口，盖住侧栏 / 标题栏 / 播放条。
+    ///
+    /// 布局参考 QQ 音乐「正在播放」整页：
+    ///
+    /// ```text
+    /// ┌───────────────────────────────────────────────────────────┐
+    /// │ ⌄                                               ⤢ ─ □ ✕   │ ← 左：收起播放页；右：全屏/最小化/最大化/关闭
+    /// │                                                           │
+    /// │        ┌──────────┐                       当前行（最亮）  │
+    /// │        │   封面    │                       上一行（暗）   │
+    /// │        └──────────┘                       下一行（更暗）  │
+    /// │            歌名                                           │
+    /// │            歌手                                           │
+    /// │        ▬▬▬▬▬▬▬▬▬                                          │
+    /// │          ◀   ▶   ▶                                        │
+    /// └───────────────────────────────────────────────────────────┘
+    /// ```
+    ///
+    /// 分层要点：
+    /// - 根容器只负责「铺满 + 定位」，**不带 padding**：背景层要真正整窗铺满；
+    /// - 中间 `#pp-content` 才带 padding：左列封面/信息/控制，右列歌词；
+    /// - 顶部拖动条 + 顶栏按钮在最上层：播放页没有标题栏，拖窗口和窗口按钮只能自己做。
+    pub(crate) fn render_lyric(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        // 「最大化/还原」要按系统真实状态出图标（Win+Up、双击、贴边吸附都算）
+        let maximized = crate::win::is_maximized(window);
+        let (lyric, loading, position, playing, position_at, duration, song, play_mode) = {
             let s = self.store.read(cx);
             (
                 s.lyric.clone(),
                 s.lyric_loading,
                 s.player.position,
                 s.player.playing,
+                s.position_at,
+                s.player.duration,
+                s.player.current().cloned(),
+                s.player.play_mode,
             )
         };
-        let Some(mut lyric) = lyric else {
-            return div()
-                .size_full()
+        let cover = song.as_ref().map(|c| c.cover_url.clone()).unwrap_or_default();
+        let title = song.as_ref().map(|c| c.title.clone()).unwrap_or_default();
+        let artist = song.as_ref().map(|c| c.artist.clone()).unwrap_or_default();
+        let fav = song
+            .as_ref()
+            .map(|c| {
+                if self.store.read(cx).session.get().userid != 0 {
+                    crate::liked::is_remote_liked(&self.store.read(cx), c)
+                } else {
+                    self.store.read(cx).library.is_favorite(c)
+                }
+            })
+            .unwrap_or(false);
+
+        // ===== 背景层：封面铺满 + 压暗（gpui 没模糊，用压暗近似毛玻璃）=====
+        let bg_layer = div()
+            .id("pp-bg")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .when(!cover.is_empty(), |el| {
+                el.child(
+                    img(SharedUri::from(cover.clone()))
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .opacity(0.45),
+                )
+            })
+            .bg(gpui::black().opacity(0.68));
+
+        // ===== 时间轴 =====
+        // 位置外推：引擎的 Position 事件只有 4Hz，逐字动画要按帧连续推进，
+        // 不外推的话进度是 250ms 一跳的阶梯，"逐渐变化"就成了"整字跳变"。
+        let pos = if playing {
+            position + position_at.elapsed().as_secs_f64().min(1.0)
+        } else {
+            position
+        };
+        let (cur, offset_ms, lines) = match lyric {
+            Some(mut l) => {
+                let cur = l.index_at(pos);
+                let lines = std::mem::take(&mut l.lines);
+                (cur, l.offset_ms, Some(lines))
+            }
+            None => (None, 0, None),
+        };
+        let store = self.store.clone();
+        let theme = self.store.read(cx).theme();
+        let accent = theme.accent;
+
+        // 当前正在唱的那句**始终居中**，而且换行时是**弹性滚上去**（不是瞬移）。
+        //
+        // 为什么不用 `scroll_to_item(Center)`：
+        // - 它是**非严格**滚动——目标行只要「还看得见」就完全不动，于是当前句
+        //   会一路漂到视口底边才被拉一次，看着就是「没居中」；
+        // - 换成 strict 版又是硬跳，没有弹性。
+        // 所以这里直接用 uniform list 的底层 `ScrollHandle` 自己做缓动：
+        // 目标偏移 = 让当前行中心落在视口中心，逐帧 ease-out-back 逼近，
+        // 顺带 `request_animation_frame` 驱动（暂停播放也能滚完）。
+        //
+        // 用户手动滚过之后让位 5 秒（这段时间不抢鼠标），5 秒没动再弹性回弹到当前句。
+        const LYRIC_IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+        if let Some(c) = cur {
+            let _ = c;
+            let base = crate::ui::list_scroll_handle(&self.lyric_scroll);
+            let real_off = -f32::from(base.offset().y);
+            // 程序没在动画、真实偏移却和上次自己设的不一样 → 用户滚的
+            if self.lyric_scroll_anim.is_none()
+                && (real_off - self.lyric_auto_off).abs() > 4.0
+            {
+                self.lyric_user_scroll_at = Some(std::time::Instant::now());
+                self.lyric_restore_pending = true;
+                self.lyric_auto_off = real_off;
+            }
+        }
+        let user_browsing = self
+            .lyric_user_scroll_at
+            .map(|t| t.elapsed() < LYRIC_IDLE)
+            .unwrap_or(false);
+        if user_browsing {
+            // 正在看别处：停掉自动滚动，别跟用户抢
+            self.lyric_scroll_anim = None;
+            // 记住「当前句」，等看完了再对齐
+            self.lyric_follow = cur;
+        } else if let Some(c) = cur {
+            const ROW_H: f32 = 76.;
+            const SCROLL_SECS: f32 = 0.46;
+            let base = crate::ui::list_scroll_handle(&self.lyric_scroll);
+            let vp_h = f32::from(base.bounds().size.height);
+            let max_off = f32::from(base.max_offset().height);
+            // 目标：当前行中心 → 视口中心（内容不够高时自动夹到 0）
+            let want =
+                (c as f32 * ROW_H + ROW_H * 0.5 - vp_h * 0.5).clamp(0.0, max_off.max(0.0));
+
+            // 换行，或者用户滚完 5 秒要回弹，都走同一段动画
+            if self.lyric_follow != Some(c) || self.lyric_restore_pending {
+                self.lyric_follow = Some(c);
+                self.lyric_restore_pending = false;
+                // 列表还没排完版（vp_h == 0）时先不启动，下一帧再来
+                if vp_h > 0.0 {
+                    let from = -f32::from(base.offset().y);
+                    self.lyric_scroll_anim = Some((from, want, std::time::Instant::now()));
+                }
+            }
+
+            if let Some((from, to0, start)) = self.lyric_scroll_anim {
+                let t = (start.elapsed().as_secs_f32() / SCROLL_SECS).clamp(0.0, 1.0);
+                // ease-out-back：冲过头一点点再回弹，就是「弹性」的手感
+                let e = {
+                    let c1 = 1.70158f32;
+                    let c3 = c1 + 1.0;
+                    1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)
+                };
+                // 视口/列表高度这一帧才量准，用当帧目标值（不用启动时那份）
+                let to = if max_off > 0.0 { want } else { to0 };
+                let off = from + (to - from) * e;
+                base.set_offset(point(px(0.), px(-off)));
+                self.lyric_auto_off = off;
+                if t >= 1.0 {
+                    self.lyric_scroll_anim = None;
+                } else {
+                    window.request_animation_frame();
+                }
+            }
+        }
+
+        // ===== 左列：封面 + 歌名 + 歌手 + 进度 + 播放控制 =====
+        let controls = {
+            let slot = self.store.read(cx).progress_bounds_slot.clone();
+            let ratio = if duration > 0.01 {
+                (position / duration).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let st_p = store.clone();
+            let st_prev = store.clone();
+            let st_play = store.clone();
+            let st_next = store.clone();
+            let st_mode = store.clone();
+            let st_fav = store.clone();
+            let fav_song = song.clone();
+            let mode_icon = match play_mode {
+                echo_core::PlayMode::Sequential => "icons/queue.svg",
+                echo_core::PlayMode::List => "icons/repeat.svg",
+                echo_core::PlayMode::Random => "icons/shuffle.svg",
+                echo_core::PlayMode::Single => "icons/repeat-one.svg",
+            };
+            div()
+                .id("pp-controls")
+                .w_full()
                 .flex()
                 .flex_col()
                 .items_center()
-                .justify_center()
-                .gap_2()
-                .text_color(theme.text_tertiary)
-                .child(icon("icons/music-note.svg", 34., theme.text_tertiary))
+                .gap_3()
+                // 进度条：canvas 绘制 + bounds 记录（与主播放条共用槽位）
                 .child(
                     div()
-                        .text_size(px(13.))
-                        .child(if loading { "歌词加载中…" } else { "暂无歌词" }),
+                        .id("pp-progress")
+                        .w_full()
+                        .h(px(14.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .child(
+                            canvas(
+                                move |bounds: Bounds<Pixels>, _, _| {
+                                    *slot.lock() = Some(bounds);
+                                },
+                                move |bounds, _, window, _| {
+                                    window.paint_quad(fill(bounds, gpui::white().opacity(0.25)));
+                                    let w = bounds.size.width * ratio;
+                                    if w > px(0.) {
+                                        window.paint_quad(fill(
+                                            Bounds::new(
+                                                bounds.origin,
+                                                size(w, bounds.size.height),
+                                            ),
+                                            gpui::white(),
+                                        ));
+                                    }
+                                },
+                            )
+                            .h(px(4.))
+                            .w_full()
+                            .rounded_full(),
+                        )
+                        .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, _, cx| {
+                            let b = st_p.read(cx).progress_bounds_slot.lock().clone();
+                            if let Some(b) = b {
+                                let r = f32::from(ev.position.x - b.left()).max(0.0)
+                                    / f32::from(b.size.width).max(1.0);
+                                let target =
+                                    (r as f64).clamp(0.0, 1.0) * st_p.read(cx).player.duration;
+                                st_p.update(cx, |s, cx| {
+                                    s.engine.seek(target);
+                                    s.player.position = target;
+                                    s.position_at = std::time::Instant::now();
+                                    cx.notify();
+                                });
+                            }
+                        }),
                 )
-                .into_any_element();
+                // 时间行
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .w_full()
+                        .text_size(px(10.))
+                        .text_color(gpui::white().opacity(0.6))
+                        .child(div().child(crate::ui::fmt_time(position)))
+                        .child(div().child(crate::ui::fmt_time(duration))),
+                )
+                // 歌曲模式 / 上一首 / 播放暂停 / 下一首 / 收藏
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_4()
+                        // 歌曲模式（顺序/列表循环/随机/单曲循环）
+                        .child(
+                            div()
+                                .id("pp-mode")
+                                .size(px(30.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(move |el| el.bg(gpui::white().opacity(0.12)))
+                                .on_click(move |_, _, cx| crate::ui::cycle_play_mode(&st_mode, cx))
+                                .child(icon(mode_icon, 14., gpui::white().opacity(0.82))),
+                        )
+                        .child(
+                            div()
+                                .id("pp-prev")
+                                .size(px(34.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .bg(gpui::white().opacity(0.12))
+                                .hover(move |el| el.bg(gpui::white().opacity(0.22)))
+                                .on_click(move |_, _, cx| crate::ui::prev_track(&st_prev, cx))
+                                .child(icon("icons/prev.svg", 14., gpui::white().opacity(0.9))),
+                        )
+                        .child(
+                            div()
+                                .id("pp-play")
+                                .size(px(46.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .bg(gpui::white())
+                                .hover(move |el| el.opacity(0.85))
+                                .on_click(move |_, _, cx| crate::ui::toggle_play(&st_play, cx))
+                                .child(icon(
+                                    if playing { "icons/pause.svg" } else { "icons/play.svg" },
+                                    17.,
+                                    gpui::black(),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("pp-next")
+                                .size(px(34.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .bg(gpui::white().opacity(0.12))
+                                .hover(move |el| el.bg(gpui::white().opacity(0.22)))
+                                .on_click(move |_, _, cx| crate::ui::next_track(&st_next, false, cx))
+                                .child(icon("icons/next.svg", 14., gpui::white().opacity(0.9))),
+                        )
+                        // 收藏
+                        .child(
+                            div()
+                                .id("pp-fav")
+                                .size(px(30.))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(move |el| el.bg(gpui::white().opacity(0.12)))
+                                .on_click(move |_, _, cx| {
+                                    if let Some(song) = fav_song.clone() {
+                                        crate::liked::toggle_like(&st_fav, &song, cx);
+                                    }
+                                })
+                                .child(icon(
+                                    if fav { "icons/heart-filled.svg" } else { "icons/heart.svg" },
+                                    14.,
+                                    if fav { accent } else { gpui::white().opacity(0.82) },
+                                )),
+                        ),
+                )
         };
 
-        let cur = lyric.index_at(position);
-        let cur_word = cur.and_then(|i| lyric.word_index_at(i, position));
-        let word_time = lyric.word_time;
-        let offset_ms = lyric.offset_ms;
-        // 行数据转成 owned：闭包要被打包进 AnyElement，不能借用局部变量
-        let lines: Vec<echo_core::LyricLine> = std::mem::take(&mut lyric.lines);
-        let store = self.store.clone();
-        let song_title = self
-            .store
-            .read(cx)
-            .player
-            .current()
-            .map(|s| s.title.clone())
-            .unwrap_or_default();
-        let song_artist = self
-            .store
-            .read(cx)
-            .player
-            .current()
-            .map(|s| s.artist.clone())
-            .unwrap_or_default();
-
-        div()
-            .id("lyric-page")
-            .size_full()
-            .overflow_y_scroll()
+        let cover_col = div()
+            .id("pp-cover-col")
+            .w(px(300.))
+            .flex_shrink_0()
+            .h_full()
             .flex()
             .flex_col()
-            .px_8()
-            .py_6()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .child(
+                div()
+                    .w(px(264.))
+                    .h(px(264.))
+                    .flex_shrink_0()
+                    .rounded(px(12.))
+                    .overflow_hidden()
+                    .bg(gpui::black().opacity(0.35))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(!cover.is_empty(), |el| {
+                        el.child(
+                            img(SharedUri::from(cover.clone()))
+                                .size_full()
+                                .rounded(px(12.))
+                                .object_fit(ObjectFit::Cover),
+                        )
+                    })
+                    .when(cover.is_empty(), |el| {
+                        el.child(icon("icons/music-note.svg", 44., gpui::white().opacity(0.4)))
+                    }),
+            )
             .child(
                 div()
                     .flex()
-                    .items_baseline()
-                    .gap_2()
-                    .mb_4()
-                    .child(div().text_size(px(18.)).child(song_title))
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
                     .child(
                         div()
-                            .text_size(px(12.))
-                            .text_color(theme.text_tertiary)
-                            .child(song_artist),
+                            .text_size(px(22.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(gpui::white())
+                            .truncate()
+                            .max_w(px(288.))
+                            .child(title),
                     )
                     .child(
                         div()
-                            .ml_2()
-                            .text_size(px(11.))
-                            .text_color(theme.text_tertiary)
-                            .child(if word_time {
-                                if playing {
-                                    "逐字歌词"
-                                } else {
-                                    "逐字歌词 · 已暂停"
-                                }
-                            } else {
-                                "LRC"
-                            }),
+                            .text_size(px(13.))
+                            .text_color(gpui::white().opacity(0.6))
+                            .truncate()
+                            .max_w(px(288.))
+                            .child(artist),
                     ),
             )
-            .children(lines.into_iter().enumerate().map(move |(i, line)| {
-                let active = cur == Some(i);
-                let wi = if active { cur_word } else { None };
-                let secs = (line.time_ms as i64 + offset_ms).max(0) as f64 / 1000.0;
-                let text = render_lyric_text(&line, wi, &theme);
-                div()
-                    .id(SharedString::from(format!("lyric-line-{i}")))
-                    .py(px(7.))
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.92))
-                    .on_click({
-                        let store = store.clone();
-                        move |_, _, cx| {
-                            // 点歌词跳到这一行
-                            store.update(cx, |s, cx| {
-                                s.engine.seek(secs);
-                                s.player.position = secs;
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .child(
-                        div()
-                            .text_size(if active { px(17.) } else { px(15.) })
-                            .text_color(if active {
-                                theme.text
-                            } else {
-                                theme.text_tertiary
-                            })
-                            .child(text),
-                    )
-                    .into_any_element()
-            }))            .child(div().h(px(60.)).flex_shrink_0())
-            .into_any_element()
-    }
+            .child(div().w(px(264.)).child(controls));
 
-    /// 免费听（概念版推荐流）。
-    pub(crate) fn render_free_listen(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = self.store.read(cx).theme();
-        if self.store.read(cx).free_listen_loading {
-            return centered_spinner(theme).into_any_element();
-        }
-        let songs = self.store.read(cx).free_listen.clone();
-        let store = self.store.clone();
-        let reload = self.store.clone();
-        let list: Option<AnyElement> = if songs.is_empty() {
-            None
-        } else {
-            Some(
-                self.render_song_list(songs.clone(), PlaySource::FreeListen, cx)
-                    .into_any_element(),
-            )
+        // ===== 右列：歌词（左对齐、当前行居中跟随、逐字渐变）=====
+        let lyric_col: AnyElement = match lines {
+            None => div()
+                .w(px(440.))
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(gpui::white().opacity(0.45))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .child(if loading { "歌词加载中…" } else { "暂无歌词" }),
+                )
+                .into_any_element(),
+            Some(lines) => {
+                let count = lines.len();
+                let lines = Arc::new(lines);
+                // 未唱：半透明白（灰）；已唱：主题色。两色差距够大，逐字渐变才看得见
+                // （早先「灰白 → 纯白」几乎无差别，等于没有效果）
+                let cfg = crate::amll::AmllConfig::new(
+                    gpui::white().opacity(0.34),
+                    accent,
+                    px(26.),
+                );
+                let list = gpui::uniform_list(
+                    "pp-lyric-list",
+                    count,
+                    move |range, _window, _cx: &mut App| {
+                        range
+                            .map(|i| {
+                                let line = &lines[i];
+                                // d<0：已经唱过（在上方）；d>0：还没唱到（在下方）
+                                let d = cur.map(|c| i as i64 - c as i64).unwrap_or(9);
+                                let active = d == 0;
+                                let opacity = if active {
+                                    1.0
+                                } else if d < 0 {
+                                    (0.52 + d as f32 * 0.07).max(0.22)
+                                } else {
+                                    (0.42 - d as f32 * 0.05).max(0.18)
+                                };
+                                let text: AnyElement = if active && !line.words.is_empty() {
+                                    // 逐字注水 + 换行弹性（统一入口，和桌面歌词共用）
+                                    let t_in_line = pos * 1000.0 + offset_ms as f64
+                                        - line.time_ms as f64;
+                                    crate::amll::current_line(
+                                        line,
+                                        t_in_line,
+                                        &cfg,
+                                        &format!("ppl{i}"),
+                                        i,
+                                        Some(px(440.)),
+                                    )
+                                } else {
+                                    div()
+                                        .text_color(gpui::white().opacity(opacity))
+                                        .child(line.text.clone())
+                                        .into_any_element()
+                                };
+                                div().h(px(76.)).flex().items_center().child(
+                                    div()
+                                        // 给确定宽度：文字才会折行而不是顶出列宽被裁
+                                        .w(px(440.))
+                                        .text_size(px(if active { 26. } else { 21. }))
+                                        .when(active, |el| {
+                                            el.font_weight(gpui::FontWeight::BOLD)
+                                        })
+                                        .child(text),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                )
+                .track_scroll(self.lyric_scroll.clone())
+                .size_full();
+                div()
+                    .w(px(440.))
+                    .flex_shrink_0()
+                    .h_full()
+                    .child(list)
+                    .into_any_element()
+            }
         };
-        div()
+
+        // ===== 顶栏：左「收起播放页」/ 右「全屏 · 最小化 · 最大化 · 关闭」=====
+        let hover_bg = gpui::white().opacity(0.16);
+        let icon_color = gpui::white().opacity(0.82);
+        let st_collapse = store.clone();
+        let top_bar = div()
+            .id("pp-top")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(44.))
+            .px_3()
             .flex()
-            .flex_col()
-            .h_full()
-            .gap_4()
-            .p_6()
+            .items_center()
+            .justify_between()
+            // 收起：退出播放页回主界面（Esc 同效）
+            .child(pp_icon_btn(
+                "pp-collapse",
+                "icons/chevron-down.svg",
+                26.,
+                icon_color,
+                hover_bg,
+                move |_, cx| crate::ui::navigate(&st_collapse, Page::Home, cx),
+            ))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(div().text_size(px(20.)).child("免费听"))
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(theme.text_secondary)
-                                    .child("概念版专属：不登录也能听的推荐曲库"),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("free-refresh")
-                                    .px_3()
-                                    .py(px(5.))
-                                    .rounded_full()
-                                    .bg(theme.bg_hover)
-                                    .text_size(px(12.))
-                                    .cursor_pointer()
-                                    .hover(move |s| s.bg(theme.border))
-                                    .on_click(move |_, _, cx| load_free_listen(&reload, true, cx))
-                                    .child("换一批"),
-                            )
-                            .when(!songs.is_empty(), |el| {
-                                el.child(
-                                    div()
-                                        .id("free-play-all")
-                                        .px_3()
-                                        .py(px(5.))
-                                        .rounded_full()
-                                        .bg(theme.accent)
-                                        .text_color(gpui::white())
-                                        .text_size(px(12.))
-                                        .cursor_pointer()
-                                        .hover(|s| s.opacity(0.88))
-                                        .on_click(move |_, _, cx| {
-                                            play_from(&store, PlaySource::FreeListen, 0, cx)
-                                        })
-                                        .child("播放全部"),
-                                )
-                            }),
-                    ),
+                    .gap_1()
+                    .child(pp_icon_btn(
+                        "pp-fullscreen",
+                        "icons/expand.svg",
+                        26.,
+                        icon_color,
+                        hover_bg,
+                        |window, _| window.toggle_fullscreen(),
+                    ))
+                    .child(pp_icon_btn(
+                        "pp-minimize",
+                        "icons/minimize.svg",
+                        26.,
+                        icon_color,
+                        hover_bg,
+                        |window, _| window.minimize_window(),
+                    ))
+                    .child(pp_icon_btn(
+                        "pp-maximize",
+                        if maximized {
+                            "icons/restore.svg"
+                        } else {
+                            "icons/maximize.svg"
+                        },
+                        26.,
+                        icon_color,
+                        hover_bg,
+                        |window, cx| crate::ui::spawn_toggle_maximize(window.window_handle(), cx),
+                    ))
+                    // 关闭：与标题栏一致，只隐藏窗口，App 继续在托盘里放歌
+                    .child(pp_icon_btn(
+                        "pp-close",
+                        "icons/close.svg",
+                        26.,
+                        icon_color,
+                        gpui::red().opacity(0.75),
+                        |window, _| crate::win::hide_window(window),
+                    )),
+            );
+
+        div()
+            .id("player-page")
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            // 键盘：Esc 退出播放页；空格 播放/暂停（与主界面一致）
+            .track_focus(&self.root_focus)
+            .on_key_down(cx.listener(
+                |root: &mut Root, ev: &gpui::KeyDownEvent, _window, cx| {
+                    match ev.keystroke.key.as_str() {
+                        "escape" => {
+                            crate::ui::navigate(&root.store.clone(), crate::state::Page::Home, cx);
+                        }
+                        "space" if ev.keystroke.modifiers.number_of_modifiers() == 0 => {
+                            crate::ui::toggle_play(&root.store.clone(), cx);
+                            cx.stop_propagation();
+                        }
+                        // 播放页里直接调速：`[` 变慢 / `]` 变快（0.5~2.0，含 0.75x）。
+                        // 慢速是为了能看清逐字填充的推进过程。
+                        "[" => {
+                            crate::ui::step_speed(&root.store.clone(), -1, cx);
+                            cx.stop_propagation();
+                        }
+                        "]" => {
+                            crate::ui::step_speed(&root.store.clone(), 1, cx);
+                            cx.stop_propagation();
+                        }
+                        _ => {}
+                    }
+                },
+            ))
+            // ① 背景层：根容器的直接子节点（内容层的兄弟），整窗铺满不留边
+            .child(bg_layer)
+            // ② 内容层：唯一带 padding 的一层
+            .child(
+                div()
+                    .id("pp-content")
+                    .size_full()
+                    .flex()
+                    .gap_8()
+                    .px(px(56.))
+                    .pt(px(56.))
+                    .pb(px(32.))
+                    .child(cover_col)
+                    .child(div().flex_1())
+                    .child(lyric_col),
             )
-            .when_some(list, |el, list| {
-                el.child(div().flex_1().min_h_0().child(list))
-            })
-            .when(songs.is_empty(), |el| {
-                el.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_2()
-                        .py_16()
-                        .text_color(theme.text_tertiary)
-                        .child(icon("icons/sparkles.svg", 34., theme.text_tertiary))
-                        .child(div().text_size(px(13.)).child("还没有推荐")),
-                )
-            })
+            // ③ 顶部拖动条：整行可拖（双击最大化），与主标题栏同款机制。
+            //    必须在顶栏按钮之前，命中测试才让按钮优先。
+            .child(
+                div()
+                    .id("pp-drag")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(44.))
+                    .window_control_area(WindowControlArea::Drag)
+                    // window_control_area 的命中测试在 gpui 0.2.2 里不稳（点快了会退化成
+                    // 普通点击），和主窗口标题栏一样再兜一层：单击手动拖、双击最大化
+                    .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
+                        if ev.click_count == 2 {
+                            crate::ui::spawn_toggle_maximize(window.window_handle(), cx);
+                        } else {
+                            crate::win::start_drag(window);
+                        }
+                    }),
+            )
+            // ④ 顶栏按钮（排在拖动条之后，命中测试优先）
+            .child(top_bar)
             .into_any_element()
     }
+
 
     /// 音乐云盘。
     pub(crate) fn render_cloud(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -2646,8 +3083,13 @@ impl Root {
                 .when(!active, |el| {
                     el.bg(theme.bg_hover).text_color(theme.text_secondary)
                 })
-                .on_click(move |_, _, cx| {
-                    crate::ui::set_theme_mode(&st, mode, cx);
+                .on_click(move |ev: &gpui::ClickEvent, _, cx| {
+                    let origin = if let gpui::ClickEvent::Mouse(m) = ev {
+                        Some(m.down.position)
+                    } else {
+                        None
+                    };
+                    crate::ui::set_theme_mode(&st, mode, origin, cx);
                 })
                 .child(label)
                 .into_any_element()
@@ -2719,6 +3161,58 @@ impl Root {
             })
             .collect();
 
+        // 背景特效（Windows Mica / Acrylic，其他系统自动降级磨砂或关闭）
+        let backdrop_btn = |label: &'static str,
+                            mode: echo_core::BackdropMode,
+                            cur: echo_core::BackdropMode,
+                            st: Entity<AppStore>| {
+            let active = mode == cur;
+            div()
+                .id(SharedString::from(format!("backdrop-{label}")))
+                .px_4()
+                .py_2()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .when(active, |el| el.bg(theme.accent).text_color(gpui::white()))
+                .when(!active, |el| {
+                    el.bg(theme.bg_hover).text_color(theme.text_secondary)
+                })
+                .on_click(move |_, _, cx| {
+                    crate::ui::set_backdrop_mode(&st, mode, cx);
+                })
+                .child(label)
+                .into_any_element()
+        };
+        let s5 = store.clone();
+        let backdrop_row = div()
+            .flex()
+            .gap_2()
+            .child(backdrop_btn(
+                "跟随系统",
+                echo_core::BackdropMode::System,
+                settings.backdrop,
+                s5.clone(),
+            ))
+            .child(backdrop_btn(
+                "云母",
+                echo_core::BackdropMode::Mica,
+                settings.backdrop,
+                s5.clone(),
+            ))
+            .child(backdrop_btn(
+                "亚克力",
+                echo_core::BackdropMode::Acrylic,
+                settings.backdrop,
+                s5.clone(),
+            ))
+            .child(backdrop_btn(
+                "关闭",
+                echo_core::BackdropMode::Off,
+                settings.backdrop,
+                s5,
+            ));
+
         let clear_store = store.clone();
 
         div()
@@ -2740,7 +3234,18 @@ impl Root {
                     .child(div().text_size(px(14.)).child("外观"))
                     .child(mode_row)
                     .child(div().text_size(px(12.)).text_color(theme.text_secondary).child("主题色"))
-                    .child(div().flex().gap_2().children(color_dots)),
+                    .child(div().flex().gap_2().children(color_dots))
+                    .child(div().text_size(px(12.)).text_color(theme.text_secondary).child("背景特效"))
+                    .child(backdrop_row)
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.text_tertiary)
+                            .child(
+                                "云母 / 亚克力需要 Windows 11 22H2 及以上；\
+                                 Win10 及更早系统自动降级为磨砂，无磨砂能力时回退普通不透明背景。",
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -3135,10 +3640,18 @@ impl Root {
                                                         let value =
                                                             if is_default { String::new() } else { name.clone() };
                                                         st.update(cx, |s, cx| {
+                                                            // 运行中直接切换输出流（第三期：不再重启生效）
+                                                            s.engine.switch_device(
+                                                                if value.is_empty() { None } else { Some(value.as_str()) },
+                                                            );
                                                             s.settings.update(|st| {
-                                                                st.output_device = value
+                                                                st.output_device = value.clone()
                                                             });
-                                                            s.toast = "输出设备已保存，重启后生效".into();
+                                                            s.toast = if value.is_empty() {
+                                                                "输出设备：系统默认".into()
+                                                            } else {
+                                                                format!("输出设备：{value}")
+                                                            };
                                                             cx.notify();
                                                         });
                                                     }
@@ -4064,45 +4577,6 @@ fn key_clone(p: &crate::player::PlayerState) -> String {
     p.current().map(|s| s.key()).unwrap_or_default()
 }
 
-// ==================== 免费听 ====================
-
-pub(crate) fn load_free_listen(store: &Entity<AppStore>, force: bool, cx: &mut App) {
-    let store_c = store.clone();
-    {
-        let s = store.read(cx);
-        if !force && (s.free_listen_loaded || s.free_listen_loading) {
-            return;
-        }
-    }
-    store.update(cx, |s, cx| {
-        s.free_listen_loading = true;
-        cx.notify();
-    });
-    let client = store.read(cx).client.clone();
-    let task = cx
-        .background_executor()
-        .spawn(async move { run_tokio(client.free_listen_songs(1, 30)) });
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        let res = task.await;
-        let _ = store_c.update(cx, |s, cx| {
-            s.free_listen_loading = false;
-            s.free_listen_loaded = true;
-            match res {
-                Ok(songs) => {
-                    log::info!("free_listen: {} 首", songs.len());
-                    s.free_listen = Arc::new(songs);
-                }
-                Err(e) => {
-                    log::warn!("free_listen ERR {e}");
-                    s.toast = format!("免费听加载失败：{e}");
-                }
-            }
-            cx.notify();
-        });
-    })
-    .detach();
-}
-
 // ==================== MV ====================
 
 /// 查当前曲目的 MV（用于「查看 MV」入口）。
@@ -4151,25 +4625,6 @@ pub(crate) fn load_current_mv(store: &Entity<AppStore>, cx: &mut App) {
         });
     })
     .detach();
-}
-
-
-/// 歌词一行：有逐字时间轴时把已经唱过的字点亮（用多个小 div 拼，不依赖富文本 API）。
-fn render_lyric_text(line: &echo_core::LyricLine, word_index: Option<usize>, theme: &Theme) -> AnyElement {
-    if line.words.is_empty() {
-        return div().child(line.text.clone()).into_any_element();
-    }
-    div()
-        .flex()
-        .flex_wrap()
-        .children(line.words.iter().enumerate().map(|(i, w)| {
-            let done = word_index.map(|wi| i <= wi).unwrap_or(false);
-            div()
-                .text_color(if done { theme.accent } else { theme.text })
-                .child(w.text.clone())
-                .into_any_element()
-        }))
-        .into_any_element()
 }
 
 

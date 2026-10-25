@@ -416,8 +416,6 @@ pub enum PlaySource {
     FavoritesFiltered,
     /// 私人 FM
     Fm,
-    /// 免费听
-    FreeListen,
     /// 音乐云盘
     Cloud,
     /// 已购单曲
@@ -466,7 +464,6 @@ pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx:
             ),
             PlaySource::History => ("播放历史".into(), s.library.get().history.as_ref().clone()),
             PlaySource::Fm => ("私人FM".into(), s.fm.as_ref().clone()),
-            PlaySource::FreeListen => ("免费听".into(), s.free_listen.as_ref().clone()),
             PlaySource::Cloud => ("音乐云盘".into(), s.cloud.as_ref().clone()),
             PlaySource::Purchased => ("已购音乐".into(), s.purchased_songs.as_ref().clone()),
         };
@@ -630,7 +627,7 @@ pub fn prev_track(store: &Entity<AppStore>, cx: &mut App) {
     }
 }
 
-fn cycle_play_mode(store: &Entity<AppStore>, cx: &mut App) {
+pub(crate) fn cycle_play_mode(store: &Entity<AppStore>, cx: &mut App) {
     store.update(cx, |s, cx| {
         s.player.play_mode = s.player.play_mode.next();
         let mode = s.player.play_mode;
@@ -640,7 +637,27 @@ fn cycle_play_mode(store: &Entity<AppStore>, cx: &mut App) {
     });
 }
 
-fn set_volume(store: &Entity<AppStore>, v: f64, cx: &mut App) {
+/// 倍速档位（与播放条的循环一致）。
+pub(crate) const SPEED_STEPS: [f64; 5] = [0.75, 1.0, 1.25, 1.5, 2.0];
+
+/// 按档位加减倍速（播放页 `[` / `]` 用）。
+pub(crate) fn step_speed(store: &Entity<AppStore>, dir: i32, cx: &mut App) {
+    store.update(cx, |s, cx| {
+        let cur = s.settings.get().speed;
+        let mut ix = SPEED_STEPS
+            .iter()
+            .position(|v| (*v - cur).abs() < 0.001)
+            .unwrap_or(1) as i32;
+        ix = (ix + dir).clamp(0, SPEED_STEPS.len() as i32 - 1);
+        let next = SPEED_STEPS[ix as usize];
+        s.settings.update(|st| st.speed = next);
+        s.engine.set_speed(next);
+        s.toast = format!("倍速 {next}x");
+        cx.notify();
+    });
+}
+
+pub(crate) fn set_volume(store: &Entity<AppStore>, v: f64, cx: &mut App) {
     store.update(cx, |s, cx| {
         s.player.volume = v.clamp(0.0, 1.0);
         s.engine.set_volume(s.player.volume);
@@ -698,6 +715,7 @@ pub fn handle_player_event_state(
     match ev {
         echo_audio::PlayerEvent::Position(p) => {
             s.player.position = p;
+            s.position_at = std::time::Instant::now();
             cx.notify();
             None
         }
@@ -740,21 +758,37 @@ pub fn handle_player_event_state(
 }
 
 /// 切换浅色/深色主题（带过渡动画，并落盘）。
-pub(crate) fn cycle_theme(store: &Entity<AppStore>, cx: &mut App) {
+pub(crate) fn cycle_theme(
+    store: &Entity<AppStore>,
+    origin: Option<gpui::Point<gpui::Pixels>>,
+    cx: &mut App,
+) {
     let next = match store.read(cx).settings.get().theme_mode {
         echo_core::ThemeMode::Dark => echo_core::ThemeMode::Light,
         _ => echo_core::ThemeMode::Dark,
     };
-    set_theme_mode(store, next, cx);
+    set_theme_mode(store, next, origin, cx);
 }
 
-/// 指定主题模式（带过渡动画）。
-pub(crate) fn set_theme_mode(store: &Entity<AppStore>, mode: echo_core::ThemeMode, cx: &mut App) {
+/// 指定主题模式：从 `origin`（通常是开关位置）开始的「开关灯」圆形揭示。
+pub(crate) fn set_theme_mode(
+    store: &Entity<AppStore>,
+    mode: echo_core::ThemeMode,
+    origin: Option<gpui::Point<gpui::Pixels>>,
+    cx: &mut App,
+) {
     if store.read(cx).settings.get().theme_mode == mode {
         return;
     }
     store.update(cx, |s, cx| {
-        s.begin_theme_anim();
+        // 揭示期间保持旧主题；圆盖满窗口的那一帧切换为新主题
+        let hold = s.theme();
+        s.theme_anim = None;
+        s.theme_reveal = Some(crate::state::ThemeReveal {
+            origin: origin.unwrap_or_else(|| gpui::point(px(64.), px(600.))),
+            hold,
+            started: std::time::Instant::now(),
+        });
         s.settings.update(|st| st.theme_mode = mode);
         s.toast = match mode {
             echo_core::ThemeMode::Dark => "已切换到深色主题".into(),
@@ -764,20 +798,57 @@ pub(crate) fn set_theme_mode(store: &Entity<AppStore>, mode: echo_core::ThemeMod
         cx.notify();
     });
 
-    // 逐帧驱动过渡：约 16ms 一次，跑完 THEME_TRANSITION_SECS 后收尾
+    // 逐帧驱动：圆形扩散 ~550ms（ease-out cubic），结束后收尾换装
     let anim_store = store.clone();
     cx.spawn(async move |cx: &mut AsyncApp| {
-        let steps = (crate::theme::THEME_TRANSITION_SECS / 0.016).ceil() as usize + 1;
+        let steps = (crate::theme::THEME_REVEAL_SECS / 0.016).ceil() as usize + 1;
         for _ in 0..steps {
             smol::Timer::after(std::time::Duration::from_millis(16)).await;
             let _ = anim_store.update(cx, |_, cx| cx.notify());
         }
         let _ = anim_store.update(cx, |s, cx| {
+            s.theme_reveal = None;
             s.finish_theme_anim();
             cx.notify();
         });
     })
     .detach();
+}
+
+/// 指定背景特效模式（Mica / Acrylic / 跟随系统 / 关闭），落盘并立即应用。
+pub(crate) fn set_backdrop_mode(store: &Entity<AppStore>, mode: echo_core::BackdropMode, cx: &mut App) {
+    // 生效模式与持久化设置都要看：ECHO_BACKDROP 环境变量覆盖时两者可能不同
+    let persisted = store.read(cx).settings.get().backdrop;
+    let effective = store.read(cx).backdrop_effective;
+    if persisted == mode && effective == mode {
+        return;
+    }
+    store.update(cx, |s, cx| {
+        s.backdrop_effective = mode;
+        if s.settings.get().backdrop != mode {
+            s.settings.update(|st| st.backdrop = mode);
+        }
+        s.toast = format!("背景特效：{}", mode.label());
+        cx.notify();
+    });
+    apply_backdrop(store, cx);
+}
+
+/// 把当前设置的背景特效模式应用到主窗口。
+///
+/// 点击回调里只有 `&mut App`（没有 `&mut Window`），所以从 `AppGlobal`
+/// 取出主窗口句柄回到窗口上下文再调 DWM。
+pub(crate) fn apply_backdrop(store: &Entity<AppStore>, cx: &mut App) {
+    let mode = store.read(cx).backdrop_effective;
+    let handle = cx.try_global::<crate::state::AppGlobal>()
+        .and_then(|g| g.main_window);
+    if let Some(handle) = handle {
+        let _ = handle.update(cx, |_view, window, _cx| {
+            crate::windows_backdrop::apply(window, mode);
+        });
+        // 材质可见性可能变了（比如关掉特效），主窗口背景要重新配色
+        let _ = store.update(cx, |_, cx| cx.notify());
+    }
 }
 
 /// 最大化 / 还原（点窗口按钮、双击标题栏都走这里）。
@@ -786,7 +857,7 @@ pub(crate) fn set_theme_mode(store: &Entity<AppStore>, mode: echo_core::ThemeMod
 /// `WM_SIZE`，而 gpui 的 resize 回调是 `window.update(...)`，重入时会失败并被
 /// `log_err` 吞掉 —— 结果就是窗口铺开了、布局还是旧的（用户看到的「只是挪到了左上角」）。
 /// 所以延到下一轮消息循环再交给系统处理。
-fn spawn_toggle_maximize(handle: AnyWindowHandle, cx: &mut App) {
+pub(crate) fn spawn_toggle_maximize(handle: AnyWindowHandle, cx: &mut App) {
     cx.spawn(async move |cx: &mut AsyncApp| {
         smol::Timer::after(std::time::Duration::from_millis(60)).await;
         let before = handle
@@ -813,6 +884,7 @@ fn spawn_toggle_maximize(handle: AnyWindowHandle, cx: &mut App) {
 }
 
 /// 路由后退一步（顶栏后退按钮与歌词页返回共用）。
+#[allow(dead_code)] // 播放条上的「切回播放页」已移除，暂时没有调用点，保留备用
 pub fn go_back(store: &Entity<AppStore>, cx: &mut App) {
     let moved = store.update(cx, |s, cx| {
         let ok = s.routes.back();
@@ -915,7 +987,6 @@ pub fn load_page(store: &Entity<AppStore>, page: &Page, cx: &mut App) {
             crate::liked::load_remote_liked(store, false, cx);
         }
         Page::Fm => crate::views::load_fm(store, false, cx),
-        Page::FreeListen => crate::views::load_free_listen(store, false, cx),
         Page::Lyric => {
             // 歌词页直接渲染当前曲目的歌词（没有就现拉一次）
             crate::views::load_lyric(store, cx);
@@ -1124,7 +1195,16 @@ pub(crate) fn load_search_tab(store: &Entity<AppStore>, kw: &str, tab: usize, cx
             match tab {
                 1 => client.search_playlists(&kw, 1, 30).await.map(SearchHit::Playlists),
                 2 => client.search_artists(&kw, 1, 30).await.map(SearchHit::Artists),
-                _ => client.search_albums(&kw, 1, 30).await.map(SearchHit::Albums),
+                3 => client.search_albums(&kw, 1, 30).await.map(SearchHit::Albums),
+                4 => client
+                    .lyric_candidates(&echo_core::Song {
+                        title: kw.clone(),
+                        ..Default::default()
+                    })
+                    .await
+                    .map(|v| v.into_iter().take(30).collect::<Vec<_>>())
+                    .map(SearchHit::Lyrics),
+                _ => client.search_mvs(&kw, 1, 30).await.map(SearchHit::Mvs),
             }
         })
     });
@@ -1142,6 +1222,8 @@ pub(crate) fn load_search_tab(store: &Entity<AppStore>, kw: &str, tab: usize, cx
                 Ok(SearchHit::Playlists(v)) => s.search.playlists = v,
                 Ok(SearchHit::Artists(v)) => s.search.artists = v,
                 Ok(SearchHit::Albums(v)) => s.search.albums = v,
+                Ok(SearchHit::Lyrics(v)) => s.search.lyrics = v,
+                Ok(SearchHit::Mvs(v)) => s.search.mvs = v,
                 Err(e) => s.toast = format!("搜索失败：{e}"),
             }
             cx.notify();
@@ -1155,6 +1237,9 @@ enum SearchHit {
     Playlists(Vec<echo_core::Playlist>),
     Artists(Vec<echo_core::Artist>),
     Albums(Vec<echo_core::Album>),
+    /// 歌词搜索候选（title/artist/duration）
+    Lyrics(Vec<echo_api::lyrics::LyricCandidate>),
+    Mvs(Vec<echo_core::MvMeta>),
 }
 
 fn load_search_hot(store: &Entity<AppStore>, cx: &mut App) {
@@ -1182,6 +1267,8 @@ fn load_search_hot(store: &Entity<AppStore>, cx: &mut App) {
 impl Root {
     pub fn render_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.store.read(cx).theme();
+        // 系统材质（Mica/Acrylic）垫在窗口后面时，基础背景画成半透明透出材质
+        let backdrop = self.store.read(cx).backdrop_active();
         // 这些页面用虚拟化列表（gpui::list 自滚），不需要整页滚动容器
         let list_page = {
             let s = self.store.read(cx);
@@ -1203,7 +1290,13 @@ impl Root {
             .size_full()
             .flex()
             .flex_col()
-            .bg(theme.bg_main)
+            .bg(if backdrop {
+                // 内容区基底层：透明部分透出系统材质（Mica/Acrylic）。
+                // 不能太实，否则材质被盖住只剩灰底（用户看到的「云母无效」）
+                theme.bg_main.opacity(0.72)
+            } else {
+                theme.bg_main
+            })
             .text_color(theme.text)
             .text_size(px(14.))
             .font_family("Segoe UI")
@@ -1319,7 +1412,50 @@ impl Root {
             .child(self.render_player_menu(cx))
             .child(self.render_queue_panel(cx))
             .child(self.render_mv_card(cx))
+            .child(self.render_theme_reveal(cx))
             .child(self.render_toast(cx))
+    }
+
+    /// 主题「开关灯」圆形揭示层：新主题底色从开关位置扩散，盖满即换装。
+    fn render_theme_reveal(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(r) = self.store.read(cx).theme_reveal.clone() else {
+            return div().into_any_element();
+        };
+        let target_bg = self.store.read(cx).target_theme().bg_main;
+        let origin = r.origin;
+        let started = r.started;
+        canvas(
+            move |_, _, _| {},
+            move |bounds, _, window, _| {
+                let t = (started.elapsed().as_secs_f32() / crate::theme::THEME_REVEAL_SECS).min(1.0f32);
+                if t >= 1.0 {
+                    return;
+                }
+                let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+                // 圆心到最远角的距离 = 完整盖满所需半径
+                let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                let ox = f32::from(origin.x) - f32::from(bounds.origin.x);
+                let oy = f32::from(origin.y) - f32::from(bounds.origin.y);
+                let dx = (ox).max(w - ox);
+                let dy = (oy).max(h - oy);
+                let max_r = (dx * dx + dy * dy).sqrt();
+                let rad = (e * max_r).max(1.0);
+                let side = rad * 2.0;
+                window.paint_quad(
+                    fill(
+                        Bounds::new(
+                            point(px(f32::from(origin.x) - rad), px(f32::from(origin.y) - rad)),
+                            size(px(side), px(side)),
+                        ),
+                        target_bg,
+                    )
+                    .corner_radii(gpui::Corners::all(px(rad))),
+                );
+            },
+        )
+        .absolute()
+        .size_full()
+        .into_any_element()
     }
 
     // ---------- 播放队列面板 ----------
@@ -1531,6 +1667,7 @@ impl Root {
     // ---------- 侧边栏 ----------
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.store.read(cx).theme();
+        let backdrop = self.store.read(cx).backdrop_active();
         let collapsed = self.store.read(cx).sidebar_collapsed;
         let found_open = self.store.read(cx).sidebar_found_open;
         let lib_open = self.store.read(cx).sidebar_lib_open;
@@ -1755,7 +1892,10 @@ impl Root {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .bg(theme.bg_sidebar)
+            // 材质激活时侧栏不再自画背景：它叠在根基层上会变成一块
+            // 「灰色补丁」（两层半透明叠出 ~85% 不透明度，把材质全盖住），
+            // 与内容区统一透出材质，靠右侧 1px 边框区分层级
+            .when(!backdrop, |el| el.bg(theme.bg_sidebar))
             .border_r_1()
             .border_color(theme.border)
             // 顶部拖动区：拖动可移动窗口
@@ -1811,7 +1951,6 @@ impl Root {
                         .child(self.quick_nav_item(&store, "icons/cloud.svg", "音乐云盘", Page::Cloud, cx))
                         .child(self.quick_nav_item(&store, "icons/clock.svg", "播放历史", Page::History, cx))
                         .child(self.quick_nav_item(&store, "icons/bag.svg", "已购音乐", Page::Purchased, cx))
-                        .child(self.quick_nav_item(&store, "icons/sparkles.svg", "免费听", Page::FreeListen, cx)),
                 )
             })
             // ===== 歌单 =====
@@ -1971,8 +2110,9 @@ impl Root {
                             size: 16.,
                             color: theme.text_secondary,
                             hover_bg: theme.bg_hover,
-                            action: Box::new(|root: &mut Root, _, _, cx: &mut Context<Root>| {
-                                cycle_theme(&root.store.clone(), cx);
+                            action: Box::new(|root: &mut Root, ev: &MouseDownEvent, _, cx: &mut Context<Root>| {
+                                // 开光灯从开关位置开始扩散
+                                cycle_theme(&root.store.clone(), Some(ev.position), cx);
                             }),
                         }
                         .render("tool-theme", cx),
@@ -2035,6 +2175,8 @@ impl Root {
     // ---------- 顶栏 ----------
     fn render_titlebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.store.read(cx).theme();
+        // 材质激活时标题栏不再自画背景（与根基层同色，避免叠出一块深斑）
+        let backdrop = self.store.read(cx).backdrop_active();
         let store = self.store.clone();
         let can_back = store.read(cx).routes.can_back();
         let can_forward = store.read(cx).routes.can_forward();
@@ -2048,7 +2190,7 @@ impl Root {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .bg(theme.bg_main)
+            .when(!backdrop, |el| el.bg(theme.bg_main))
             // 顶部细条：整行宽可拖动窗口
             .child(
                 div()
@@ -2202,6 +2344,26 @@ impl Root {
             )
             // 窗口控制
             .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .mr_2()
+                    // mini 模式：开 mini 播放器并隐藏主窗口（播放不受影响）
+                    .child(
+                        IconButton {
+                            path: "icons/pip.svg",
+                            size: 14.,
+                            color: theme.text_secondary,
+                            hover_bg: theme.bg_hover,
+                            action: Box::new(|root: &mut Root, _, window, cx| {
+                                crate::desktop::open_mini_player(&root.store.clone(), cx);
+                                crate::win::hide_window(window);
+                            }),
+                        }
+                        .render("tb-mini", cx),
+                    ),
+            )
+            .child(
                 IconButton {
                     path: "icons/minimize.svg",
                     size: 14.,
@@ -2262,8 +2424,7 @@ impl Root {
             Some(Page::Settings) => self.render_settings(cx).into_any_element(),
             Some(Page::Favorites) => self.render_library(true, cx).into_any_element(),
             Some(Page::Fm) => self.render_fm(cx).into_any_element(),
-            Some(Page::Lyric) => self.render_lyric(cx).into_any_element(),
-            Some(Page::FreeListen) => self.render_free_listen(cx).into_any_element(),
+            Some(Page::Lyric) => div().into_any_element(),
             Some(Page::Cloud) => self.render_cloud(cx).into_any_element(),
             Some(Page::Purchased) => self.render_purchased(cx).into_any_element(),
             Some(Page::History) => self.render_library(false, cx).into_any_element(),
@@ -2651,7 +2812,7 @@ impl Root {
         }
 
         // 分类 Tab
-        let tabs: Vec<AnyElement> = ["单曲", "歌单", "歌手", "专辑"]
+        let tabs: Vec<AnyElement> = ["单曲", "歌单", "歌手", "专辑", "歌词", "MV"]
             .iter()
             .enumerate()
             .map(|(i, label)| {
@@ -2748,6 +2909,189 @@ impl Root {
                     self.empty_hint("没有找到相关专辑", &theme).into_any_element()
                 } else {
                     div().grid().grid_cols(5).gap_4().children(cards).into_any_element()
+                }
+            }
+            // ===== 歌词搜索结果（第三期搜索补全）=====
+            4 => {
+                if search.lyrics.is_empty() {
+                    self.empty_hint("没有找到相关歌词", &theme).into_any_element()
+                } else {
+                    let rows: Vec<AnyElement> = search
+                        .lyrics
+                        .iter()
+                        .map(|c| {
+                            let nav_store = store.clone();
+                            let title = c.title.clone();
+                            let click_title = title.clone();
+                            let artist = c.artist.clone();
+                            let click_artist = artist.clone();
+                            let dur = c.duration;
+                            div()
+                                .id(SharedString::from(format!(
+                                    "lyric-{}-{}",
+                                    c.id,
+                                    title.chars().take(12).collect::<String>()
+                                )))
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .px_3()
+                                .py_2()
+                                .rounded(px(8.))
+                                .cursor_pointer()
+                                .hover(move |el| el.bg(theme.bg_hover))
+                                .on_click(move |_, _, cx| {
+                                    // 歌词本身不可独立播放：点击跳去搜这首歌
+                                    let kw = if click_artist.is_empty() {
+                                        click_title.clone()
+                                    } else {
+                                        format!("{click_artist} {click_title}")
+                                    };
+                                    navigate(&nav_store, Page::Search(kw), cx);
+                                })
+                                .child(
+                                    div()
+                                        .w(px(18.))
+                                        .text_size(px(13.))
+                                        .text_color(theme.accent)
+                                        .child(icon("icons/list-music.svg", 14., theme.accent)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_size(px(13.5))
+                                                .truncate()
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(theme.text_tertiary)
+                                                .child(artist),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_tertiary)
+                                        .child(format!("{}:{:02}", dur / 60, dur % 60)),
+                                )
+                                .into_any_element()
+                        })
+                        .collect();
+                    div().flex().flex_col().gap_1().children(rows).into_any_element()
+                }
+            }
+            // ===== MV 搜索结果（第三期搜索补全）=====
+            5 => {
+                if search.mvs.is_empty() {
+                    self.empty_hint("没有找到相关 MV", &theme).into_any_element()
+                } else {
+                    let rows: Vec<AnyElement> = search
+                        .mvs
+                        .iter()
+                        .map(|m| {
+                            let url = format!(
+                                "https://www.kugou.com/mvweb/html/mv_{}.html",
+                                m.mvhash.to_lowercase()
+                            );
+                            let title = m.title.clone();
+                            let singer = m.singer.clone();
+                            let quality = m.quality.clone();
+                            let heat = m.heat;
+                            let dur = m.duration;
+                            let mv_store = store.clone();
+                            div()
+                                .id(SharedString::from(format!(
+                                    "mv-{}",
+                                    m.mvhash.chars().take(10).collect::<String>()
+                                )))
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .px_3()
+                                .py_2()
+                                .rounded(px(8.))
+                                .cursor_pointer()
+                                .hover(move |el| el.bg(theme.bg_hover))
+                                .on_click(move |_, _, cx| {
+                                    // 视频播放不在本 app 能力范围内：交给浏览器（与 MV 卡片一致）
+                                    #[cfg(windows)]
+                                    {
+                                        let _ = std::process::Command::new("cmd")
+                                            .args(["/c", "start", "", &url])
+                                            .spawn();
+                                    }
+                                    #[cfg(not(windows))]
+                                    {
+                                        let _ = std::process::Command::new("open")
+                                            .arg(&url)
+                                            .spawn();
+                                    }
+                                    mv_store.update(cx, |s, cx| {
+                                        s.toast = "已在浏览器中打开 MV".into();
+                                        cx.notify();
+                                    });
+                                })
+                                .child(
+                                    div()
+                                        .w(px(18.))
+                                        .text_size(px(13.))
+                                        .text_color(theme.accent)
+                                        .child(icon("icons/play.svg", 14., theme.accent)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_size(px(13.5))
+                                                .truncate()
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(theme.text_tertiary)
+                                                .child(singer),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(if quality.is_empty() {
+                                            theme.text_tertiary
+                                        } else {
+                                            theme.accent
+                                        })
+                                        .when(!quality.is_empty(), |el| el.child(quality)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_tertiary)
+                                        .child(format!("{}:{:02}", dur / 60, dur % 60)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_tertiary)
+                                        .child(format_heat(heat)),
+                                )
+                                .into_any_element()
+                        })
+                        .collect();
+                    div().flex().flex_col().gap_1().children(rows).into_any_element()
                 }
             }
             _ => {
@@ -2961,6 +3305,7 @@ impl Root {
     // ---------- 播放条 ----------
     fn render_player_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.store.read(cx).theme();
+        let backdrop = self.store.read(cx).backdrop_active();
         let s = self.store.read(cx);
         let current = s.player.current().cloned();
         let playing = s.player.playing;
@@ -2991,7 +3336,12 @@ impl Root {
             .items_center()
             .px_4()
             .gap_4()
-            .bg(theme.bg_panel)
+            .bg(if backdrop {
+                // 播放条最浓，给底部一个稳定的锚（文字/控件都落在这里）
+                theme.bg_panel.opacity(0.90)
+            } else {
+                theme.bg_panel
+            })
             .border_t_1()
             .border_color(theme.border)
             // 拖拽（进度条 / 音量条）统一挂在播放条上：
@@ -3039,10 +3389,20 @@ impl Root {
                 div().w(px(260.)).flex().items_center().gap_3()
                     .child(
                         div()
+                            .id("pb-cover")
                             .size(px(52.))
                             .rounded(px(COVER_RADIUS))
                             .overflow_hidden()
                             .flex_shrink_0()
+                            .cursor_pointer()
+                            .hover(move |el| el.opacity(0.85))
+                            // 点击封面进入歌词页（对齐原 EchoMusic）
+                            .on_click({
+                                let st = store.clone();
+                                move |_, _, cx| {
+                                    navigate(&st, Page::Lyric, cx);
+                                }
+                            })
                             .bg(theme.bg_hover)
                             .flex()
                             .items_center()
@@ -3155,13 +3515,17 @@ impl Root {
                                         let store = self.store.clone();
                                         move |_, _, cx| toggle_play(&store, cx)
                                     })
-                                    .child(icon(
-                                        if loading { "icons/download.svg" }
-                                        else if playing { "icons/pause.svg" }
-                                        else { "icons/play.svg" },
-                                        17.,
-                                        gpui::white(),
-                                    )),
+                                    // 切歌/缓冲时显示旋转加载圈（不是下载图标）
+                                    .child(if loading {
+                                        loading_spinner(17., gpui::white()).into_any_element()
+                                    } else {
+                                        icon(
+                                            if playing { "icons/pause.svg" } else { "icons/play.svg" },
+                                            17.,
+                                            gpui::white(),
+                                        )
+                                        .into_any_element()
+                                    }),
                             )
                             .child(
                                 IconButton {
@@ -3439,44 +3803,6 @@ impl Root {
                                 "icons/queue.svg",
                                 15.,
                                 if open { theme.accent } else { theme.text_secondary },
-                            ))
-                    })
-                    // 歌词：打开歌词页
-                    .child({
-                        let st = self.store.clone();
-                        let open_lyric = self
-                            .store
-                            .read(cx)
-                            .routes
-                            .current()
-                            .cloned()
-                            .map(|p| matches!(p, Page::Lyric))
-                            .unwrap_or(false);
-                        div()
-                            .id("pb-lyric")
-                            .w(px(30.))
-                            .h(px(30.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.))
-                            .cursor_pointer()
-                            .hover(move |el| el.bg(theme.bg_hover))
-                            .on_click(move |_, _, cx| {
-                                if open_lyric {
-                                    go_back(&st, cx);
-                                } else {
-                                    crate::ui::navigate(&st, Page::Lyric, cx);
-                                }
-                            })
-                            .child(icon(
-                                "icons/list-music.svg",
-                                15.,
-                                if open_lyric {
-                                    theme.accent
-                                } else {
-                                    theme.text_secondary
-                                },
                             ))
                     })
                     // 倍速：点一下在 0.75/1.0/1.25/1.5/2.0 之间循环
@@ -4320,6 +4646,17 @@ pub(crate) fn ellipsize(s: &str, max_chars: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// 播放量格式化（MV 搜索结果）：105060666 → 1.1亿、9580000 → 958万、12345 → 1.2万。
+fn format_heat(n: u64) -> String {
+    if n >= 100_000_000 {
+        format!("{:.1}亿", n as f64 / 100_000_000.0)
+    } else if n >= 10_000 {
+        format!("{:.0}万", n as f64 / 10_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 /// 模糊匹配：先做子串匹配，不中再按「字符顺序出现」判定（支持跳字，如 `jx` 命中 `江南`…）。

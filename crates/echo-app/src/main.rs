@@ -3,6 +3,7 @@
 // release 构建不弹出控制台窗口；debug 构建保留，方便看日志
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod amll;
 mod assets;
 mod icons;
 mod imgcache;
@@ -12,10 +13,13 @@ mod state;
 mod text_input;
 mod theme;
 mod desktop;
+mod smtc;
+mod taskbar;
 mod ui;
 mod views;
 mod vip;
 mod win;
+mod windows_backdrop;
 
 use assets::{Assets, ReqwestHttpClient};
 use echo_audio::{AudioEngine, PlayerEvent};
@@ -54,11 +58,47 @@ pub struct Root {
     pub content_scroll: ScrollHandle,
     /// 侧栏歌单列表滚动条句柄
     pub sidebar_scroll: ScrollHandle,
+    /// 播放页歌词列表：当前行变化时把它滚到视口中间
+    pub lyric_scroll: UniformListScrollHandle,
+    /// 上一次已跟随的行号（只在换行时滚，否则会抢掉用户手动滚动）
+    pub lyric_follow: Option<usize>,
+    /// 歌词滚动动画：(起点偏移, 目标偏移, 开始时刻)。换行时启动，
+    /// 用 ease-out-back 缓动滚到「当前句居中」，观感是向上弹一下再稳住
+    pub lyric_scroll_anim: Option<(f32, f32, std::time::Instant)>,
+    /// 用户最后一次手动滚歌词的时间：这段时间内不自动居中，免得抢鼠标
+    pub lyric_user_scroll_at: Option<std::time::Instant>,
+    /// 用户滚过歌词、等着 5 秒后回弹到当前句
+    pub lyric_restore_pending: bool,
+    /// 上一次「程序自己」设的滚动偏移。渲染时和真实偏移一比，
+    /// 差得多说明是用户滚的（uniform_list 会把 wheel 事件吃掉，
+    /// 挂在父节点上的 on_scroll_wheel 根本收不到，只能这样感知）
+    pub lyric_auto_off: f32,
     /// 上一次写进窗口标题的文本（避免每帧都调 SetWindowText）
     pub window_title: String,
 }
 
 impl Root {
+    /// 任务栏缩略图按钮跟随播放 / 收藏状态（`taskbar::sync` 内部去重，每帧调也安全）。
+    fn sync_taskbar_buttons(&mut self, cx: &mut Context<Self>) {
+        let (playing, fav) = {
+            let s = self.store.read(cx);
+            let playing = s.player.playing;
+            let fav = s
+                .player
+                .current()
+                .map(|c| {
+                    if s.session.get().userid != 0 {
+                        crate::liked::is_remote_liked(&s, c)
+                    } else {
+                        s.library.is_favorite(c)
+                    }
+                })
+                .unwrap_or(false);
+            (playing, fav)
+        };
+        taskbar::sync(playing, fav);
+    }
+
     /// 把「正在播放」写进窗口标题。
     ///
     /// Windows 的任务栏悬浮提示、任务管理器、Alt-Tab 都读窗口标题，
@@ -90,11 +130,55 @@ impl Root {
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_window_title(window, cx);
+        self.sync_taskbar_buttons(cx);
         // 整棵树套一层自定义图片缓存：所有 img 都走 LRU，不再无限常驻
+        // 播放页（歌词页）全屏接管：铺满整个窗口，盖住侧栏/标题栏/播放条
+        let content: gpui::AnyElement =
+            if matches!(self.store.read(cx).routes.current(), Some(crate::state::Page::Lyric)) {
+                self.render_lyric(window, cx)
+            } else {
+                self.render_layout(window, cx).into_any_element()
+            };
         image_cache(self.cover_cache.clone())
             .size_full()
-            .child(self.render_layout(window, cx))
+            .child(content)
     }
+}
+
+/// 日志过滤器：只压掉「已知、且上游已自行降级」的噪音，其它照旧透传。
+struct QuietDxgiProbe<L>(L);
+
+impl<L: log::Log> log::Log for QuietDxgiProbe<L> {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if is_dxgi_probe_noise(record) {
+            return;
+        }
+        self.0.log(record);
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+/// DXGI 调试层探测失败的噪音。
+///
+/// `DXGI_ERROR_SDK_COMPONENT_MISSING`（0x887A002D）：gpui 在 **debug 构建**里会调
+/// `DXGIGetDebugInterface1` 探一下有没有 DXGI 调试接口，系统没装「图形工具」
+/// （Graphics Tools）这个可选功能就必然失败。gpui 自己已经降级处理
+/// （打一条 WARN 后关掉 DirectX 调试特性继续跑），渲染不受影响。
+/// 但它在降级前先用 `log_err()` 把原始 Error 以 **ERROR** 级别打出来，
+/// 于是每次启动日志第一行都是这条假错误，`grep ERROR` 的自动化会被它带偏。
+///
+/// 这里只精确放行这一个 HRESULT（错误码与系统语言无关），其它 ERROR 一律保留。
+/// 不想过滤也可以装真正的调试层：
+/// `DISM /Online /Add-Capability /CapabilityName:Tools.Graphics.DirectX~~~~0.0.1.0`
+fn is_dxgi_probe_noise(record: &log::Record<'_>) -> bool {
+    record.level() == log::Level::Error && record.args().to_string().contains("0x887A002D")
 }
 
 fn main() {
@@ -109,7 +193,12 @@ fn main() {
             log_builder.target(env_logger::Target::Pipe(Box::new(f)));
         }
     }
-    let _ = log_builder.try_init();
+    // 包一层只用来压掉已知噪音，其它行为与 env_logger 完全一致
+    let logger = log_builder.build();
+    let max_level = logger.filter();
+    if log::set_boxed_logger(Box::new(QuietDxgiProbe(logger))).is_ok() {
+        log::set_max_level(max_level);
+    }
     // panic 落日志：release 无控制台，否则崩溃时看不到任何原因。
     // 先写消息再抓 backtrace（force_capture 不受 RUST_BACKTRACE 影响）。
     let prev_hook = std::panic::take_hook();
@@ -152,8 +241,11 @@ fn main() {
             engine.set_volume(settings.get().volume);
             // 倍速（第三期）：设置里存的值直接灌给引擎
             engine.set_speed(settings.get().speed);
-            if !settings.get().output_device.is_empty() {
-                log::info!("输出设备（设置）：{}", settings.get().output_device);
+            // 输出设备（第三期）：设置里存了设备名就切过去（运行中切换已支持）
+            let saved_output = settings.get().output_device;
+            if !saved_output.is_empty() {
+                log::info!("输出设备（设置）：{saved_output}");
+                engine.switch_device(Some(&saved_output));
             }
 
             // ===== 会话与本地曲库 =====
@@ -193,8 +285,15 @@ fn main() {
             let volume_bounds = Arc::new(Mutex::new(None));
             let volume = settings.get().volume;
             let play_mode = settings.get().play_mode;
+            // 背景特效模式：ECHO_BACKDROP=system|mica|acrylic|off 可临时覆盖
+            // （只影响本次运行，不写回设置文件，供自动化测试用）。
+            let backdrop_mode = match std::env::var("ECHO_BACKDROP") {
+                Ok(v) => windows_backdrop::parse_mode(&v).unwrap_or_else(|| settings.get().backdrop),
+                Err(_) => settings.get().backdrop,
+            };
             let store = cx.new(|_| AppStore {
                 settings,
+                backdrop_effective: backdrop_mode,
                 client: client.clone(),
                 engine: engine.clone(),
                 player: player::PlayerState {
@@ -239,9 +338,6 @@ fn main() {
                 lyric: None,
                 lyric_key: String::new(),
                 lyric_loading: false,
-                free_listen: Arc::new(Vec::new()),
-                free_listen_loaded: false,
-                free_listen_loading: false,
                 player_menu: false,
                 sleep_until: None,
                 mv: None,
@@ -271,11 +367,13 @@ fn main() {
                 seek_target: 0.0,
                 search_input: String::new(),
                 toast: String::new(),
+                position_at: std::time::Instant::now(),
                 sidebar_collapsed: false,
                 sidebar_found_open: true,
                 sidebar_lib_open: true,
                 sidebar_tab: 0,
                 theme_anim: None,
+                theme_reveal: None,
                 progress_bounds_slot: progress_bounds.clone(),
                 volume_bounds_slot: volume_bounds.clone(),
                 queue_scroll: gpui::UniformListScrollHandle::new(),
@@ -415,13 +513,19 @@ fn main() {
                             volume_bounds: volume_bounds.clone(),
                             content_scroll: ScrollHandle::new(),
                             sidebar_scroll: ScrollHandle::new(),
+                            lyric_scroll: UniformListScrollHandle::new(),
+                            lyric_follow: None,
+                            lyric_scroll_anim: None,
+                            lyric_user_scroll_at: None,
+                            lyric_restore_pending: false,
+                            lyric_auto_off: 0.0,
                             window_title: String::new(),
                         })
                     },
                 )
                 .expect("open window");
 
-            // ===== 窗口图标 / 关闭即隐藏 / 系统托盘 =====
+            // ===== 窗口图标 / 背景特效 / 关闭即隐藏 / 系统托盘 =====
             // 主窗口 HWND 共享给托盘线程（托盘线程只转发命令，窗口操作仍在 UI 线程）
             let main_hwnd = Arc::new(std::sync::atomic::AtomicIsize::new(0));
             {
@@ -431,6 +535,8 @@ fn main() {
                     if let Some(h) = win::hwnd(window) {
                         slot.store(h as isize, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // 背景特效（Mica / Acrylic / 磨砂降级），设置项在「设置 → 外观」
+                    windows_backdrop::apply(window, backdrop_mode);
                     // 键盘默认落点：没有输入框时由根节点接住（空格播放/暂停）
                     window.focus(&root.root_focus);
                     // 关闭按钮 / Alt+F4 只隐藏窗口，真正退出走托盘菜单
@@ -440,6 +546,10 @@ fn main() {
                     });
                 });
             }
+            // ===== SMTC 系统媒体控制（任务栏悬浮卡片 / 蓝牙耳机播放控件）=====
+            // 按键事件经托盘事件通道回主线程，与托盘菜单共用处理逻辑
+            crate::smtc::start(main_hwnd.load(std::sync::atomic::Ordering::Relaxed));
+
             {
                 let (tray_tx, tray_rx) = std::sync::mpsc::channel::<win::TrayEvent>();
                 win::start_tray(main_hwnd.clone(), tray_tx);
@@ -484,10 +594,63 @@ fn main() {
                 .detach();
             }
 
+            // ===== 任务栏缩略图工具栏（悬停任务栏按钮 → 上一曲/播放暂停/下一曲/收藏）=====
+            // 点击经子类化拦 WM_COMMAND 后走 mpsc 回来，与托盘菜单同一套动作
+            {
+                let (tb_tx, tb_rx) = std::sync::mpsc::channel::<taskbar::TaskbarEvent>();
+                taskbar::init(
+                    main_hwnd.load(std::sync::atomic::Ordering::Relaxed),
+                    tb_tx,
+                );
+                let tb_store = store.clone();
+                let tb_win = window;
+                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                    loop {
+                        smol::Timer::after(std::time::Duration::from_millis(120)).await;
+                        loop {
+                            match tb_rx.try_recv() {
+                                Ok(taskbar::TaskbarEvent::Prev) => {
+                                    let _ = tb_win.update(cx, |_, _, cx| {
+                                        ui::prev_track(&tb_store, cx);
+                                    });
+                                }
+                                Ok(taskbar::TaskbarEvent::TogglePlay) => {
+                                    let _ = tb_win.update(cx, |_, _, cx| {
+                                        ui::toggle_play(&tb_store, cx);
+                                    });
+                                }
+                                Ok(taskbar::TaskbarEvent::Next) => {
+                                    let _ = tb_win.update(cx, |_, _, cx| {
+                                        ui::next_track(&tb_store, false, cx);
+                                    });
+                                }
+                                Ok(taskbar::TaskbarEvent::ToggleFav) => {
+                                    let _ = tb_win.update(cx, |_, _, cx| {
+                                        let song =
+                                            tb_store.read(cx).player.current().cloned();
+                                        if let Some(song) = song {
+                                            crate::liked::toggle_like(&tb_store, &song, cx);
+                                        }
+                                    });
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+
             // 全局句柄
-            cx.set_global(AppGlobal {
-                store: store.downgrade(),
+            cx.set_global(AppGlobal {                store: store.downgrade(),
+                main_window: Some(window.into()),
             });
+
+            // 按设置恢复桌面歌词（浮窗之前只能从设置页手动开，重启即丢）
+            if store.read(cx).settings.get().desktop_lyric {
+                crate::desktop::toggle_desktop_lyric(&store, cx);
+            }
 
             // ===== 播放器事件桥接（std mpsc → smol channel → 主线程） =====
             let (ui_tx, ui_rx) = smol::channel::unbounded::<PlayerEvent>();
@@ -508,6 +671,19 @@ fn main() {
                         .update(cx, |s, cx| ui::handle_player_event_state(s, ev, cx))
                         .ok()
                         .flatten();
+                    // SMTC 同步：任务栏/蓝牙媒体控件跟随播放状态
+                    let _ = event_store.read_with(cx, |s, _| {
+                        if let Some(song) = s.player.current() {
+                            crate::smtc::sync(
+                                &song.title,
+                                &song.artist,
+                                &song.cover_url,
+                                s.player.playing,
+                                s.player.position,
+                                s.player.duration,
+                            );
+                        }
+                    });
                     if let Some((rid, song)) = to_load {
                         let _ = cx.update(|app| ui::spawn_resolve(&event_store, rid, song, app));
                     }
@@ -563,18 +739,33 @@ fn main() {
             // 默认进入首页
             ui::navigate(&store, Page::Home, cx);
 
-            // 加载动画泵：任一列表处于加载态时持续重绘，驱动居中加载动画旋转
+            // 动画泵：加载态（旋转）/ 停在歌词页或开着桌面歌词且在播放时（AMLL 扫光 ~30fps）重绘
             {
                 let pump_store = store.clone();
                 cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                     loop {
-                        let active = pump_store
-                            .read_with(cx, |s, _| s.any_loading())
-                            .unwrap_or(false);
-                        if active {
+                        let (loading, lyric_anim) = pump_store
+                            .read_with(cx, |s, _| {
+                                let on_lyric =
+                                    matches!(s.routes.current(), Some(crate::state::Page::Lyric));
+                                (
+                                    s.any_loading(),
+                                    s.player.playing
+                                        && (on_lyric || crate::desktop::lyric_window_open()),
+                                )
+                            })
+                            .unwrap_or((false, false));
+                        if loading || lyric_anim {
                             let _ = pump_store.update(cx, |_, cx| cx.notify());
+                            if lyric_anim {
+                                // 桌面歌词浮窗跟着刷（独立窗口不吃主窗口重绘）
+                                let _ = cx.update(|app| crate::desktop::refresh_float_windows(app));
+                            }
                         }
-                        smol::Timer::after(std::time::Duration::from_millis(50)).await;
+                        smol::Timer::after(std::time::Duration::from_millis(
+                            if loading || lyric_anim { 33 } else { 300 },
+                        ))
+                        .await;
                     }
                 })
                 .detach();
@@ -592,10 +783,15 @@ fn main() {
                         "rank-top" => Page::Rank("2".into(), "TOP500".into()),
                         "album" => Page::Album("212206631".into(), "秋风一吹又老一岁".into()),
                         "search-artist" | "search-album" => Page::Search("周杰伦".into()),
+                        // 搜索补全冒烟：进搜索页后自动切 歌词(4)/MV(5) tab
+                        "search-lyric" | "search-mv" => Page::Search("晴天".into()),
                         "settings" => Page::Settings,
+                        // ECHO_SMOKE=backdrop-mica|acrylic|system|off：
+                        // 进设置页后直接调用与点击按钮相同的生产路径切换背景特效，
+                        // 供自动化读回验证（绕过合成点击，真实用户仍走按钮点击）
+                        t if t.starts_with("backdrop-") => Page::Settings,
                         "cloud" => Page::Cloud,
                         "fm" => Page::Fm,
-                        "freelisten" | "free" => Page::FreeListen,
                         "lyric" => Page::Lyric,
                         "purchased" => Page::Purchased,
                         "profile" => Page::Profile,
@@ -647,6 +843,15 @@ fn main() {
                         });
                     }
 
+                    // ECHO_SMOKE=search-lyric|search-mv：搜索补全（歌词/MV tab）
+                    if target == "search-lyric" || target == "search-mv" {
+                        let tab = if target == "search-lyric" { 4 } else { 5 };
+                        smol::Timer::after(std::time::Duration::from_secs(3)).await;
+                        let _ = cx.update(|app| {
+                            ui::load_search_tab(&smoke_store, "晴天", tab, app);
+                        });
+                    }
+
                     // ECHO_SMOKE=queue：跳搜索页 → 自动播放第一首 → 打开队列面板（验证队列渲染）
                     if target == "queue" {
                         let _ = cx.update(|app| ui::navigate(&smoke_store, Page::Search("晴天".into()), app));
@@ -664,6 +869,39 @@ fn main() {
                             s.queue_open = true;
                             cx.notify();
                         });
+                    }
+
+                    // ECHO_SMOKE=mini：打开 mini 播放器（自动化验证浮窗）
+                    if target == "mini" {
+                        smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                        let _ = cx.update(|app| {
+                            crate::desktop::open_mini_player(&smoke_store, app);
+                        });
+                    }
+
+                    // ECHO_SMOKE=devswitch：播放一首歌 → 运行中切换输出设备，
+                    // 验证不断流、从原位置继续（日志看「输出设备已切换」）
+                    if target == "devswitch" {
+                        let _ = cx
+                            .update(|app| ui::navigate(&smoke_store, Page::Search("晴天".into()), app));
+                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
+                        let _ = cx.update(|app| {
+                            ui::play_from(&smoke_store, ui::PlaySource::Search, 0, app)
+                        });
+                        smol::Timer::after(std::time::Duration::from_secs(8)).await;
+                        let _ = smoke_store.update(cx, |s, _| {
+                            s.engine.switch_device(None); // 回系统默认（重建输出流）
+                        });
+                    }
+
+                    // ECHO_SMOKE=backdrop-*：走与设置页按钮相同的 set_backdrop_mode
+                    if let Some(mode_str) = target.strip_prefix("backdrop-") {
+                        if let Some(mode) = windows_backdrop::parse_mode(mode_str) {
+                            smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                            let _ = cx.update(|app| {
+                                ui::set_backdrop_mode(&smoke_store, mode, app);
+                            });
+                        }
                     }
                 })
                 .detach();
