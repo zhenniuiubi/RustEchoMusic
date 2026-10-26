@@ -36,6 +36,36 @@ pub struct DesktopLyricView {
     /// 前几帧再补一次「去边框」：DWM 属性在窗口真正上屏后才生效，
     /// 创建时设的那一次会被覆盖，表现就是「没 hover 时仍有一圈边框」
     frame_fix_frames: u8,
+    /// 当前窗口尺寸是按哪个字号倍数量出来的（倍数变了就重新量一次）
+    sized_for: f32,
+}
+
+/// 桌面歌词基准字号（1 倍 = 24px）。
+pub const LYRIC_BASE_PX: f32 = 24.;
+/// 字号倍数取值范围。
+pub const LYRIC_SCALE_MIN: f32 = 2.0;
+pub const LYRIC_SCALE_MAX: f32 = 5.0;
+
+/// 读取并夹取字号倍数（老配置没有这个字段时 serde 会给默认 2.0）。
+fn lyric_scale_of(settings: &echo_core::Settings) -> f32 {
+    let v = if settings.lyric_scale > 0.0 {
+        settings.lyric_scale
+    } else {
+        2.0
+    };
+    v.clamp(LYRIC_SCALE_MIN, LYRIC_SCALE_MAX)
+}
+
+/// 字号倍数 → 窗口尺寸。
+///
+/// 字号变大必须同步放开窗口：文字排版靠窗口宽度换行，窗口不涨就会被裁掉。
+/// 宽度随倍数增长（2 倍 840，4/5 倍封顶 1500），高度按「当前行 + 下一行 + 边距」算。
+fn lyric_window_size(scale: f32) -> (f32, f32) {
+    let font = LYRIC_BASE_PX * scale;
+    let next = 13. * scale;
+    let w = (420. * scale).clamp(700., 1500.);
+    let h = font * 1.7 + next * 1.5 + 30.;
+    (w, h)
 }
 
 impl Render for DesktopLyricView {
@@ -71,8 +101,31 @@ impl Render for DesktopLyricView {
         // 不能用半透明白：桌面歌词浮在任何壁纸/窗口之上，白字落在浅色背景
         // （浏览器、资源管理器）上等于隐形。中性灰两头都看得见，也和主题色
         // 差得足够远，注水边界才清楚。
+        // 字号倍数（2–5 倍，默认 2）：窗口尺寸要跟着走，否则大字会被裁掉
+        let scale = lyric_scale_of(&self.store.read(cx).settings.get());
+        if (self.sized_for - scale).abs() > 0.01 {
+            let (mut w, h) = lyric_window_size(scale);
+            let dpi = window.scale_factor();
+            let (screen_w, _) = crate::win::screen_size_logical(dpi);
+            // 5 倍字号（120px）在 1080p 上按公式要 1500 宽，别超出屏幕
+            w = w.min((screen_w - 40.0).max(320.0));
+            let cur = window.bounds();
+            if (f32::from(cur.size.width) - w).abs() > 2.0
+                || (f32::from(cur.size.height) - h).abs() > 2.0
+            {
+                window.resize(size(px(w), px(h)));
+                // resize 以左上角为锚点，宽度变大就会伸出屏幕右边；这里保持
+                // 「窗口中心不动」重新摆一次位（gpui 0.2.2 没有 set_position）
+                if let Some(hwnd) = crate::win::hwnd(window) {
+                    let old_cx = f32::from(cur.origin.x) + f32::from(cur.size.width) / 2.0;
+                    let nx = (old_cx - w / 2.0).clamp(4.0, (screen_w - w - 4.0).max(4.0));
+                    crate::win::move_window(hwnd as isize, nx, f32::from(cur.origin.y), dpi);
+                }
+            }
+            self.sized_for = scale;
+        }
         let unsung: Hsla = gpui::rgb(0x9a9a9a).into();
-        let cfg = crate::amll::AmllConfig::new(unsung, accent, px(24.));
+        let cfg = crate::amll::AmllConfig::new(unsung, accent, px(LYRIC_BASE_PX * scale));
 
         // 位置外推：引擎 Position 只有 4Hz，不外推逐字就是 250ms 一跳的阶梯
         let pos = if playing {
@@ -256,11 +309,16 @@ impl Render for DesktopLyricView {
             // 默认**无背景**（透明，只浮歌词）；鼠标移入才铺一层 80% 透明深灰底，
             // 让控制条和文字有依托，浅色桌面上也不至于看不清。
             .when(hovered, |el| el.bg(gpui::black().opacity(0.8)).rounded(px(10.)))
-            // 整窗的 hover 只用来切换控制条：控制条是子节点，鼠标落在上面也算 hover
+            // 整窗的 hover 只用来**点亮**控制条/背景。
+            //
+            // 这里只接受 `hovered == true`，绝不在这里关掉：`dl-controls` 用了
+            // `occlude()`（挡住下面的拖动层），鼠标移到按钮上时父节点的 hover 会被
+            // 判成 false，于是背景 hide → 250ms 轮询又把它 show → 再移一下又 hide，
+            // 表现就是**背景闪烁**。关闭统一交给 `spawn_hover_poll` 按光标位置收敛。
             .on_hover(cx.listener(
                 |view: &mut DesktopLyricView, hovered: &bool, _, cx: &mut Context<Self>| {
-                    if view.hovered != *hovered {
-                        view.hovered = *hovered;
+                    if *hovered && !view.hovered {
+                        view.hovered = true;
                         cx.notify();
                     }
                 },
@@ -288,7 +346,7 @@ impl Render for DesktopLyricView {
                     .child(div().id("dl-current").child(current))
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(px(13. * scale))
                             .text_color(next_gray)
                             .child(next_text),
                     ),
@@ -357,7 +415,7 @@ impl HoverPollable for MiniPlayerView {
 fn spawn_hover_poll<T: HoverPollable>(weak: WeakEntity<T>, cx: &mut App) {
     cx.spawn(async move |cx: &mut AsyncApp| loop {
         cx.background_executor()
-            .timer(std::time::Duration::from_millis(250))
+            .timer(std::time::Duration::from_millis(120))
             .await;
         let alive = cx
             .update(|cx| {
@@ -423,6 +481,12 @@ const MINI_ROW_H: f32 = 52.;
 /// mini 进度条左端：`pl 6 + 窗口按钮列 24 + gap 8 + 封面 44 + gap 8`
 /// （绝对定位的 left 相对 padding box，所以 padding 已经算在里面了）
 const MINI_PROGRESS_LEFT: f32 = 90.;
+/// 进度条在窗口底部占的高度：`bottom(10) + 高(3)`。
+///
+/// 这一条带子不该参与「内容垂直居中」——否则整行内容会按 64px 的窗口居中，
+/// 视觉上就偏下（上方留白 20px、下方只有 6px）。行内所有内容都在这条带子
+/// **以上**的剩余空间里居中（用 padding-bottom 把这条带子让出来）。
+const MINI_PROGRESS_ZONE: f32 = 13.;
 
 /// mini 播放器视图：封面 + 标题 + 进度 + 播放控制/收藏/列表/桌面歌词/音量 + 置顶（整窗可拖动）。
 pub struct MiniPlayerView {
@@ -645,13 +709,22 @@ impl Render for MiniPlayerView {
 
             let sb_handle = handle.clone();
             let sb_drag = drag.clone();
-            let overlay = crate::ui::uniform_scrollbar_overlay(
-                "mini-queue-sb",
-                sb_handle,
-                move |_, start| {
-                    *sb_drag.lock() = Some(start);
-                },
-            );
+            // 必须**绝对定位**：这个浮层是 `size_full` 的普通子节点，直接
+            // `.child(overlay)` 会被排在列表下方（高度 100%，整块落到可视区之外），
+            // 结果就是「队列没有滚动条」。
+            let overlay = div()
+                .absolute()
+                .top(px(0.))
+                .bottom(px(0.))
+                .right(px(0.))
+                .w(px(10.))
+                .child(crate::ui::uniform_scrollbar_overlay(
+                    "mini-queue-sb",
+                    sb_handle,
+                    move |_, start| {
+                        *sb_drag.lock() = Some(start);
+                    },
+                ));
 
             Some(
                 div()
@@ -708,6 +781,9 @@ impl Render for MiniPlayerView {
                     .id("mini-row")
                     .h(px(MINI_H))
                     .flex_shrink_0()
+                    // 行本身按整高居中：进度条只占**右侧**那条（left=90 起），
+                    // 左侧「窗口按钮 + 封面」这一组不受它影响，应该在整个 64px 里
+                    // 居中。中段文案/控制键、右侧图标各自再加 pb 让出进度条那条带子。
                     .relative()
                     .flex()
                     .items_center()
@@ -821,6 +897,9 @@ impl Render for MiniPlayerView {
                             .min_w_0()
                             .relative()
                             .h(px(44.))
+                            // 让出底部进度条那 13px：歌名/切歌按钮在「窗口顶 → 进度条
+                            // 上沿」之间居中（否则视觉上偏下：上方 20px、下方 6px）
+                            .pb(px(MINI_PROGRESS_ZONE))
                             .flex()
                             .items_center()
                             // 默认：歌名 + 歌手（hover 时隐藏，给控制键让位）
@@ -878,6 +957,8 @@ impl Render for MiniPlayerView {
                             .items_center()
                             .gap(px(2.))
                             .flex_shrink_0()
+                            // 和中间那组控制键对齐（同样让出进度条带子）
+                            .pb(px(MINI_PROGRESS_ZONE))
                             .occlude()
                             .child(fav_btn)
                             .child(queue_btn)
@@ -1020,13 +1101,16 @@ pub fn toggle_desktop_lyric(store: &Entity<AppStore>, cx: &mut App) {
     }
 
     let store_c = store.clone();
+    // 初始尺寸按当前字号倍数量出来（默认 2 倍 → 840×147）
+    let scale = lyric_scale_of(&store.read(cx).settings.get());
+    let (ly_w, ly_h) = lyric_window_size(scale);
     let window = cx.open_window(
         WindowOptions {
             titlebar: None,
             window_background: WindowBackgroundAppearance::Transparent,
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(600.), px(120.)),
+                size(px(ly_w), px(ly_h)),
                 cx,
             ))),
             window_min_size: Some(size(px(320.), px(80.))),
@@ -1045,6 +1129,7 @@ pub fn toggle_desktop_lyric(store: &Entity<AppStore>, cx: &mut App) {
                 hovered: false,
                 hwnd_raw: 0,
                 frame_fix_frames: 5,
+                sized_for: scale,
             })
         },
     );

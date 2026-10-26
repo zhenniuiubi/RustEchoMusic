@@ -43,15 +43,10 @@ fn hex(h: u32) -> Hsla {
 /// 主题配色过渡时长（秒）。
 pub const THEME_TRANSITION_SECS: f32 = 0.26;
 
-/// 开光灯圆形揭示总时长（秒）。
-pub const THEME_REVEAL_SECS: f32 = 0.9;
-/// 揭示动画中「波前扩到盖满窗口」占的时间比例。
-pub const THEME_REVEAL_GROW_FRAC: f32 = 0.62;
-/// 波前盖满之后，揭示层淡出所占的时间比例（从 `GROW_FRAC` 开始算）。
-///
-/// 底色渐变刻意比波前慢一档（见 `AppStore::theme`），波前扫完时底色还差一截没变
-/// 完；揭示层提前淡出，剩下的变色由底色渐变平滑补上，全程不会有「啪」一下换装。
-pub const THEME_REVEAL_FADE_FRAC: f32 = 0.22;
+/// 开光灯圆形揭示总时长（秒）。对齐 View Transitions 那套手感（450~500ms）。
+pub const THEME_REVEAL_SECS: f32 = 0.5;
+/// 圆面扩到「盖满窗口」占的时间比例；剩下的是圆面淡出与底色收口的交叉段。
+pub const THEME_REVEAL_GROW_FRAC: f32 = 0.8;
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t

@@ -26,6 +26,8 @@ pub struct PlayerState {
     pub play_mode: PlayMode,
     /// 播放请求 id（竞态守卫：过期解析结果被丢弃）
     pub request_id: u64,
+    /// 当前队列是不是私人 FM（播完要自动续推下一批）
+    pub fm_queue: bool,
 }
 
 impl PlayerState {
@@ -47,6 +49,8 @@ impl PlayerState {
         self.queue_title = title.to_string();
         self.index = if self.queue.is_empty() { None } else { Some(start.min(self.queue.len() - 1)) };
         self.loaded = false;
+        // 换队列默认不是 FM；`play_from` 会在来源是 FM 时把它置回来
+        self.fm_queue = false;
     }
 
     /// 清空队列并停止播放。
@@ -59,6 +63,7 @@ impl PlayerState {
         self.loaded = false;
         self.position = 0.0;
         self.duration = 0.0;
+        self.fm_queue = false;
     }
 
     /// 计算下一曲目下标（按播放模式），无下一首返回 None。

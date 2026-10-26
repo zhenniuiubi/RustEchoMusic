@@ -61,14 +61,49 @@ pub fn parse_time_length(s: &str) -> i64 {
     }
 }
 
-/// 归一化封面：将酷狗模板 `{size}` 替换为指定尺寸。
+/// 归一化封面：把 URL 里的尺寸换成指定值。
+///
+/// 两种形态都要管：
+/// 1. 模板形态 `.../{size}/...`（大多数接口直接给模板，替换即可）；
+/// 2. **尺寸已经烧进路径**的形态，比如酷狗的
+///    `http://imge.kugou.com/stdmusic/120/20210114/xxx.jpg`。
+///    这种 URL 里没有 `{size}`，只做字符串替换等于什么都没干——于是
+///    "高清封面" 拿到的还是 120×120 的缩略图（播放页 264pt 的封面糊成一片
+///    就是这个原因）。所以要把路径里第一段纯数字（= 尺寸）改写掉。
 pub fn normalize_cover(url: &str, size: u32) -> String {
     let u = url.trim();
     if u.is_empty() {
         return String::new();
     }
     let s = size.to_string();
-    u.replace("{size}", &s)
+    if u.contains("{size}") {
+        return u.replace("{size}", &s);
+    }
+    // 只动图片 CDN 的路径，且只把「看起来就是尺寸」的那一段换掉：
+    // 尺寸是几十到一千出头的小整数（120 / 240 / 480 / 1000），而日期、图片 id
+    // 都是 8 位以上的大数（20210114…），用范围判断不会误伤。
+    const MIN_SIZE: u32 = 50;
+    const MAX_SIZE: u32 = 2000;
+    if let Some((scheme, rest)) = u.split_once("://") {
+        if let Some((host, path)) = rest.split_once('/') {
+            if host.ends_with("kugou.com") {
+                let mut segs: Vec<&str> = path.split('/').collect();
+                for seg in segs.iter_mut() {
+                    if seg.is_empty() || seg.len() > 4 || !seg.chars().all(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    match seg.parse::<u32>() {
+                        Ok(n) if (MIN_SIZE..=MAX_SIZE).contains(&n) => {
+                            *seg = &s;
+                            return format!("{scheme}://{host}/{}", segs.join("/"));
+                        }
+                        _ => continue,
+                    }
+                }
+            }
+        }
+    }
+    u.to_string()
 }
 
 /// 歌手数组：`singers`/`authors` 明细优先，回退 `SingerName` 串。
@@ -590,3 +625,44 @@ pub fn parse_user(v: &serde_json::Value) -> echo_core::User {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_cover;
+
+    #[test]
+    fn cover_template_replaced() {
+        assert_eq!(
+            normalize_cover("http://imge.kugou.com/stdmusic/{size}/20210114/a.jpg", 480),
+            "http://imge.kugou.com/stdmusic/480/20210114/a.jpg"
+        );
+    }
+
+    #[test]
+    fn cover_burnt_in_size_rewritten() {
+        // 酷狗把尺寸烧在路径里，模板里没有 {size}
+        assert_eq!(
+            normalize_cover("http://imge.kugou.com/stdmusic/120/20210114/a.jpg", 480),
+            "http://imge.kugou.com/stdmusic/480/20210114/a.jpg"
+        );
+        // 歌手头像这类更深一级的路径同样要换
+        assert_eq!(
+            normalize_cover("http://singerimg.kugou.com/uploadpic/softhead/400/20200101/a.jpg", 240),
+            "http://singerimg.kugou.com/uploadpic/softhead/240/20200101/a.jpg"
+        );
+    }
+
+    #[test]
+    fn cover_big_numbers_untouched() {
+        // 8 位日期/id 不是尺寸，不能动
+        assert_eq!(
+            normalize_cover("http://imge.kugou.com/stdmusic/120/20210114120846674495.jpg", 480),
+            "http://imge.kugou.com/stdmusic/480/20210114120846674495.jpg"
+        );
+        assert_eq!(
+            normalize_cover("http://other.cdn.com/20210114/a.jpg", 480),
+            "http://other.cdn.com/20210114/a.jpg"
+        );
+        assert_eq!(normalize_cover("", 480), "");
+    }
+}

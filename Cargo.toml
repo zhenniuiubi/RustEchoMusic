@@ -5,6 +5,7 @@ members = [
     "crates/echo-api",
     "crates/echo-audio",
     "crates/echo-app",
+    "crates/backdrop-demo",
 ]
 
 [workspace.package]

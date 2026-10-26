@@ -1851,14 +1851,16 @@ impl Root {
             )
         };
         let cover = song.as_ref().map(|c| c.cover_url.clone()).unwrap_or_default();
-        // 264px 的封面用 120px 的图拉上去是糊的，这里换高清版（拿不到就回退）
+        // 264pt 的封面用 120 的缩略图拉上去是糊的，这里换高清版。
+        // 没有 hd 字段（老快照/老数据）时不能直接回退到 120 的缩略图，而是把
+        // 缩略图 URL 里的尺寸段改写成 480 —— 同一个 CDN 路径换个数字就是高清图。
         let cover_hd = song
             .as_ref()
             .map(|c| {
                 if c.cover_url_hd.is_empty() {
-                    c.cover_url.clone()
+                    echo_api::normalize::normalize_cover(&c.cover_url, 480)
                 } else {
-                    c.cover_url_hd.clone()
+                    echo_api::normalize::normalize_cover(&c.cover_url_hd, 480)
                 }
             })
             .unwrap_or_default();
@@ -1880,13 +1882,19 @@ impl Root {
         // gpui 0.2.2 没有元素级模糊，模糊图由 `imgcache::blurred_cover` 在后台把封面
         // 缩小 + 高斯模糊后给出（按 URL 缓存）。它第一帧还没算完时会返回 None，
         // 这时先用原图顶一下，算完会通知重绘自动换成模糊版。
-        let blurred = crate::imgcache::blurred_cover(&cover, window, cx);
+        // 背景用**高清封面**做底：120 的缩略图放大到整窗只有几块色斑，
+        // 连压暗之后都发灰；高清图缩下去再模糊，颜色才立得住。
+        let blurred = crate::imgcache::blurred_cover(&cover_hd, window, cx);
+        // 背景层四周各外扩 10px：模糊图的边缘无论如何都比中间淡一点，正好贴边
+        // 铺会出现「两边一条黑」；外扩之后多出来的部分被 `#player-page` 的
+        // overflow_hidden 裁掉，边缘就干净了。
         let mut bg_layer = div()
             .id("pp-bg")
             .absolute()
-            .top_0()
-            .left_0()
-            .size_full();
+            .top(px(-10.))
+            .left(px(-10.))
+            .right(px(-10.))
+            .bottom(px(-10.));
         bg_layer = match blurred {
             Some(b) => bg_layer.child(
                 img(b)
@@ -1894,11 +1902,10 @@ impl Root {
                     .top_0()
                     .left_0()
                     .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    .opacity(0.92),
+                    .object_fit(ObjectFit::Cover),
             ),
-            None if !cover.is_empty() => bg_layer.child(
-                img(SharedUri::from(cover.clone()))
+            None if !cover_hd.is_empty() => bg_layer.child(
+                img(SharedUri::from(cover_hd.clone()))
                     .absolute()
                     .top_0()
                     .left_0()
@@ -3248,6 +3255,87 @@ impl Root {
                 s5,
             ));
 
+        // 染色浓度：同一种系统材质，染色越浓越像 Win11 开始菜单
+        // （底层确实是亚克力，但几乎不透明、只泛一点壁纸的色调）。
+        let dense_chip = |label: &'static str,
+                          dense: bool,
+                          cur: bool,
+                          st: Entity<AppStore>| {
+            div()
+                .id(SharedString::from(format!("backdrop-dense-{label}")))
+                .px_4()
+                .py_2()
+                .rounded(px(8.))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .when(cur, |el| el.bg(theme.accent).text_color(gpui::white()))
+                .when(!cur, |el| {
+                    el.bg(theme.bg_hover).text_color(theme.text_secondary)
+                })
+                .on_click(move |_, _, cx| {
+                    st.update(cx, |s, cx| {
+                        s.settings.update(|st| st.backdrop_dense = dense);
+                        s.toast = if dense {
+                            "材质染色：浓（开始菜单风格）".into()
+                        } else {
+                            "材质染色：通透".into()
+                        };
+                        cx.notify();
+                    });
+                })
+                .child(label)
+                .into_any_element()
+        };
+        let s6 = store.clone();
+        let dense_row = div()
+            .flex()
+            .gap_2()
+            .child(dense_chip(
+                "通透",
+                false,
+                !settings.backdrop_dense,
+                s6.clone(),
+            ))
+            .child(dense_chip("浓染色（开始菜单风格）", true, settings.backdrop_dense, s6));
+
+        // 桌面歌词字号 chips（2×/3×/4×/5×）：收集成 Vec 再 children，
+        // 免得在 div 链里套闭包导致括号层级太深
+        let lyric_scale_row = {
+            let cur = settings.lyric_scale;
+            let mut chips: Vec<AnyElement> = Vec::new();
+            for n in 2..=5u32 {
+                let st = store.clone();
+                let active = (cur - n as f32).abs() < 0.01;
+                chips.push(
+                    div()
+                        .id(SharedString::from(format!("lyric-scale-{n}")))
+                        .px_3()
+                        .py(px(4.))
+                        .rounded(px(6.))
+                        .text_size(px(12.))
+                        .cursor_pointer()
+                        .when(active, |el| el.bg(theme.accent).text_color(gpui::white()))
+                        .when(!active, |el| {
+                            el.bg(theme.bg_hover).text_color(theme.text_secondary)
+                        })
+                        .on_click(move |_, _, cx| {
+                            st.update(cx, |s, cx| {
+                                s.settings.update(|st| st.lyric_scale = n as f32);
+                                cx.notify();
+                            });
+                            // 只改字号不会触发浮窗重绘（主窗口改设置时下一帧才
+                            // refresh），这里立即刷一次，让窗口马上按新字号改尺寸
+                            cx.defer(move |cx| {
+                                crate::desktop::refresh_float_windows(cx);
+                            });
+                        })
+                        .child(format!("{n}×"))
+                        .into_any_element(),
+                );
+            }
+            div().flex().gap_2().children(chips)
+        };
+
         let clear_store = store.clone();
 
         div()
@@ -3274,10 +3362,19 @@ impl Root {
                     .child(backdrop_row)
                     .child(
                         div()
+                            .text_size(px(12.))
+                            .text_color(theme.text_secondary)
+                            .child("染色浓度"),
+                    )
+                    .child(dense_row)
+                    .child(
+                        div()
                             .text_size(px(11.))
                             .text_color(theme.text_tertiary)
                             .child(
-                                "云母 / 亚克力需要 Windows 11 22H2 及以上；\
+                                "「浓染色」= Win11 开始菜单的观感：底层仍是系统材质，\
+                                 但染色很浓、只泛一点壁纸的色调；「通透」能明显看出壁纸被模糊透出来。\
+                                 云母 / 亚克力需要 Windows 11 22H2 及以上；\
                                  Win10 及更早系统自动降级为磨砂，无磨砂能力时回退普通不透明背景。",
                             ),
                     ),
@@ -3544,6 +3641,27 @@ impl Root {
                                     })
                                     .child("打开 mini 播放器")
                             }),
+                    )
+                    // 桌面歌词字号（2–5 倍，基准 24px；默认 2 倍）
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .w(px(72.))
+                                    .text_size(px(12.))
+                                    .text_color(theme.text_secondary)
+                                    .child("歌词字号"),
+                            )
+                            .child(lyric_scale_row)
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.text_tertiary)
+                                    .child("桌面歌词放大倍数，窗口会自动跟着变"),
+                            ),
                     ),
             )
             .child(
@@ -4467,6 +4585,98 @@ pub(crate) fn load_purchased(store: &Entity<AppStore>, force: bool, cx: &mut App
 }
 
 
+/// 私人 FM 续推：一批播完了，带着上一批的 `cur_mark` 再要一批，接到队尾继续播。
+///
+/// 接口语义是「一批一批推」：`cur_mark` 不带回去服务端会认为刚推过、直接给空列表
+/// （见 `api.rs::personal_fm`），所以游标必须一路存下来（`AppStore::fm_cur_mark`）。
+/// 返回的批次可能和已播的重叠，这里按 hash 去重；整批都是重复的话就用新的游标再要
+/// 一次，最多 3 轮。
+pub(crate) fn fm_extend(store: &Entity<AppStore>, cx: &mut App) {
+    let (client, mode, pool, mut mark, seen) = {
+        let s = store.read(cx);
+        if s.fm_extending {
+            return;
+        }
+        let seen: std::collections::HashSet<String> =
+            s.player.queue.iter().map(|x| x.hash.clone()).collect();
+        (s.client.clone(), s.fm_mode.clone(), s.fm_pool, s.fm_cur_mark, seen)
+    };
+    store.update(cx, |s, cx| {
+        s.fm_extending = true;
+        s.fm_loading = true;
+        cx.notify();
+    });
+
+    let store_c = store.clone();
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let mut picked: Vec<echo_core::Song> = Vec::new();
+        for round in 0..3 {
+            let client_c = client.clone();
+            let mode_c = mode.clone();
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::ui::run_tokio(client_c.personal_fm(0, mark, "login", &mode_c, pool))
+                })
+                .await;
+            match res {
+                Ok(batch) => {
+                    mark = batch.cur_mark;
+                    let total = batch.songs.len();
+                    let fresh: Vec<echo_core::Song> = batch
+                        .songs
+                        .into_iter()
+                        .filter(|x| {
+                            !seen.contains(&x.hash) && !picked.iter().any(|p| p.hash == x.hash)
+                        })
+                        .collect();
+                    log::info!(
+                        "fm extend round {round}: 收到 {} 首，去重后剩 {} 首（cur_mark={mark}）",
+                        total,
+                        fresh.len()
+                    );
+                    if !fresh.is_empty() {
+                        picked = fresh;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("fm extend ERR {e}");
+                    break;
+                }
+            }
+        }
+
+        // 先把新一批挂到队尾，再交给 play_index 走正常的「解析地址 → 播放」流程
+        let start = store_c.update(cx, |s, cx| {
+            s.fm_extending = false;
+            s.fm_loading = false;
+            s.fm_cur_mark = mark;
+            if picked.is_empty() {
+                s.player.playing = false;
+                s.player.loading = false;
+                s.toast = "私人FM 暂时没有更多推荐".into();
+                cx.notify();
+                return None;
+            }
+            let start = s.player.queue.len();
+            let added = picked.len();
+            s.fm = Arc::new(picked.clone());
+            s.player.queue.extend(picked);
+            log::info!(
+                "fm extend: 追加 {added} 首，队列 {} 首，从 #{start} 接着播",
+                s.player.queue.len()
+            );
+            cx.notify();
+            Some(start)
+        });
+        if let Ok(Some(start)) = start {
+            let _ = cx.update(|app| crate::ui::play_index(&store_c, start, app));
+        }
+    })
+    .detach();
+}
+
 /// 加载私人 FM（`/v2/personal_recommend`）。
 pub(crate) fn load_fm(store: &Entity<AppStore>, force: bool, cx: &mut App) {
     let store_c = store.clone();
@@ -4497,6 +4707,7 @@ pub(crate) fn load_fm(store: &Entity<AppStore>, force: bool, cx: &mut App) {
             match res {
                 Ok(batch) if !batch.songs.is_empty() => {
                     log::info!("fm: {} 首（cur_mark={}）", batch.songs.len(), batch.cur_mark);
+                    s.fm_cur_mark = batch.cur_mark;
                     s.fm = Arc::new(batch.songs);
                 }
                 Ok(_) => {

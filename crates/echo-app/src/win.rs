@@ -54,6 +54,38 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// 主显示器的**逻辑**尺寸（按传入的缩放比例换算）。
+///
+/// 用来给浮窗兜底：大字号桌面歌词可能比屏幕还宽，得先知道屏幕多大。
+pub fn screen_size_logical(scale: f32) -> (f32, f32) {
+    let s = if scale > 0.1 { scale } else { 1.0 };
+    unsafe {
+        (
+            GetSystemMetrics(SM_CXSCREEN) as f32 / s,
+            GetSystemMetrics(SM_CYSCREEN) as f32 / s,
+        )
+    }
+}
+
+/// 移动窗口（保持大小与层级不变）。
+///
+/// gpui 0.2.2 没有暴露 `set_position`，而 `Window::resize` 是以**左上角**为锚点
+/// 的——桌面歌词从 2× 调到 5× 时窗口会向右长出去、直接伸出屏幕。
+pub fn move_window(hwnd_raw: isize, x: f32, y: f32, scale: f32) {
+    let s = if scale > 0.1 { scale } else { 1.0 };
+    unsafe {
+        SetWindowPos(
+            hwnd_raw as HWND,
+            std::ptr::null_mut(),
+            (x * s) as i32,
+            (y * s) as i32,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 /// 取 gpui 窗口底层的 HWND。
 pub fn hwnd(window: &Window) -> Option<HWND> {
     let handle = HasWindowHandle::window_handle(window).ok()?;

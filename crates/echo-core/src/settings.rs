@@ -122,10 +122,20 @@ pub struct Settings {
     pub output_device: String,
     /// 是否显示桌面歌词窗口
     pub desktop_lyric: bool,
+    /// 桌面歌词字号倍数（2.0–5.0，基准 24px）。
+    ///
+    /// 默认 2 倍：桌面歌词是「隔着一段距离瞥一眼」的场景，24px 太小。
+    pub lyric_scale: f32,
     /// 桌面歌词窗口位置（x, y；None 时自动居中贴底）
     pub desktop_lyric_pos: Option<(f64, f64)>,
     /// 主窗口背景特效模式（Windows Mica / Acrylic）
     pub backdrop: BackdropMode,
+    /// 材质「浓染色」：底层主题色的 alpha 拉高，只透出一点色调。
+    ///
+    /// Win11 开始菜单就是这种观感——底层确实是亚克力，但染色很浓，看起来
+    /// 「几乎不透明、只泛一点壁纸的颜色」。关掉（默认）更通透，能明显看出
+    /// 壁纸被磨砂透出来。
+    pub backdrop_dense: bool,
 }
 
 impl Default for Settings {
@@ -147,8 +157,10 @@ impl Default for Settings {
             sleep_minutes: 0,
             output_device: String::new(),
             desktop_lyric: false,
+            lyric_scale: 2.0,
             desktop_lyric_pos: None,
             backdrop: BackdropMode::default(),
+            backdrop_dense: false,
         }
     }
 }

@@ -335,6 +335,10 @@ pub struct AppStore {
     pub fm_pool: i64,
     pub fm_loaded: bool,
     pub fm_loading: bool,
+    /// 上一批 FM 的游标（`cur_mark`）：续推下一批必须带回去，否则服务端返回空列表
+    pub fm_cur_mark: i64,
+    /// 正在续推下一批 FM（防止一批播完时重复发起）
+    pub fm_extending: bool,
     /// 音乐云盘歌曲（登录后拉取）
     pub cloud: Arc<Vec<Song>>,
     pub cloud_loaded: bool,
@@ -441,17 +445,20 @@ impl AppStore {
     pub fn theme(&self) -> Theme {
         // 开光灯揭示进行中：整棵 UI 树的颜色从旧主题插值到新主题。
         //
-        // 这里**不能**再「hold 住旧主题、等圆盖满再换」——那样圆扫过的地方会被
-        // 一层不透明色盖住，内容就看不见了（用户明确反馈过）。改成底层自己渐变，
-        // 上层只画一圈半透明的「波前」做视觉引导，内容全程可见。
+        // gpui 0.2.2 没有圆形裁剪（`ContentMask` 只有矩形，见 Windows 后端的
+        // `distance_from_clip_rect`），也没有整页快照，所以拿不到 Web 上 View
+        // Transitions 那种「圆内新 UI、圆外旧 UI」的双层。折中做法：**圆面扩散
+        // 期间底色保持旧主题**，等圆面盖满窗口后，圆面淡出与底色收口同时进行
+        // ——两件事反向交叉，视觉上就是「扫过的地方已经换好了」。
         //
-        // 但这个渐变**必须比波前慢**：两者同步的话，圆内圆外的底色几乎一样，
-        // 波前就完全看不出来了（实测过）。慢一档之后，波前扫过的地方比没扫到的
-        // 地方更接近新主题，形成真正的「色差波前」；波前扫完再让底色慢慢补上。
+        // 千万不要让底色全程跟着插值：那样圆内圆外底色一样，圆面看不出来，
+        // 整窗还会长时间停在灰蒙蒙的中间色（实测过，观感最差的就是这个）。
         if let Some(r) = &self.theme_reveal {
             let t = (r.started.elapsed().as_secs_f32() / crate::theme::THEME_REVEAL_SECS)
                 .min(1.0f32);
-            let e = t * t * (3.0 - 2.0 * t); // smoothstep：两头慢、中间快
+            let from = crate::theme::THEME_REVEAL_GROW_FRAC;
+            let k = ((t - from) / (1.0 - from)).clamp(0.0, 1.0);
+            let e = k * k * (3.0 - 2.0 * k); // smoothstep：快速但不硬切
             return Theme::blend(&r.hold, &self.target_theme(), e);
         }
         let target = self.target_theme();
@@ -487,6 +494,31 @@ impl AppStore {
     /// false（关闭特效 / 系统不支持）保持不透明配色。
     pub fn backdrop_active(&self) -> bool {
         crate::windows_backdrop::material_visible(self.backdrop_effective)
+    }
+
+    /// 材质窗口的基础底色透明度。
+    ///
+    /// 0.45 能明显看出壁纸被磨砂透出来；`backdrop_dense`（「开始菜单风格」）
+    /// 时拉到 0.80——Win11 开始菜单就是这个观感：底层确实是亚克力，但染色很浓，
+    /// 只泛一点壁纸的色调，内容对比度也更高。
+    pub fn backdrop_tint_alpha(&self) -> f32 {
+        if self.settings.get().backdrop_dense {
+            0.80
+        } else {
+            0.45
+        }
+    }
+
+    /// 材质窗口上「面板类」表面（播放条、侧栏）的透明度。
+    ///
+    /// 面板本来就该比底色更实一点（分层），浓染色模式下再收一点，避免
+    /// 与底色糊成一片、看不出层级。
+    pub fn backdrop_panel_alpha(&self) -> f32 {
+        if self.settings.get().backdrop_dense {
+            0.92
+        } else {
+            0.82
+        }
     }
 
     /// 是否存在任一列表加载态（驱动加载动画持续重绘）。

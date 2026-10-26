@@ -43,8 +43,8 @@ use gpui::{Window, WindowBackgroundAppearance};
 ///
 /// DWM 调用失败只记日志不 panic——窗口留在当前状态，UI 配色不受影响
 /// （`material_visible` 决定配色，与这里是否成功解耦）。
-pub fn apply(window: &Window, mode: BackdropMode) {
-    imp::apply(window, mode)
+pub fn apply(window: &Window, mode: BackdropMode, dark: bool) {
+    imp::apply(window, mode, dark)
 }
 
 /// 该模式下系统材质是否真的垫在窗口后面。
@@ -86,6 +86,8 @@ mod imp {
     const WIN10_1809_BUILD: u32 = 17763;
     /// 未公开属性号：Win11 21H2 的 Mica 开关。
     const DWMWA_MICA_EFFECT: i32 = 1029;
+    /// 标题栏/系统材质用深色：属性 20（20H1 起叫这个名）。
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: i32 = 20;
     /// 未公开属性号：`SetWindowCompositionAttribute` 的 ACCENT_POLICY。
     const WCA_ACCENT_POLICY: u32 = 0x13;
     /// ACCENT_POLICY.accent_state：关闭 accent（普通不透明）。
@@ -281,12 +283,21 @@ mod imp {
         fallback_blurred(window, why);
     }
 
-    pub(super) fn apply(window: &Window, mode: BackdropMode) {
+    pub(super) fn apply(window: &Window, mode: BackdropMode, dark: bool) {
         let Some(hwnd) = crate::win::hwnd(window) else {
             log::warn!("背景特效：拿不到 HWND，跳过");
             return;
         };
         let build = win_build();
+        // 材质的明暗必须跟 App 自己的主题走，不能跟系统走：
+        // gpui 建窗时按**系统**外观设了 DWMWA_USE_IMMERSIVE_DARK_MODE，系统是浅色
+        // 而 App 选了深色主题时，Mica 会是浅色的（深色 UI 底下一片亮灰）。
+        dwm_set_u32(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            if dark { 1 } else { 0 },
+            "DWMWA_USE_IMMERSIVE_DARK_MODE",
+        );
 
         match mode {
             BackdropMode::Off => {

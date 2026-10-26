@@ -253,7 +253,15 @@ fn main() {
             let library_store = echo_core::LibraryStore::load(&data_dir).expect("load library");
             // 播放队列快照：关掉 App 再打开要能还原（不自动播放，点播放时再解析地址）
             let queue_store = echo_core::QueueStore::load(&data_dir).expect("load queue");
-            let saved_queue = queue_store.get();
+            let mut saved_queue = queue_store.get();
+            // 快照里存的是歌的完整数据，包括封面 URL。老版 `normalize_cover` 只认
+            // `{size}` 模板，酷狗那种「尺寸烧在路径里」的 URL（.../stdmusic/120/...）
+            // 一直没被升级 —— 磁盘上的旧快照会让播放页永远拿 120 的缩略图（糊）。
+            // 这里按当前规则重算一遍，老快照也能吃到修复。
+            for s in saved_queue.songs.iter_mut() {
+                s.cover_url = echo_api::normalize::normalize_cover(&s.cover_url, 120);
+                s.cover_url_hd = echo_api::normalize::normalize_cover(&s.cover_url_hd, 480);
+            }
             if !saved_queue.is_empty() {
                 log::info!(
                     "restored queue: {} 首 (index={:?}, title={})",
@@ -291,6 +299,8 @@ fn main() {
                 Ok(v) => windows_backdrop::parse_mode(&v).unwrap_or_else(|| settings.get().backdrop),
                 Err(_) => settings.get().backdrop,
             };
+            // 系统材质（Mica/Acrylic）的明暗要跟 App 主题走，见 windows_backdrop::apply
+            let dark_theme = settings.get().theme_mode == echo_core::ThemeMode::Dark;
             let store = cx.new(|_| AppStore {
                 settings,
                 backdrop_effective: backdrop_mode,
@@ -347,6 +357,8 @@ fn main() {
                 fm_pool: 0,
                 fm_loaded: false,
                 fm_loading: false,
+                fm_cur_mark: 0,
+                fm_extending: false,
                 cloud: Arc::new(Vec::new()),
                 cloud_loaded: false,
                 cloud_loading: false,
@@ -536,7 +548,7 @@ fn main() {
                         slot.store(h as isize, std::sync::atomic::Ordering::Relaxed);
                     }
                     // 背景特效（Mica / Acrylic / 磨砂降级），设置项在「设置 → 外观」
-                    windows_backdrop::apply(window, backdrop_mode);
+                    windows_backdrop::apply(window, backdrop_mode, dark_theme);
                     // 键盘默认落点：没有输入框时由根节点接住（空格播放/暂停）
                     window.focus(&root.root_focus);
                     // 关闭按钮 / Alt+F4 只隐藏窗口，真正退出走托盘菜单
@@ -791,7 +803,7 @@ fn main() {
                         // 供自动化读回验证（绕过合成点击，真实用户仍走按钮点击）
                         t if t.starts_with("backdrop-") => Page::Settings,
                         "cloud" => Page::Cloud,
-                        "fm" => Page::Fm,
+                        "fm" | "fm-end" => Page::Fm,
                         "lyric" => Page::Lyric,
                         "purchased" => Page::Purchased,
                         "profile" => Page::Profile,
@@ -916,9 +928,49 @@ fn main() {
                         });
                     }
 
+                    // ECHO_SMOKE=fm-end：验证「私人 FM 一批播完自动续推」。
+                    // 播起 FM 后直接跳到最后那一首、再拖到结尾前 1 秒，让引擎自己发
+                    // Ended（不用等 3 分钟），日志里应出现 `fm extend:` 并且继续播下一首。
+                    if target == "fm-end" {
+                        smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                        let _ = cx.update(|app| {
+                            ui::play_from(&smoke_store, ui::PlaySource::Fm, 0, app)
+                        });
+                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
+                        let (last, dur) = smoke_store
+                            .read_with(cx, |s, _| {
+                                (s.player.queue.len().saturating_sub(1), s.player.duration)
+                            })
+                            .unwrap_or((0, 0.0));
+                        log::warn!("[fm-end] queue last={last} dur={dur:.1}");
+                        let _ = cx.update(|app| ui::play_index(&smoke_store, last, app));
+                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
+                        let dur = smoke_store
+                            .read_with(cx, |s, _| s.player.duration)
+                            .unwrap_or(0.0);
+                        let _ = smoke_store.update(cx, |s, _| {
+                            s.engine.seek((dur - 1.0).max(0.0));
+                        });
+                    }
+
                     // ECHO_SMOKE=backdrop-*：走与设置页按钮相同的 set_backdrop_mode
+                    // 后缀 `-dense` / `-clear` 顺带把「浓染色」打开 / 关掉，
+                    // 如 backdrop-acrylic-dense / backdrop-acrylic-clear
                     if let Some(mode_str) = target.strip_prefix("backdrop-") {
+                        let (mode_str, dense) = match mode_str.strip_suffix("-dense") {
+                            Some(m) => (m, Some(true)),
+                            None => match mode_str.strip_suffix("-clear") {
+                                Some(m) => (m, Some(false)),
+                                None => (mode_str, None),
+                            },
+                        };
                         if let Some(mode) = windows_backdrop::parse_mode(mode_str) {
+                            // 先落「浓染色」再切模式：set_backdrop_mode 里会重读设置
+                            if let Some(on) = dense {
+                                smoke_store.update(cx, |s, _| {
+                                    s.settings.update(|st| st.backdrop_dense = on);
+                                });
+                            }
                             smol::Timer::after(std::time::Duration::from_secs(2)).await;
                             let _ = cx.update(|app| {
                                 ui::set_backdrop_mode(&smoke_store, mode, app);

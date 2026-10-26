@@ -478,6 +478,7 @@ pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx:
         let mode = s.player.play_mode;
         let volume = s.player.volume;
         s.player.set_queue(&title, songs, start);
+        s.player.fm_queue = matches!(source, PlaySource::Fm);
         s.player.play_mode = mode;
         s.player.volume = volume;
         s.player.position = 0.0;
@@ -720,7 +721,27 @@ pub fn handle_player_event_state(
             None
         }
         echo_audio::PlayerEvent::Ended => {
-            if let Some(i) = s.player.next_index() {
+            // 私人 FM 的「一批播完」不能靠 `next_index()` 判断：列表循环/随机模式下
+            // 它会绕回队首，永远碰不到队尾，于是同一批 5 首来回放、再也不去要新歌。
+            // 这里改成「当前是队列最后一首」就续推（单曲循环除外，那是用户明确要求重播）。
+            let fm_at_tail = s.player.fm_queue
+                && s.player.play_mode != echo_core::PlayMode::Single
+                && s
+                    .player
+                    .index
+                    .map(|i| i + 1 >= s.player.queue.len())
+                    .unwrap_or(false);
+            if fm_at_tail {
+                s.player.loading = true;
+                s.fm_loading = true;
+                cx.notify();
+                let store = cx.entity();
+                cx.spawn(async move |_, cx: &mut gpui::AsyncApp| {
+                    let _ = cx.update(|app| crate::views::fm_extend(&store, app));
+                })
+                .detach();
+                None
+            } else if let Some(i) = s.player.next_index() {
                 s.player.index = Some(i);
                 s.player.position = 0.0;
                 s.player.loaded = false;
@@ -811,6 +832,9 @@ pub(crate) fn set_theme_mode(
             s.finish_theme_anim();
             cx.notify();
         });
+        // 系统材质（Mica/Acrylic）的明暗跟着主题走，切完主题要重新下发一次属性，
+        // 否则深色 UI 底下还垫着浅色 Mica（或者反过来）
+        let _ = cx.update(|app| apply_backdrop(&anim_store, app));
     })
     .detach();
 }
@@ -840,11 +864,12 @@ pub(crate) fn set_backdrop_mode(store: &Entity<AppStore>, mode: echo_core::Backd
 /// 取出主窗口句柄回到窗口上下文再调 DWM。
 pub(crate) fn apply_backdrop(store: &Entity<AppStore>, cx: &mut App) {
     let mode = store.read(cx).backdrop_effective;
+    let dark = store.read(cx).settings.get().theme_mode == echo_core::ThemeMode::Dark;
     let handle = cx.try_global::<crate::state::AppGlobal>()
         .and_then(|g| g.main_window);
     if let Some(handle) = handle {
         let _ = handle.update(cx, |_view, window, _cx| {
-            crate::windows_backdrop::apply(window, mode);
+            crate::windows_backdrop::apply(window, mode, dark);
         });
         // 材质可见性可能变了（比如关掉特效），主窗口背景要重新配色
         let _ = store.update(cx, |_, cx| cx.notify());
@@ -1262,9 +1287,24 @@ fn load_search_hot(store: &Entity<AppStore>, cx: &mut App) {
     .detach();
 }
 
-/// 画一个实心圆（圆角=半径的方块）：主题揭示层的「圆盘」用它叠出径向羽化。
+// ==================== 主题「开关灯」圆面 ====================
+
+/// 圆面（= 已扫过区域）压的新主题色浓度。
+///
+/// 这是个折中值：调高（0.7+）更像「整块换好」，但内容会被压得很淡；调低
+/// （0.3 以下）圆内外差别太小，看不出是在「扫」。0.45 时内容仍然清楚可读，
+/// 也不会把整块区域压成一片灰。
+const REVEAL_TINT_ALPHA: f32 = 0.45;
+
+fn smoothstep01(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}
+
+/// 实心圆：正方形 + 圆角=半径，正好是一个圆，由 `quad_sdf` 做 1px 抗锯齿，
+/// 边缘是干净的硬边（这正是 `clip-path: circle()` 的观感）。
 fn paint_disc(window: &mut Window, cx: f32, cy: f32, r: f32, color: Hsla) {
-    if r <= 0.0 {
+    if r <= 0.5 || color.a <= 0.002 {
         return;
     }
     let side = r * 2.0;
@@ -1275,41 +1315,6 @@ fn paint_disc(window: &mut Window, cx: f32, cy: f32, r: f32, color: Hsla) {
         )
         .corner_radii(gpui::Corners::all(px(r))),
     );
-}
-
-/// 画一圈圆环（外圆挖掉内圆）。
-///
-/// gpui 0.2.2 的 `ContentMask` 只有矩形 bounds，元素层面做不了圆形裁剪；但
-/// `PathBuilder` 走的是 lyon 的 NonZero 填充规则——外圈顺时针 + 内圈逆时针两个
-/// 多边形叠在一起，中间就被挖空，得到真正的环带。
-///
-/// 环带之间**互不重叠**，所以每一圈都能独立指定 alpha，可以拼出任意径向分布
-/// （「中心淡、波前浓、外沿归零」这种双向羽化，靠同心圆盘叠加是做不出来的——
-/// 叠加只能越叠越实）。
-fn paint_ring(window: &mut Window, cx: f32, cy: f32, r_out: f32, r_in: f32, color: Hsla) {
-    if r_out <= 0.5 || r_in >= r_out {
-        return;
-    }
-    const SEG: usize = 56;
-    let step = std::f32::consts::TAU / SEG as f32;
-    let mut outer = Vec::with_capacity(SEG);
-    let mut inner = Vec::with_capacity(SEG);
-    for i in 0..SEG {
-        let a = i as f32 * step;
-        outer.push(point(px(cx + r_out * a.cos()), px(cy + r_out * a.sin())));
-    }
-    // 内圈反向：NonZero 规则下才会被当成「洞」
-    for i in (0..SEG).rev() {
-        let a = i as f32 * step;
-        inner.push(point(px(cx + r_in * a.cos()), px(cy + r_in * a.sin())));
-    }
-    let mut b = gpui::PathBuilder::fill();
-    b.add_polygon(&outer, true);
-    b.add_polygon(&inner, true);
-    match b.build() {
-        Ok(path) => window.paint_path(path, color),
-        Err(e) => log::warn!("波前环构建失败：{e}"),
-    }
 }
 
 // ==================== 主布局 Root ====================
@@ -1342,8 +1347,9 @@ impl Root {
             .flex_col()
             .bg(if backdrop {
                 // 内容区基底层：透明部分透出系统材质（Mica/Acrylic）。
-                // 不能太实，否则材质被盖住只剩灰底（用户看到的「云母无效」）
-                theme.bg_main.opacity(0.72)
+                // alpha 由 `AppStore::backdrop_tint_alpha` 给：默认 0.45（明显
+                // 透出壁纸），「浓染色」0.80（接近 Win11 开始菜单，几乎不透）。
+                theme.bg_main.opacity(self.store.read(cx).backdrop_tint_alpha())
             } else {
                 theme.bg_main
             })
@@ -1466,84 +1472,58 @@ impl Root {
             .child(self.render_toast(cx))
     }
 
-    /// 主题「开关灯」的波前光圈：新主题色的一道圆形波从开关位置扩散铺满窗口。
+    /// 主题「开关灯」：新主题色的一块圆形区域从开关位置扩散铺满窗口。
     ///
-    /// Web 上那套 View Transitions 是「新主题整页快照 + `clip-path: circle()`」，
-    /// gpui 0.2.2 做不到同样的效果，原因有二：
-    /// 1. 没有整页快照 API（`grep screenshot` 无结果）；
-    /// 2. `ContentMask` 只有矩形 `bounds`，元素层面**没有圆形裁剪**，所以也拿不到
-    ///    「圆内显示新 UI、圆外显示旧 UI」的双层。
+    /// 参考的是 Web 上 View Transitions + `clip-path: circle()` 那套（以点击点
+    /// 为圆心、半径从 0 扩到「到最远角」的距离）。gpui 0.2.2 做不到完整版：
+    /// 1. `ContentMask` 只有矩形 bounds（Windows 后端走 `distance_from_clip_rect`），
+    ///    元素层面没有圆形裁剪，拿不到「圆内新 UI / 圆外旧 UI」的双层；
+    /// 2. 也没有整页快照 API。
     ///
-    /// 于是改成：**底层 UI 自己从旧主题插值到新主题**（见 `AppStore::theme`），
-    /// 上层只画一圈半透明的「波前」——已扫过的区域只压很淡的一层新主题色，
-    /// 波前那一圈稍浓，外沿渐隐到 0。这样内容全程都看得见（最浓处也只有 50%
-    /// 覆盖），同时保留了「从点击处扩散」的动线。
+    /// 所以近似成：一个**硬边**的半透明圆面（新主题底色）从点击点扩散，圆外保持
+    /// 旧主题；圆面盖满窗口后，圆面淡出与底色收口同时进行（见 `AppStore::theme`），
+    /// 两者反向交叉，收尾不会「啪」一下。
     fn render_theme_reveal(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(r) = self.store.read(cx).theme_reveal.clone() else {
             return div().into_any_element();
         };
-        let target_bg = self.store.read(cx).target_theme().bg_main;
+        let t =
+            (r.started.elapsed().as_secs_f32() / crate::theme::THEME_REVEAL_SECS).min(1.0f32);
+        let grow_frac = crate::theme::THEME_REVEAL_GROW_FRAC;
+        // 尾段：圆面淡出的同时底色收口，alpha 从 1 收到 0
+        let tail = ((t - grow_frac) / (1.0 - grow_frac)).clamp(0.0, 1.0);
+        let alpha = 1.0 - smoothstep01(tail);
+        if alpha <= 0.002 {
+            return div().into_any_element();
+        }
+        let color = self.store.read(cx).target_theme().bg_main;
         let origin = r.origin;
-        let started = r.started;
         canvas(
             move |_, _, _| {},
             move |bounds, _, window, _| {
-                let t =
-                    (started.elapsed().as_secs_f32() / crate::theme::THEME_REVEAL_SECS).min(1.0f32);
-                let grow = (t / crate::theme::THEME_REVEAL_GROW_FRAC).min(1.0);
-                let e = 1.0 - (1.0 - grow).powi(3); // ease-out cubic：起步快、铺满稳
-                // 圆心到最远角的距离 = 波前铺满窗口所需的半径
+                // 和文章里的 computeMaxRadius 一样：圆心到最远角的距离
                 let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
                 let ox = f32::from(origin.x) - f32::from(bounds.origin.x);
                 let oy = f32::from(origin.y) - f32::from(bounds.origin.y);
-                let dx = (ox).max(w - ox);
-                let dy = (oy).max(h - oy);
+                let dx = ox.max(w - ox);
+                let dy = oy.max(h - oy);
                 let max_r = (dx * dx + dy * dy).sqrt();
-                let rad = e * (max_r + 48.);
-                if rad <= 0.5 {
-                    return;
-                }
-                // 收尾：波前铺满后整体淡出（比底色渐变更早收，剩下的交给底色补上）
-                let fade = ((t - crate::theme::THEME_REVEAL_GROW_FRAC)
-                    / crate::theme::THEME_REVEAL_FADE_FRAC)
-                    .clamp(0.0, 1.0);
-                let alpha = 1.0 - fade * fade * (3.0 - 2.0 * fade); // smoothstep
-                if alpha <= 0.002 {
-                    return;
-                }
-
-                let (cx0, cy0) = (f32::from(origin.x), f32::from(origin.y));
-                // 已扫过区压一层新主题色（浓度要够看出色差，又不能盖住内容）；
-                // 波前那一圈更浓，外沿渐隐到 0，形成一道「扫过去」的波。
-                const A_IN: f32 = 0.34;
-                const A_PEAK: f32 = 0.60;
-                const RINGS: usize = 14;
-                let ring_w = (max_r * 0.30).clamp(56.0, 190.0);
-                let inner_r = rad - ring_w;
-                if inner_r > 0.5 {
-                    paint_disc(window, cx0, cy0, inner_r, target_bg.opacity(A_IN * alpha));
-                }
-                let step = ring_w / RINGS as f32;
-                for k in 0..RINGS {
-                    let r_out = rad - step * k as f32;
-                    if r_out <= 0.5 {
-                        break;
-                    }
-                    // u: 0 = 波前外沿（还没扫到），1 = 内沿（已扫过）
-                    let u = (k as f32 + 0.5) / RINGS as f32;
-                    let a = if u <= 0.5 {
-                        A_PEAK * (u / 0.5)
-                    } else {
-                        A_PEAK + (A_IN - A_PEAK) * ((u - 0.5) / 0.5)
-                    };
-                    let color = target_bg.opacity(a * alpha);
-                    let r_in = r_out - step;
-                    if r_in <= 0.5 {
-                        paint_disc(window, cx0, cy0, r_out, color);
-                    } else {
-                        paint_ring(window, cx0, cy0, r_out, r_in, color);
-                    }
-                }
+                // ease-in-out cubic：起手别一下蹦出个大圆（ease-out 起步太冲），
+                // 收尾也别硬停（ease-in 刹车太急）
+                let grow = (t / grow_frac).min(1.0);
+                let e = if grow < 0.5 {
+                    4.0 * grow * grow * grow
+                } else {
+                    1.0 - (-2.0 * grow + 2.0).powi(3) / 2.0
+                };
+                let rad = e * (max_r + 4.);
+                paint_disc(
+                    window,
+                    f32::from(origin.x),
+                    f32::from(origin.y),
+                    rad,
+                    color.opacity(REVEAL_TINT_ALPHA * alpha),
+                );
             },
         )
         .absolute()
@@ -3431,7 +3411,9 @@ impl Root {
             .gap_4()
             .bg(if backdrop {
                 // 播放条最浓，给底部一个稳定的锚（文字/控件都落在这里）
-                theme.bg_panel.opacity(0.90)
+                theme
+                    .bg_panel
+                    .opacity(self.store.read(cx).backdrop_panel_alpha())
             } else {
                 theme.bg_panel
             })
@@ -4531,7 +4513,10 @@ pub(crate) fn song_row(
 /// 滚动条轨道上下内边距（px）。
 pub(crate) const SB_INSET: f32 = 4.0;
 /// 滚动条拇指宽度（px）。
-const SB_W: f32 = 5.0;
+///
+/// 5px 在浅色底上几乎看不见（mini 队列 360 宽、整条只有 5px），用户反馈
+/// 「没有滚动条」；改成 6px 并提高不透明度后，静止状态下也能一眼看到。
+const SB_W: f32 = 6.0;
 /// 播放队列行高（uniform_list 要求所有行等高）。
 const QUEUE_ROW_H: f32 = 42.;
 
@@ -4690,7 +4675,7 @@ where
                         point(bounds.origin.x + bounds.size.width - px(SB_W), thumb_y),
                         gpui::size(px(SB_W), px(thumb_h)),
                     ),
-                    hsla(0., 0., 0., 0.22),
+                    hsla(0., 0., 0., 0.30),
                 )
                 .corner_radii(px(3.)),
             );

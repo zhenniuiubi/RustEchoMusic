@@ -118,10 +118,12 @@ impl ImageCache for CoverCache {
 // 注意通道顺序：gpui 的 `RenderImage` 存的是 BGRA（见 `swap_rgba_pa_to_bgra`），
 // 但高斯模糊是逐通道独立的线性运算，通道顺序不影响结果，不用先转回 RGBA。
 
-/// 模糊图的宽度（像素）。64 已经足够糊，再小会出现明显的色块台阶。
-const BLUR_W: u32 = 72;
-/// 模糊后的高斯 sigma（在缩小后的图上做，等效到原图约 ×(原图宽/72)）。
-const BLUR_SIGMA: f32 = 2.4;
+/// 模糊图的宽度（像素）。96 是「够糊但颜色还在」的平衡点：再小下去放大到
+/// 上千像素时会看到色块台阶，再大就把源图的结构留下来了。
+const BLUR_W: u32 = 96;
+/// 高斯 sigma（在缩小后的图上做，等效到原图约 ×(原图宽/96)，铺满窗口后
+/// 远大于这个数）。2.4 只能糊掉细节、人形轮廓还看得清，往上加到 5.5。
+const BLUR_SIGMA: f32 = 5.5;
 
 /// 背景模糊图缓存条目。
 ///
@@ -249,7 +251,44 @@ fn blur_render_image(src: &RenderImage) -> Option<Arc<RenderImage>> {
     let nw = BLUR_W;
     let nh = ((h as u32 * nw) / w).max(1);
     let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
-    let blurred = image::imageops::blur(&small, BLUR_SIGMA);
-    let out = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(nw, nh, blurred.into_raw())?;
+    // `image::imageops::blur` 把越界采样当成**透明黑**：直接在原图上模糊，四条
+    // 边会被拉黑一圈。铺满整个窗口之后，那一圈就是左右各一条黑边（用户报的
+    // 「背景两边有黑色」）。所以先按边缘像素外扩再模糊，最后把外扩裁掉。
+    let pad = (BLUR_SIGMA * 3.0).ceil() as u32;
+    let padded = pad_edge(&small, pad);
+    let blurred = image::imageops::blur(&padded, BLUR_SIGMA);
+    let mut cropped = image::imageops::crop_imm(&blurred, pad, pad, nw, nh).to_image();
+    // 大 sigma 之后各通道被平均，颜色会往灰里跑；稍微提一点饱和度，
+    // 铺满窗口才有「专辑配色」的感觉（0.62 的压暗会再吃掉一部分）。
+    boost_saturation(&mut cropped, 1.35);
+    let out = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(nw, nh, cropped.into_raw())?;
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(out)])))
+}
+
+/// 提高饱和度（往亮度轴外推）。字节序是 BGRA。
+fn boost_saturation(img: &mut image::RgbaImage, k: f32) {
+    for px in img.pixels_mut() {
+        let (b, g, r) = (px[0] as f32, px[1] as f32, px[2] as f32);
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        px[0] = (luma + (b - luma) * k).clamp(0.0, 255.0) as u8;
+        px[1] = (luma + (g - luma) * k).clamp(0.0, 255.0) as u8;
+        px[2] = (luma + (r - luma) * k).clamp(0.0, 255.0) as u8;
+    }
+}
+
+/// 边缘像素外扩（clamp 到边界），避免高斯模糊在图像边缘吸到「透明黑」。
+fn pad_edge(src: &image::RgbaImage, pad: u32) -> image::RgbaImage {
+    let (w, h) = src.dimensions();
+    if pad == 0 {
+        return src.clone();
+    }
+    let mut out = image::RgbaImage::new(w + pad * 2, h + pad * 2);
+    for y in 0..out.height() {
+        let sy = y.saturating_sub(pad).min(h - 1);
+        for x in 0..out.width() {
+            let sx = x.saturating_sub(pad).min(w - 1);
+            out.put_pixel(x, y, *src.get_pixel(sx, sy));
+        }
+    }
+    out
 }
