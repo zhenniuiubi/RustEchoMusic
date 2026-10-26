@@ -582,7 +582,15 @@ pub(crate) fn send_sms_code(store: &Entity<AppStore>, mobile: String, cx: &mut A
                     s.toast = "验证码已发送".into();
                     s.login.sms_countdown = 60;
                 }
-                Err(e) => s.login.error = format!("验证码发送失败：{e}"),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    // 20028 = 风控「请先通过验证」：接口侧拿 dfid 判的，换设备也没用
+                    s.login.error = if msg.contains("20028") {
+                        "验证码发送失败：当前设备被风控拦截，请稍后再试或改用扫码登录".into()
+                    } else {
+                        format!("验证码发送失败：{msg}")
+                    };
+                }
             }
             cx.notify();
         });
@@ -1843,6 +1851,17 @@ impl Root {
             )
         };
         let cover = song.as_ref().map(|c| c.cover_url.clone()).unwrap_or_default();
+        // 264px 的封面用 120px 的图拉上去是糊的，这里换高清版（拿不到就回退）
+        let cover_hd = song
+            .as_ref()
+            .map(|c| {
+                if c.cover_url_hd.is_empty() {
+                    c.cover_url.clone()
+                } else {
+                    c.cover_url_hd.clone()
+                }
+            })
+            .unwrap_or_default();
         let title = song.as_ref().map(|c| c.title.clone()).unwrap_or_default();
         let artist = song.as_ref().map(|c| c.artist.clone()).unwrap_or_default();
         let fav = song
@@ -1856,25 +1875,41 @@ impl Root {
             })
             .unwrap_or(false);
 
-        // ===== 背景层：封面铺满 + 压暗（gpui 没模糊，用压暗近似毛玻璃）=====
-        let bg_layer = div()
+        // ===== 背景层：封面高斯模糊铺满 + 压暗 =====
+        //
+        // gpui 0.2.2 没有元素级模糊，模糊图由 `imgcache::blurred_cover` 在后台把封面
+        // 缩小 + 高斯模糊后给出（按 URL 缓存）。它第一帧还没算完时会返回 None，
+        // 这时先用原图顶一下，算完会通知重绘自动换成模糊版。
+        let blurred = crate::imgcache::blurred_cover(&cover, window, cx);
+        let mut bg_layer = div()
             .id("pp-bg")
             .absolute()
             .top_0()
             .left_0()
-            .size_full()
-            .when(!cover.is_empty(), |el| {
-                el.child(
-                    img(SharedUri::from(cover.clone()))
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .object_fit(ObjectFit::Cover)
-                        .opacity(0.45),
-                )
-            })
-            .bg(gpui::black().opacity(0.68));
+            .size_full();
+        bg_layer = match blurred {
+            Some(b) => bg_layer.child(
+                img(b)
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .opacity(0.92),
+            ),
+            None if !cover.is_empty() => bg_layer.child(
+                img(SharedUri::from(cover.clone()))
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .opacity(0.45),
+            ),
+            None => bg_layer,
+        };
+        // 模糊后的背景比原图「实」得多，压暗可以轻一点，颜色反而更出得来
+        let bg_layer = bg_layer.bg(gpui::black().opacity(0.62));
 
         // ===== 时间轴 =====
         // 位置外推：引擎的 Position 事件只有 4Hz，逐字动画要按帧连续推进，
@@ -2171,9 +2206,9 @@ impl Root {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .when(!cover.is_empty(), |el| {
+                    .when(!cover_hd.is_empty(), |el| {
                         el.child(
-                            img(SharedUri::from(cover.clone()))
+                            img(SharedUri::from(cover_hd.clone()))
                                 .size_full()
                                 .rounded(px(12.))
                                 .object_fit(ObjectFit::Cover),
@@ -2420,9 +2455,9 @@ impl Root {
                     .left_0()
                     .right_0()
                     .h(px(44.))
-                    .window_control_area(WindowControlArea::Drag)
-                    // window_control_area 的命中测试在 gpui 0.2.2 里不稳（点快了会退化成
-                    // 普通点击），和主窗口标题栏一样再兜一层：单击手动拖、双击最大化
+                    // 不用 window_control_area：命中成功时它会让系统先起一个移动循环，
+                    // 和这里补发的 WM_NCLBUTTONDOWN 叠成两个循环 → 拖动掉帧；命中失败时
+                    // 又退化成普通点击 → 拖不动。只走 win::start_drag。
                     .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
                         if ev.click_count == 2 {
                             crate::ui::spawn_toggle_maximize(window.window_handle(), cx);

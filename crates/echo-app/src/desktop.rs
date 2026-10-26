@@ -280,7 +280,8 @@ impl Render for DesktopLyricView {
                     .justify_center()
                     .gap_1()
                     .px_6()
-                    .window_control_area(WindowControlArea::Drag)
+                    // 不挂 window_control_area：命中成功时系统和这里补发的
+                    // WM_NCLBUTTONDOWN 会叠出两个移动循环，拖动会掉帧
                     .on_mouse_down(MouseButton::Left, |_, window, _| {
                         crate::win::start_drag(window);
                     })
@@ -689,13 +690,17 @@ impl Render for MiniPlayerView {
             .flex_col()
             .bg(theme.bg_main)
             // 底层拖动层：满幅只做命中测试。前景没有 hitbox 的区域（封面/文字）
-            // 点击穿透到这一层 → 系统标题栏拖动；按钮 occlude 后不受影响
+            // 点击穿透到这一层 → 拖动窗口；按钮 occlude 后不受影响
             .child(
                 div()
                     .id("mini-drag")
                     .absolute()
                     .size_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    // 与拖动条同款处理：只走 win::start_drag，不挂 window_control_area
+                    // （命中成功时它会和补发的 WM_NCLBUTTONDOWN 叠成两个移动循环）
+                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                        crate::win::start_drag(window);
+                    }),
             )
             // ===== 第一行：窗口按钮 + 封面 + 文案/进度 + 控制 =====
             .child(
@@ -1026,6 +1031,10 @@ pub fn toggle_desktop_lyric(store: &Entity<AppStore>, cx: &mut App) {
             ))),
             window_min_size: Some(size(px(320.), px(80.))),
             is_resizable: false,
+            // PopUp = WS_EX_TOOLWINDOW：任务栏 / Alt-Tab 里不会出现「桌面歌词」
+            // 这个独立窗口（它只是挂在桌面上的一层文字，不该当成一个应用窗口）。
+            // 顺带去掉 WS_THICKFRAME/WS_SYSMENU，透明浮窗四周也不会有系统边框。
+            kind: WindowKind::PopUp,
             ..Default::default()
         },
         |_, cx| {

@@ -894,6 +894,28 @@ fn main() {
                         });
                     }
 
+                    // ECHO_SMOKE=theme：走与侧边栏按钮相同的 set_theme_mode 触发一次
+                    // 深浅切换（合成鼠标点不到侧边栏底部的小图标，这里直接调生产路径）
+                    if target == "theme" {
+                        smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                        let _ = cx.update(|app| {
+                            // 切到「跟当前相反」的模式：设置会落盘，写死 Dark 的话
+                            // 第二次跑就命中「模式相同直接返回」，动画不会再触发
+                            let cur = smoke_store.read(app).settings.get().theme_mode;
+                            let next = if cur == echo_core::ThemeMode::Dark {
+                                echo_core::ThemeMode::Light
+                            } else {
+                                echo_core::ThemeMode::Dark
+                            };
+                            ui::set_theme_mode(
+                                &smoke_store,
+                                next,
+                                Some(gpui::point(px(166.), px(523.))),
+                                app,
+                            );
+                        });
+                    }
+
                     // ECHO_SMOKE=backdrop-*：走与设置页按钮相同的 set_backdrop_mode
                     if let Some(mode_str) = target.strip_prefix("backdrop-") {
                         if let Some(mode) = windows_backdrop::parse_mode(mode_str) {

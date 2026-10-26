@@ -1203,6 +1203,10 @@ impl KuGouClient {
 
     /// 发送手机验证码（`/v7/send_mobile_code`）。
     /// 注意：该域名仅支持 http（无 TLS），与原实现一致。
+    ///
+    /// **dfid 必须发 `-`**：实测同一个设备指纹下，带注册过的 dfid 会被风控拦住
+    /// （`{"status":0,"error_code":20028,"data":"请先通过验证"}`），而 dfid 用 `-`
+    /// （未注册）时正常返回。风控是绑定在 dfid 上的，与 mid/guid 无关。
     pub async fn send_sms_code(&self, mobile: &str) -> anyhow::Result<()> {
         let body = json!({
             "businessid": 5,
@@ -1215,9 +1219,12 @@ impl KuGouClient {
             body: Some(body),
             encrypt_type: EncryptType::Android,
             skip_user_auth: true,
+            // 不带真实 dfid：带上会被判「请先通过验证」（error_code 20028）
+            dfid_override: Some("-".into()),
             ..Default::default()
         };
-        self.request(spec).await?;
+        let res = self.request(spec).await?;
+        log::info!("send_mobile_code: {}", res);
         Ok(())
     }
 
@@ -1300,7 +1307,15 @@ impl KuGouClient {
         spec.user_agent =
             Some("Android16-1070-11440-130-0-LOGIN-wifi".into());
 
-        let res = self.request(spec).await?;
+        let mut res = self.request(spec.clone()).await;
+        if let Err(crate::client::ApiError::Business { error_code: 20028, .. }) = &res {
+            // 与 send_mobile_code 同源的 dfid 风控：带真实 dfid 被判「请先通过验证」，
+            // 换成未注册的 `-` 再试一次（原实现默认也是随机 dfid）。
+            log::warn!("login_by_verifycode 命中 dfid 风控(20028)，改用未注册 dfid 重试");
+            spec.dfid_override = Some("-".into());
+            res = self.request(spec).await;
+        }
+        let res = res?;
         let data = res.get("data").cloned().unwrap_or(Value::Null);
         self.finish_login(&data, &temp_key, "验证码登录失败")
     }

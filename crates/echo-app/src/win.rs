@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture};
 
 /// 托盘菜单命令回调消息。
 const WM_APP_TRAY: u32 = WM_APP + 1;
@@ -242,24 +242,33 @@ pub fn is_maximized(window: &Window) -> bool {
 
 /// 开始拖动窗口（等价于按住系统标题栏）。
 ///
-/// 为什么不直接用 `window_control_area(Drag)`：gpui 的命中测试要拿「上一次鼠标移动
-/// 算出来的 hitbox 列表」去匹配，点快一点/刚移进来时匹配不到，就成了普通点击，
-/// 于是左上角怎么按都拖不动。这里直接给系统发一条「非客户区左键按下 + HTCAPTION」，
+/// 为什么不直接用 `window_control_area(Drag)`：
+/// 1. gpui 的命中测试要拿「上一次鼠标移动算出来的 hitbox 列表」去匹配，点快一点 /
+///    刚把鼠标从别的窗口移进来时匹配不到，就成了普通点击，于是顶部怎么按都拖不动；
+/// 2. 命中成功时 gpui 会在 `WM_NCHITTEST` 里回 `HTCAPTION`，系统立刻起一个移动循环，
+///    而我们在 `on_mouse_down` 里再补发一条 `WM_NCLBUTTONDOWN` 就会**嵌出第二个
+///    移动循环**——两个循环同时吃鼠标消息，窗口一帧移动两次，表现为拖动严重掉帧。
+/// 所以拖动区统一只用这一条路：给系统发一条「非客户区左键按下 + HTCAPTION」，
 /// 走 Windows 自己的窗口移动循环（贴边吸附、跨屏拖动都是系统的原生行为）。
 pub fn start_drag(window: &Window) {
-    /// gpui 会把这条 WM_NCLBUTTONDOWN 再派发回 view（本函数会被再调一次），
-    /// 用标志位保证只发一条，第二次放行给 DefWindowProc 去执行默认拖动。
-    static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-    if PENDING.swap(false, Ordering::SeqCst) {
-        return;
-    }
     if let Some(h) = hwnd(window) {
-        PENDING.store(true, Ordering::SeqCst);
         unsafe {
-            PostMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION as WPARAM, 0);
+            // gpui 在鼠标按下时 `SetCapture` 了，不先释放的话系统的移动循环
+            // 收不到后续鼠标事件（拖起来发飘 / 一顿一顿）。
+            ReleaseCapture();
+            // `SC_MOVE | HTCAPTION`：等价按住系统标题栏，让 DefWindowProc 进
+            // Windows 自己的窗口移动循环（贴边吸附、跨屏拖动都是原生行为）。
+            //
+            // **不能用 `WM_NCLBUTTONDOWN | HTCAPTION`**：gpui 的窗口过程收到它
+            // 会当成一次真实鼠标按下重新派发给 view，`ClickState::update` 把
+            // `click_count` 累加成 2，于是「单击顶部」被判成「双击」→ 窗口最大化，
+            // 系统移动循环也被 `ShowWindow` 打断（表现为顶部拖不动）。
+            // `WM_SYSCOMMAND` 不是鼠标消息，不经过 input 回调，click_state 干净。
+            // lParam 传 0：WPF `Window.DragMove()` 内部也是这么发的，系统用当前
+            // 光标位置算偏移，不会跳窗。
+            PostMessageW(h, WM_SYSCOMMAND, (SC_MOVE | HTCAPTION) as WPARAM, 0);
         }
-        log::debug!("start_drag: post WM_NCLBUTTONDOWN/HTCAPTION");
+        log::debug!("start_drag: post WM_SYSCOMMAND/SC_MOVE|HTCAPTION");
     }
 }
 

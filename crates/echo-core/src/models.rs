@@ -33,9 +33,16 @@ pub struct Song {
     /// 时长（秒）
     #[serde(default)]
     pub duration: u64,
-    /// 封面地址
+    /// 封面地址（120px，列表 / 播放条用）
     #[serde(default)]
     pub cover_url: String,
+    /// 高清封面地址（480px）。
+    ///
+    /// 播放页封面要显示到 264px，用 120px 的图拉上去是糊的；但把 `cover_url`
+    /// 统一提到 480 又会让几十上百行的列表白下载一大堆大图，所以只在需要大图的
+    /// 地方（播放页封面、全屏背景）用这一份。
+    #[serde(default)]
+    pub cover_url_hd: String,
     /// 解析后的播放地址
     #[serde(default)]
     pub audio_url: String,

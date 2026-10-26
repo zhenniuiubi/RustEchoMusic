@@ -439,9 +439,20 @@ impl AppStore {
 
     /// 当前配色（浅/深切换时在 `THEME_TRANSITION_SECS` 内平滑过渡）。
     pub fn theme(&self) -> Theme {
-        // 开光灯揭示进行中：保持旧主题（圆盖满后由 finish 切换）
+        // 开光灯揭示进行中：整棵 UI 树的颜色从旧主题插值到新主题。
+        //
+        // 这里**不能**再「hold 住旧主题、等圆盖满再换」——那样圆扫过的地方会被
+        // 一层不透明色盖住，内容就看不见了（用户明确反馈过）。改成底层自己渐变，
+        // 上层只画一圈半透明的「波前」做视觉引导，内容全程可见。
+        //
+        // 但这个渐变**必须比波前慢**：两者同步的话，圆内圆外的底色几乎一样，
+        // 波前就完全看不出来了（实测过）。慢一档之后，波前扫过的地方比没扫到的
+        // 地方更接近新主题，形成真正的「色差波前」；波前扫完再让底色慢慢补上。
         if let Some(r) = &self.theme_reveal {
-            return r.hold.clone();
+            let t = (r.started.elapsed().as_secs_f32() / crate::theme::THEME_REVEAL_SECS)
+                .min(1.0f32);
+            let e = t * t * (3.0 - 2.0 * t); // smoothstep：两头慢、中间快
+            return Theme::blend(&r.hold, &self.target_theme(), e);
         }
         let target = self.target_theme();
         match &self.theme_anim {

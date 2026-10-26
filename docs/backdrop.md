@@ -70,6 +70,12 @@ EchoMusic 主窗口支持 Windows 系统背景材质。实现集中在 `crates/e
 - Win10 1809+：所有非关闭模式降级为 gpui Blurred（未公开的
   `SetWindowCompositionAttribute`/`ACCENT_ENABLE_ACRYLICBLURBEHIND`），窗口拖动时
   模糊更新略滞后是系统已知行为；UI 半透明配色不变。
+- **Win10 也必须先 `DwmExtendFrameIntoClientArea(margins={-1,-1,-1,-1})`**：gpui 的
+  无边框窗口其实还留着一圈非客户区（`WM_NCCALCSIZE` 只把客户区内缩了
+  `frame_thickness`，外圈仍归 DWM）。Win11 那条路因为先扩展了框架，材质会铺到外圈；
+  Win10 以前没扩展，外圈仍是 DWM 画的窗口边框色 —— 客户区半透明、外圈实心，看起来就是
+  「开了特效后 app 多了一个边框」。现在 Win10 降级路径统一先扩展框架（`fallback_blurred_win10`），
+  关闭特效时 `reset_frame` 收回。
 - Win10 1809 之前 / 版本检测失败：普通不透明背景（自动回到不透明配色）。
 - 验证方法：在目标系统上运行 `ECHO_BACKDROP=mica echo-music.exe`，观察日志
   `背景特效：... 降级为 gpui Blurred 磨砂`，并用截图对比窗口边缘（无 DWM 材质时

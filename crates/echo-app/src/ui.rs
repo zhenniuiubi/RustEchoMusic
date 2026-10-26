@@ -1262,6 +1262,56 @@ fn load_search_hot(store: &Entity<AppStore>, cx: &mut App) {
     .detach();
 }
 
+/// 画一个实心圆（圆角=半径的方块）：主题揭示层的「圆盘」用它叠出径向羽化。
+fn paint_disc(window: &mut Window, cx: f32, cy: f32, r: f32, color: Hsla) {
+    if r <= 0.0 {
+        return;
+    }
+    let side = r * 2.0;
+    window.paint_quad(
+        fill(
+            Bounds::new(point(px(cx - r), px(cy - r)), size(px(side), px(side))),
+            color,
+        )
+        .corner_radii(gpui::Corners::all(px(r))),
+    );
+}
+
+/// 画一圈圆环（外圆挖掉内圆）。
+///
+/// gpui 0.2.2 的 `ContentMask` 只有矩形 bounds，元素层面做不了圆形裁剪；但
+/// `PathBuilder` 走的是 lyon 的 NonZero 填充规则——外圈顺时针 + 内圈逆时针两个
+/// 多边形叠在一起，中间就被挖空，得到真正的环带。
+///
+/// 环带之间**互不重叠**，所以每一圈都能独立指定 alpha，可以拼出任意径向分布
+/// （「中心淡、波前浓、外沿归零」这种双向羽化，靠同心圆盘叠加是做不出来的——
+/// 叠加只能越叠越实）。
+fn paint_ring(window: &mut Window, cx: f32, cy: f32, r_out: f32, r_in: f32, color: Hsla) {
+    if r_out <= 0.5 || r_in >= r_out {
+        return;
+    }
+    const SEG: usize = 56;
+    let step = std::f32::consts::TAU / SEG as f32;
+    let mut outer = Vec::with_capacity(SEG);
+    let mut inner = Vec::with_capacity(SEG);
+    for i in 0..SEG {
+        let a = i as f32 * step;
+        outer.push(point(px(cx + r_out * a.cos()), px(cy + r_out * a.sin())));
+    }
+    // 内圈反向：NonZero 规则下才会被当成「洞」
+    for i in (0..SEG).rev() {
+        let a = i as f32 * step;
+        inner.push(point(px(cx + r_in * a.cos()), px(cy + r_in * a.sin())));
+    }
+    let mut b = gpui::PathBuilder::fill();
+    b.add_polygon(&outer, true);
+    b.add_polygon(&inner, true);
+    match b.build() {
+        Ok(path) => window.paint_path(path, color),
+        Err(e) => log::warn!("波前环构建失败：{e}"),
+    }
+}
+
 // ==================== 主布局 Root ====================
 
 impl Root {
@@ -1416,7 +1466,18 @@ impl Root {
             .child(self.render_toast(cx))
     }
 
-    /// 主题「开关灯」圆形揭示层：新主题底色从开关位置扩散，盖满即换装。
+    /// 主题「开关灯」的波前光圈：新主题色的一道圆形波从开关位置扩散铺满窗口。
+    ///
+    /// Web 上那套 View Transitions 是「新主题整页快照 + `clip-path: circle()`」，
+    /// gpui 0.2.2 做不到同样的效果，原因有二：
+    /// 1. 没有整页快照 API（`grep screenshot` 无结果）；
+    /// 2. `ContentMask` 只有矩形 `bounds`，元素层面**没有圆形裁剪**，所以也拿不到
+    ///    「圆内显示新 UI、圆外显示旧 UI」的双层。
+    ///
+    /// 于是改成：**底层 UI 自己从旧主题插值到新主题**（见 `AppStore::theme`），
+    /// 上层只画一圈半透明的「波前」——已扫过的区域只压很淡的一层新主题色，
+    /// 波前那一圈稍浓，外沿渐隐到 0。这样内容全程都看得见（最浓处也只有 50%
+    /// 覆盖），同时保留了「从点击处扩散」的动线。
     fn render_theme_reveal(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(r) = self.store.read(cx).theme_reveal.clone() else {
             return div().into_any_element();
@@ -1427,30 +1488,62 @@ impl Root {
         canvas(
             move |_, _, _| {},
             move |bounds, _, window, _| {
-                let t = (started.elapsed().as_secs_f32() / crate::theme::THEME_REVEAL_SECS).min(1.0f32);
-                if t >= 1.0 {
-                    return;
-                }
-                let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
-                // 圆心到最远角的距离 = 完整盖满所需半径
+                let t =
+                    (started.elapsed().as_secs_f32() / crate::theme::THEME_REVEAL_SECS).min(1.0f32);
+                let grow = (t / crate::theme::THEME_REVEAL_GROW_FRAC).min(1.0);
+                let e = 1.0 - (1.0 - grow).powi(3); // ease-out cubic：起步快、铺满稳
+                // 圆心到最远角的距离 = 波前铺满窗口所需的半径
                 let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
                 let ox = f32::from(origin.x) - f32::from(bounds.origin.x);
                 let oy = f32::from(origin.y) - f32::from(bounds.origin.y);
                 let dx = (ox).max(w - ox);
                 let dy = (oy).max(h - oy);
                 let max_r = (dx * dx + dy * dy).sqrt();
-                let rad = (e * max_r).max(1.0);
-                let side = rad * 2.0;
-                window.paint_quad(
-                    fill(
-                        Bounds::new(
-                            point(px(f32::from(origin.x) - rad), px(f32::from(origin.y) - rad)),
-                            size(px(side), px(side)),
-                        ),
-                        target_bg,
-                    )
-                    .corner_radii(gpui::Corners::all(px(rad))),
-                );
+                let rad = e * (max_r + 48.);
+                if rad <= 0.5 {
+                    return;
+                }
+                // 收尾：波前铺满后整体淡出（比底色渐变更早收，剩下的交给底色补上）
+                let fade = ((t - crate::theme::THEME_REVEAL_GROW_FRAC)
+                    / crate::theme::THEME_REVEAL_FADE_FRAC)
+                    .clamp(0.0, 1.0);
+                let alpha = 1.0 - fade * fade * (3.0 - 2.0 * fade); // smoothstep
+                if alpha <= 0.002 {
+                    return;
+                }
+
+                let (cx0, cy0) = (f32::from(origin.x), f32::from(origin.y));
+                // 已扫过区压一层新主题色（浓度要够看出色差，又不能盖住内容）；
+                // 波前那一圈更浓，外沿渐隐到 0，形成一道「扫过去」的波。
+                const A_IN: f32 = 0.34;
+                const A_PEAK: f32 = 0.60;
+                const RINGS: usize = 14;
+                let ring_w = (max_r * 0.30).clamp(56.0, 190.0);
+                let inner_r = rad - ring_w;
+                if inner_r > 0.5 {
+                    paint_disc(window, cx0, cy0, inner_r, target_bg.opacity(A_IN * alpha));
+                }
+                let step = ring_w / RINGS as f32;
+                for k in 0..RINGS {
+                    let r_out = rad - step * k as f32;
+                    if r_out <= 0.5 {
+                        break;
+                    }
+                    // u: 0 = 波前外沿（还没扫到），1 = 内沿（已扫过）
+                    let u = (k as f32 + 0.5) / RINGS as f32;
+                    let a = if u <= 0.5 {
+                        A_PEAK * (u / 0.5)
+                    } else {
+                        A_PEAK + (A_IN - A_PEAK) * ((u - 0.5) / 0.5)
+                    };
+                    let color = target_bg.opacity(a * alpha);
+                    let r_in = r_out - step;
+                    if r_in <= 0.5 {
+                        paint_disc(window, cx0, cy0, r_out, color);
+                    } else {
+                        paint_ring(window, cx0, cy0, r_out, r_in, color);
+                    }
+                }
             },
         )
         .absolute()
@@ -1905,7 +1998,13 @@ impl Root {
                     .w_full()
                     .h(px(8.))
                     .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag),
+                    .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
+                        if ev.click_count == 2 {
+                            spawn_toggle_maximize(window.window_handle(), cx);
+                        } else {
+                            crate::win::start_drag(window);
+                        }
+                    }),
             )
             .child(div().pt_1().child(account))
             // ===== 发现音乐 =====
@@ -2117,21 +2216,6 @@ impl Root {
                         }
                         .render("tool-theme", cx),
                     )
-                    .child(
-                        IconButton {
-                            path: if collapsed { "icons/arrow-right.svg" } else { "icons/arrow-left.svg" },
-                            size: 16.,
-                            color: theme.text_secondary,
-                            hover_bg: theme.bg_hover,
-                            action: Box::new(move |root: &mut Root, _, _, cx: &mut Context<Root>| {
-                                root.store.update(cx, |s, cx| {
-                                    s.sidebar_collapsed = !s.sidebar_collapsed;
-                                    cx.notify();
-                                });
-                            }),
-                        }
-                        .render("tool-collapse", cx),
-                    ),
             )
     }
 
@@ -2198,7 +2282,17 @@ impl Root {
                     .w_full()
                     .h(px(8.))
                     .flex_shrink_0()
-                    .window_control_area(WindowControlArea::Drag),
+                    // 不用 window_control_area：它靠「上一次鼠标移动算出的 hitbox」
+                    // 做命中，鼠标刚从别的窗口移进来时匹配不到 → 拖不动；命中成功时
+                    // 又会和这里补发的 WM_NCLBUTTONDOWN 叠出第二个系统移动循环 →
+                    // 拖动掉帧。统一走 win::start_drag（见 win.rs 的说明）。
+                    .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
+                        if ev.click_count == 2 {
+                            spawn_toggle_maximize(window.window_handle(), cx);
+                        } else {
+                            crate::win::start_drag(window);
+                        }
+                    }),
             )
             .child(
                 div()
@@ -2332,7 +2426,6 @@ impl Root {
                     .id("titlebar-drag")
                     .flex_1()
                     .h_full()
-                    .window_control_area(WindowControlArea::Drag)
                     .on_mouse_down(MouseButton::Left, |ev: &MouseDownEvent, window, cx| {
                         if ev.click_count == 2 {
                             // 双击最大化/还原

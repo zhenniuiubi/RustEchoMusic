@@ -269,6 +269,18 @@ mod imp {
         window.set_background_appearance(WindowBackgroundAppearance::Blurred);
     }
 
+    /// Win10 的磨砂降级（先把框架铺满整窗，再开亚克力）。
+    ///
+    /// gpui 的「无边框」窗口在 Win10 上其实还留着一圈非客户区（`WM_NCCALCSIZE`
+    /// 只把**客户区**内缩了 frame_thickness，外圈仍归 DWM）。Win11 那条路因为
+    /// 先调了 `DwmExtendFrameIntoClientArea`，材质会铺到外圈；Win10 这条以前没调，
+    /// 于是外圈还是 DWM 画的窗口边框色 —— 客户区半透明、外圈实心，看起来就是
+    /// 「开了特效后 app 多了一个边框」。这里补上扩展，材质铺满整窗，边框消失。
+    fn fallback_blurred_win10(window: &Window, hwnd: HWND, why: &str) {
+        extend_frame_glass(hwnd);
+        fallback_blurred(window, why);
+    }
+
     pub(super) fn apply(window: &Window, mode: BackdropMode) {
         let Some(hwnd) = crate::win::hwnd(window) else {
             log::warn!("背景特效：拿不到 HWND，跳过");
@@ -291,6 +303,10 @@ mod imp {
                 if build >= WIN11_BUILD && build < WIN11_22H2_BUILD {
                     // 21H2 专用清理（1029 + 框架扩展）
                     disable_mica_21h2(hwnd);
+                } else if build >= WIN10_1809_BUILD && build < WIN11_BUILD {
+                    // Win10：把材质期间扩展出去的框架收回，否则窗口四周会留下一圈
+                    // 透明/磨砂的边（关掉特效后看起来就是「多了个边框」）
+                    reset_frame(hwnd);
                 }
                 log::info!("背景特效：已关闭（普通不透明背景）");
             }
@@ -318,7 +334,7 @@ mod imp {
                     if build >= WIN11_BUILD && build < WIN11_22H2_BUILD {
                         disable_mica_21h2(hwnd);
                     }
-                    fallback_blurred(window, "系统不支持 DWM 系统背景");
+                    fallback_blurred_win10(window, hwnd, "系统不支持 DWM 系统背景");
                 } else {
                     log::info!("背景特效：系统过老（build {build}），普通不透明背景");
                     window.set_background_appearance(WindowBackgroundAppearance::Opaque);
@@ -340,7 +356,7 @@ mod imp {
                     window.set_background_appearance(WindowBackgroundAppearance::Opaque);
                     log::info!("背景特效：Mica（Win11 21H2 未公开属性 1029）");
                 } else if build >= WIN10_1809_BUILD {
-                    fallback_blurred(window, "Win10 无 Mica");
+                    fallback_blurred_win10(window, hwnd, "Win10 无 Mica");
                 } else {
                     log::info!("背景特效：系统过老（build {build}），普通不透明背景");
                     window.set_background_appearance(WindowBackgroundAppearance::Opaque);
@@ -361,7 +377,7 @@ mod imp {
                     if build >= WIN11_BUILD && build < WIN11_22H2_BUILD {
                         disable_mica_21h2(hwnd);
                     }
-                    fallback_blurred(window, "系统不支持 DWM 亚克力");
+                    fallback_blurred_win10(window, hwnd, "系统不支持 DWM 亚克力");
                 } else {
                     log::info!("背景特效：系统过老（build {build}），普通不透明背景");
                     window.set_background_appearance(WindowBackgroundAppearance::Opaque);

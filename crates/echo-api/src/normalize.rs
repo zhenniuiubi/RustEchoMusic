@@ -307,6 +307,7 @@ pub fn parse_song(v: &serde_json::Value) -> Song {
             if raw > 10000 { (raw / 1000) as u64 } else { raw as u64 }
         },
         cover_url: normalize_cover(&cover_raw, 120),
+        cover_url_hd: normalize_cover(&cover_raw, 480),
         audio_url: String::new(),
         mix_song_id: pick_str(v, &["MixSongID", "mixsongid", "mix_song_id"]),
         // 云歌单条目 id：`fileid` 才是删除时用的 fileid（audio_id 是另一个编号）
