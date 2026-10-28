@@ -116,6 +116,16 @@ pub fn is_auth_expired(err: &anyhow::Error) -> bool {
     )
 }
 
+/// 取业务错误码（网络/解析错误返回 `None`）。
+///
+/// UI 侧据此把 `api status=0 error_code=20021 msg=` 这类原始串换成中文提示。
+pub fn business_code(err: &anyhow::Error) -> Option<i64> {
+    match err.downcast_ref::<ApiError>() {
+        Some(ApiError::Business { error_code, .. }) => Some(*error_code),
+        _ => None,
+    }
+}
+
 /// 登录态。
 #[derive(Debug, Clone, Default)]
 pub struct AuthState {

@@ -279,6 +279,9 @@ impl IconButton {
 /// 解析指定歌曲的播放地址并加载引擎（在 update 之外调用）。
 pub fn spawn_resolve(store: &Entity<AppStore>, request_id: u64, song: Song, cx: &mut App) {
     let store = store.clone();
+    // 私人 FM 的「听过没」在这里打点：所有播放入口（play_from / play_index /
+    // Ended 自动下一首 / 重启还原后首次播放）最终都会走到解析地址。
+    crate::views::note_fm_heard(&store, &song, cx);
     let (client, engine, quality) = {
         let s = store.read(cx);
         (s.client.clone(), s.engine.clone(), s.settings.get().audio_quality)
@@ -473,12 +476,22 @@ pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx:
         return;
     }
     let start = index.min(songs.len() - 1);
+    // 私人 FM：把这一批的 hash 记下来，后面判断「整批都播过」用
+    let fm_hashes: Vec<String> = if matches!(source, PlaySource::Fm) {
+        songs.iter().map(|x| x.hash.clone()).collect()
+    } else {
+        Vec::new()
+    };
     // 设置队列状态
     let current_song = store.update(cx, |s, cx| {
         let mode = s.player.play_mode;
         let volume = s.player.volume;
         s.player.set_queue(&title, songs, start);
         s.player.fm_queue = matches!(source, PlaySource::Fm);
+        if s.player.fm_queue {
+            s.fm_batch = fm_hashes;
+            s.fm_heard.clear();
+        }
         s.player.play_mode = mode;
         s.player.volume = volume;
         s.player.position = 0.0;
@@ -498,6 +511,29 @@ pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx:
         crate::views::load_lyric(&store, cx);
         start_with_fade(&store, rid, song, cx);
     }
+}
+
+/// 「播放全部」：随机模式下从**随机一首**开始，而不是永远固定第一首。
+///
+/// 目前用在「我最喜爱」页；点单曲仍然走 `play_from(.., index)`，从点的那首开始。
+pub fn play_all(store: &Entity<AppStore>, source: PlaySource, cx: &mut App) {
+    let start = {
+        let s = store.read(cx);
+        let len = match source {
+            PlaySource::Favorites | PlaySource::FavoritesFiltered => s.favorites_view().len(),
+            PlaySource::History => s.library.get().history.len(),
+            _ => 0,
+        };
+        if s.player.play_mode == echo_core::PlayMode::Random && len > 0 {
+            use rand::Rng as _;
+            let start = rand::rng().random_range(0..len);
+            log::info!("play_all: 随机模式，从第 {start}/{len} 首开始");
+            start
+        } else {
+            0
+        }
+    };
+    play_from(store, source, start, cx);
 }
 
 /// 切歌淡出：正在播就把旧音源淡出，再解析新地址（避免硬切爆音）。
@@ -608,6 +644,11 @@ pub fn clear_queue(store: &Entity<AppStore>, cx: &mut App) {
 }
 
 pub fn next_track(store: &Entity<AppStore>, auto: bool, cx: &mut App) {
+    // 私人 FM：这一轮的歌都听过了 → 清空队列换下一轮（不再往下接老队列）
+    if crate::views::fm_round_finished(store.read(cx)) {
+        crate::views::fm_extend(store, cx);
+        return;
+    }
     let next = store.read(cx).player.next_index();
     match next {
         Some(i) => play_index(store, i, cx),
@@ -721,17 +762,19 @@ pub fn handle_player_event_state(
             None
         }
         echo_audio::PlayerEvent::Ended => {
-            // 私人 FM 的「一批播完」不能靠 `next_index()` 判断：列表循环/随机模式下
+            // 私人 FM 的「一轮听完」不能靠 `next_index()` 判断：列表循环/随机模式下
             // 它会绕回队首，永远碰不到队尾，于是同一批 5 首来回放、再也不去要新歌。
-            // 这里改成「当前是队列最后一首」就续推（单曲循环除外，那是用户明确要求重播）。
-            let fm_at_tail = s.player.fm_queue
+            // 这里只要「这一轮都听过了」或者「已经是队列最后一首」就换一轮
+            // （单曲循环除外，那是用户明确要求重播）。
+            let at_tail = s
+                .player
+                .index
+                .map(|i| i + 1 >= s.player.queue.len())
+                .unwrap_or(false);
+            let fm_round_done = s.player.fm_queue
                 && s.player.play_mode != echo_core::PlayMode::Single
-                && s
-                    .player
-                    .index
-                    .map(|i| i + 1 >= s.player.queue.len())
-                    .unwrap_or(false);
-            if fm_at_tail {
+                && (crate::views::fm_round_finished(s) || at_tail);
+            if fm_round_done {
                 s.player.loading = true;
                 s.fm_loading = true;
                 cx.notify();
@@ -1291,10 +1334,10 @@ fn load_search_hot(store: &Entity<AppStore>, cx: &mut App) {
 
 /// 圆面（= 已扫过区域）压的新主题色浓度。
 ///
-/// 这是个折中值：调高（0.7+）更像「整块换好」，但内容会被压得很淡；调低
-/// （0.3 以下）圆内外差别太小，看不出是在「扫」。0.45 时内容仍然清楚可读，
-/// 也不会把整块区域压成一片灰。
-const REVEAL_TINT_ALPHA: f32 = 0.45;
+/// 圆面是叠在旧界面上的**半透明蒙版**，这个值直接决定「水波纹内外区分得够不够明显」：
+/// 0.45 时圆内是「旧底色 + 45% 新底色」的混合色，深转浅/浅转深都灰蒙蒙一片；
+/// 0.92 之后圆内基本就是新底色本身，扫过的地方看着就是干脆的白/黑。
+const REVEAL_TINT_ALPHA: f32 = 0.92;
 
 fn smoothstep01(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);

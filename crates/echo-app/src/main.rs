@@ -359,6 +359,8 @@ fn main() {
                 fm_loading: false,
                 fm_cur_mark: 0,
                 fm_extending: false,
+                fm_batch: Vec::new(),
+                fm_heard: Default::default(),
                 cloud: Arc::new(Vec::new()),
                 cloud_loaded: false,
                 cloud_loading: false,
@@ -803,7 +805,7 @@ fn main() {
                         // 供自动化读回验证（绕过合成点击，真实用户仍走按钮点击）
                         t if t.starts_with("backdrop-") => Page::Settings,
                         "cloud" => Page::Cloud,
-                        "fm" | "fm-end" => Page::Fm,
+                        "fm" | "fm-end" | "fm-heard" => Page::Fm,
                         "lyric" => Page::Lyric,
                         "purchased" => Page::Purchased,
                         "profile" => Page::Profile,
@@ -883,11 +885,43 @@ fn main() {
                         });
                     }
 
+                    // ECHO_SMOKE=fm-heard：验证「这一批都播过就预取下一批」。
+                    // 进 FM 页 → 等数据 → 播第一首 → 每 1.2s 切下一首（每首只听一小段，
+                    // 不要求播完），日志里应能看到
+                    // 「fm: 本批 N 首已全部播放过，预取下一批」+「fm extend(autoplay=false)」。
+                    if target == "fm-heard" {
+                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
+                        let _ = cx.update(|app| {
+                            let n = smoke_store.read_with(app, |s, _| s.fm.len());
+                            log::warn!("[smoke-fm] fm songs n={n}");
+                            ui::play_from(&smoke_store, ui::PlaySource::Fm, 0, app);
+                        });
+                        for i in 1..8usize {
+                            smol::Timer::after(std::time::Duration::from_millis(1200)).await;
+                            let _ = cx.update(|app| {
+                                let (len, idx) = smoke_store
+                                    .read_with(app, |s, _| (s.player.queue.len(), s.player.index));
+                                log::warn!(
+                                    "[smoke-fm] step {i}: queue={len} idx={idx:?} -> 切歌"
+                                );
+                                // 走真实的「下一首」路径：一轮听完就在这里清空队列换下一轮
+                                ui::next_track(&smoke_store, false, app);
+                            });
+                        }
+                    }
+
                     // ECHO_SMOKE=mini：打开 mini 播放器（自动化验证浮窗）
+                    // 与顶栏按钮同一条路径：开 mini + 收主窗口，截图才能拍到 mini
                     if target == "mini" {
                         smol::Timer::after(std::time::Duration::from_secs(2)).await;
                         let _ = cx.update(|app| {
                             crate::desktop::open_mini_player(&smoke_store, app);
+                            if let Some(h) = app
+                                .try_global::<crate::state::AppGlobal>()
+                                .and_then(|g| g.main_window)
+                            {
+                                let _ = h.update(app, |_, w, _| crate::win::hide_window(w));
+                            }
                         });
                     }
 
@@ -967,7 +1001,7 @@ fn main() {
                         if let Some(mode) = windows_backdrop::parse_mode(mode_str) {
                             // 先落「浓染色」再切模式：set_backdrop_mode 里会重读设置
                             if let Some(on) = dense {
-                                smoke_store.update(cx, |s, _| {
+                                let _ = smoke_store.update(cx, |s, _| {
                                     s.settings.update(|st| st.backdrop_dense = on);
                                 });
                             }

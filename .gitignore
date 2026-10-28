@@ -8,6 +8,7 @@
 # 第三方参考项目源码（各自带 LICENSE，不在本仓库重复收录）
 /_ref/
 /_kgapi/
+/_MoeKoeMusic-main/
 *.zip
 
 # 本机工作区：日志、memory、备份

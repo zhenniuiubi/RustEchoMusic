@@ -553,6 +553,20 @@ fn poll_qr_login(store: &Entity<AppStore>, qr_ver: u64, cx: &mut AsyncApp) {
     .detach();
 }
 
+/// 登录/验证码相关业务错误 → 用户看得懂的中文提示。
+///
+/// `ApiError::Business` 的 Display 是 `api status=0 error_code=20021 msg=` 这种调试串，
+/// 直接丢给用户既看不懂也没法定位，这里按错误码换成人话（未知码仍带上错误码）。
+fn login_error_text(err: &anyhow::Error, prefix: &str) -> String {
+    match echo_api::business_code(err) {
+        Some(20021) => "验证码错误或已失效，请重新获取".into(),
+        Some(20028) => "当前设备被风控拦截，请稍后再试，或改用扫码登录".into(),
+        Some(20006) | Some(20017) | Some(20018) => "登录态已失效，请重新登录".into(),
+        Some(code) => format!("{prefix}（错误码 {code}）"),
+        None => format!("{prefix}：{err}"),
+    }
+}
+
 /// 发送短信验证码。
 pub(crate) fn send_sms_code(store: &Entity<AppStore>, mobile: String, cx: &mut App) {
     let store = store.clone();
@@ -583,13 +597,8 @@ pub(crate) fn send_sms_code(store: &Entity<AppStore>, mobile: String, cx: &mut A
                     s.login.sms_countdown = 60;
                 }
                 Err(e) => {
-                    let msg = format!("{e}");
                     // 20028 = 风控「请先通过验证」：接口侧拿 dfid 判的，换设备也没用
-                    s.login.error = if msg.contains("20028") {
-                        "验证码发送失败：当前设备被风控拦截，请稍后再试或改用扫码登录".into()
-                    } else {
-                        format!("验证码发送失败：{msg}")
-                    };
+                    s.login.error = login_error_text(&e, "验证码发送失败");
                 }
             }
             cx.notify();
@@ -647,9 +656,10 @@ pub(crate) fn submit_sms_login(
                 let _ = cx.update(|app| apply_login(&store, login, app));
             }
             Err(e) => {
+                let text = login_error_text(&e, "登录失败");
                 let _ = store.update(cx, |s, cx| {
                     s.login.busy = false;
-                    s.login.error = format!("{e}");
+                    s.login.error = text;
                     cx.notify();
                 });
             }
@@ -692,9 +702,10 @@ pub(crate) fn submit_login(
                 let _ = cx.update(|app| apply_login(&store2, login, app));
             }
             Err(e) => {
+                let text = login_error_text(&e, "登录失败");
                 let _ = store.update(cx, |s, cx| {
                     s.login.busy = false;
-                    s.login.error = format!("{e}");
+                    s.login.error = text;
                     cx.notify();
                 });
             }
@@ -912,16 +923,17 @@ impl Root {
                             .child(
                                 div()
                                     .id("sms-send")
-                                    .h(px(40.))
-                                    .px_3()
+                                    .h(px(32.))
+                                    .px_2()
+                                    .mr_1()
                                     .flex_shrink_0()
-                                    .rounded(px(10.))
+                                    .rounded(px(9.))
                                     .border_1()
                                     .border_color(theme.border)
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_size(px(12.))
+                                    .text_size(px(11.5))
                                     .cursor_pointer()
                                     .when(countdown > 0, |el| el.text_color(theme.text_tertiary))
                                     .when(countdown == 0, |el| {
@@ -1362,10 +1374,13 @@ impl Root {
     /// 私人 FM（参考酷狗「私人FM」：推荐来源 tabs + 频道卡片 + 当前播放）。
     pub(crate) fn render_fm(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.store.read(cx).theme();
-        if self.store.read(cx).fm_loading {
+        let songs = self.store.read(cx).fm.clone();
+        // 只有「首次、还没有任何内容」才整页转圈。
+        // 切推荐来源（口味/风格/探索）或切频道时保留旧内容原地等新数据，
+        // 否则整页白闪一下，观感上就像刷新了页面。
+        if self.store.read(cx).fm_loading && songs.is_empty() {
             return centered_spinner(theme).into_any_element();
         }
-        let songs = self.store.read(cx).fm.clone();
         let mode = self.store.read(cx).fm_mode.clone();
         let pool = self.store.read(cx).fm_pool;
         let playing_fm = self.store.read(cx).player.queue_title == "私人FM";
@@ -1525,6 +1540,12 @@ impl Root {
             } else {
                 song.rec_reason.clone()
             };
+            // 封面上的控制按钮：点它就是「播这首 / 暂停继续」
+            let cover_store = self.store.clone();
+            let cover_hash = song.hash.clone();
+            let this_playing = playing_fm
+                && current.as_ref().map(|c| c.hash == song.hash).unwrap_or(false)
+                && self.store.read(cx).player.playing;
             div()
                 .flex()
                 .gap_4()
@@ -1535,20 +1556,74 @@ impl Root {
                 .border_color(theme.border)
                 .child(
                     div()
-                        .w(px(92.))
-                        .h(px(92.))
+                        .relative()
+                        .w(px(136.))
+                        .h(px(136.))
                         .flex_shrink_0()
-                        .rounded(px(10.))
+                        .rounded(px(12.))
                         .overflow_hidden()
                         .bg(theme.bg_hover)
                         .when(!cover.is_empty(), |el| {
                             el.child(
                                 img(SharedUri::from(cover.clone()))
+                                    .absolute()
                                     .size_full()
-                                    .rounded(px(10.))
                                     .object_fit(ObjectFit::Cover),
                             )
-                        }),
+                        })
+                        // 播放控制**叠在封面图上**：封面走绝对定位铺底，
+                        // 控制层走正常流 + size_full 居中（gpui 0.2.2 里
+                        // 「absolute 容器 + flex 居中子元素」实测不居中，反着来才稳）
+                        .child(
+                            div()
+                                .id("fm-now-toggle")
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(gpui::black().opacity(0.14)))
+                                .on_click(move |_, _, cx| {
+                                    let same = {
+                                        let st = cover_store.read(cx);
+                                        st.player.fm_queue
+                                            && st
+                                                .player
+                                                .current()
+                                                .map(|c| c.hash == cover_hash)
+                                                .unwrap_or(false)
+                                    };
+                                    if same {
+                                        crate::ui::toggle_play(&cover_store, cx);
+                                    } else {
+                                        crate::ui::play_from(
+                                            &cover_store,
+                                            crate::ui::PlaySource::Fm,
+                                            0,
+                                            cx,
+                                        );
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .w(px(44.))
+                                        .h(px(44.))
+                                        .rounded_full()
+                                        .bg(gpui::white().opacity(0.92))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(icon(
+                                            if this_playing {
+                                                "icons/pause.svg"
+                                            } else {
+                                                "icons/play.svg"
+                                            },
+                                            18.,
+                                            theme.accent,
+                                        )),
+                                ),
+                        ),
                 )
                 .child(
                     div()
@@ -1621,7 +1696,7 @@ impl Root {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(icon("icons/heart-sparkle.svg", 34., gpui::white())),
+                            .child(icon("icons/radio.svg", 34., gpui::white())),
                     )
                     .child(
                         div()
@@ -4411,7 +4486,10 @@ impl Root {
                                     .on_click({
                                         let store = store.clone();
                                         let source = source.clone();
-                                        move |_, _, cx| play_from(&store, source.clone(), 0, cx)
+                                        // 随机模式下从随机一首开始（不要固定第一首）
+                                        move |_, _, cx| {
+                                            crate::ui::play_all(&store, source.clone(), cx)
+                                        }
                                     })
                                     .child(icon("icons/play.svg", 11., gpui::white()))
                                     .child("播放全部"),
@@ -4585,7 +4663,34 @@ pub(crate) fn load_purchased(store: &Entity<AppStore>, force: bool, cx: &mut App
 }
 
 
-/// 私人 FM 续推：一批播完了，带着上一批的 `cur_mark` 再要一批，接到队尾继续播。
+/// 私人 FM：记一首「已经播放过」。
+///
+/// 只打点，不在这里触发换歌 —— 换批的时机是**切歌**（见 [`fm_round_finished`] 与
+/// `ui::next_track` / `PlayerEvent::Ended`）。之所以在**开始播放**（解析地址）时就记，
+/// 是因为用户要求「不必每首都播完，听过就算」。
+pub(crate) fn note_fm_heard(store: &Entity<AppStore>, song: &echo_core::Song, cx: &mut App) {
+    let _ = store.update(cx, |s, _| {
+        if !s.player.fm_queue || s.fm_batch.is_empty() {
+            return false;
+        }
+        // 队列里插了别的歌（非 FM）时不算数
+        if !s.fm_batch.iter().any(|h| h == &song.hash) {
+            return false;
+        }
+        s.fm_heard.insert(song.hash.clone());
+        s.fm_batch.iter().all(|h| s.fm_heard.contains(h))
+    });
+}
+
+/// 私人 FM 这一轮的歌是不是都听过了（切歌时据此决定「清空队列换下一轮」）。
+pub(crate) fn fm_round_finished(s: &AppStore) -> bool {
+    s.player.fm_queue
+        && !s.fm_batch.is_empty()
+        && s.fm_batch.iter().all(|h| s.fm_heard.contains(h))
+}
+
+/// 私人 FM 换一轮：带着上一轮的 `cur_mark` 再要一批，**清空队列换成新一轮**，
+/// 从新批第一首开始播。
 ///
 /// 接口语义是「一批一批推」：`cur_mark` 不带回去服务端会认为刚推过、直接给空列表
 /// （见 `api.rs::personal_fm`），所以游标必须一路存下来（`AppStore::fm_cur_mark`）。
@@ -4597,6 +4702,7 @@ pub(crate) fn fm_extend(store: &Entity<AppStore>, cx: &mut App) {
         if s.fm_extending {
             return;
         }
+        // 用当前队列的 hash 去重：新一轮要「不一样的歌」，同一批再拿一次没意义
         let seen: std::collections::HashSet<String> =
             s.player.queue.iter().map(|x| x.hash.clone()).collect();
         (s.client.clone(), s.fm_mode.clone(), s.fm_pool, s.fm_cur_mark, seen)
@@ -4647,8 +4753,8 @@ pub(crate) fn fm_extend(store: &Entity<AppStore>, cx: &mut App) {
             }
         }
 
-        // 先把新一批挂到队尾，再交给 play_index 走正常的「解析地址 → 播放」流程
-        let start = store_c.update(cx, |s, cx| {
+        // 清空旧队列，换成新一轮，再从第一首开始播
+        let ok = store_c.update(cx, |s, cx| {
             s.fm_extending = false;
             s.fm_loading = false;
             s.fm_cur_mark = mark;
@@ -4657,21 +4763,26 @@ pub(crate) fn fm_extend(store: &Entity<AppStore>, cx: &mut App) {
                 s.player.loading = false;
                 s.toast = "私人FM 暂时没有更多推荐".into();
                 cx.notify();
-                return None;
+                return false;
             }
-            let start = s.player.queue.len();
             let added = picked.len();
+            // 新一批成为「本批」：已播记录清空，等下一轮再判断
+            s.fm_batch = picked.iter().map(|x| x.hash.clone()).collect();
+            s.fm_heard.clear();
             s.fm = Arc::new(picked.clone());
-            s.player.queue.extend(picked);
-            log::info!(
-                "fm extend: 追加 {added} 首，队列 {} 首，从 #{start} 接着播",
-                s.player.queue.len()
-            );
+            // 关键在于「清空」而不是像以前那样挂到队尾：队列不会越滚越长
+            s.player.set_queue("私人FM", picked, 0);
+            s.player.fm_queue = true;
+            s.player.position = 0.0;
+            s.player.loading = true;
+            s.player.request_id += 1;
+            s.persist_queue();
+            log::info!("fm: 换一轮，{added} 首，队列已重置");
             cx.notify();
-            Some(start)
+            true
         });
-        if let Ok(Some(start)) = start {
-            let _ = cx.update(|app| crate::ui::play_index(&store_c, start, app));
+        if let Ok(true) = ok {
+            let _ = cx.update(|app| crate::ui::play_index(&store_c, 0, app));
         }
     })
     .detach();

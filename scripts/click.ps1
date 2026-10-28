@@ -15,12 +15,18 @@ param(
   [string]$Clicks2 = "",
   # text2: 在 clicks2 之后再输入一次（验证失焦后打字无效）
   [string]$Text2 = "",
+  # clicks3: text2 之后的第三次点击（如「输入手机号+验证码→点登录」）
+  [string]$Clicks3 = "",
   # enter: 输入文字后按一次回车（提交搜索）
   [switch]$Enter,
   # wheel: 滚轮 "x:y:notches"（负值向下）
   [string]$Wheel = "",
   # noshot: 不落截图（只看日志/存活状态时用）
   [switch]$NoShot,
+  # keepalive: 结束后不结束进程（留给人工在窗口里继续操作）
+  [switch]$KeepAlive,
+  # attachpid: 接管已在运行的进程（不新启、不清日志、不结束）
+  [int]$AttachPid = 0,
   [string]$Exe = "D:/RustEchoMusic/target/debug/echo-music.exe"
 )
 $ErrorActionPreference = "Stop"
@@ -70,10 +76,15 @@ public class M {
 
 if ($Smoke -ne "") { $env:ECHO_SMOKE = $Smoke } else { Remove-Item Env:ECHO_SMOKE -ErrorAction SilentlyContinue }
 $logFile = "D:\RustEchoMusic\.workbuddy\click_app.log"
-if (Test-Path $logFile) { Remove-Item $logFile -Force }
-$env:ECHO_LOG_FILE = $logFile
-$p = Start-Process -FilePath $Exe -PassThru
-Start-Sleep -Milliseconds $Wait
+if ($AttachPid -gt 0) {
+  # 接管已运行的实例：不重启、不清日志（日志仍由该进程继续写）
+  $p = Get-Process -Id $AttachPid -ErrorAction Stop
+} else {
+  if (Test-Path $logFile) { Remove-Item $logFile -Force }
+  $env:ECHO_LOG_FILE = $logFile
+  $p = Start-Process -FilePath $Exe -PassThru
+  Start-Sleep -Milliseconds $Wait
+}
 $p.Refresh()
 $h = [M]::FindAppWindow([uint32]$p.Id)
 if ($h -eq [IntPtr]::Zero) {
@@ -91,7 +102,12 @@ $oy = $r.Top
 
 function ClickAt([int]$x, [int]$y) {
   [M]::SetCursorPos($ox + $x, $oy + $y) | Out-Null
-  Start-Sleep -Milliseconds 180
+  Start-Sleep -Milliseconds 150
+  # 关键：补发一次 MOUSEEVENTF_MOVE。
+  # gpui 的命中测试靠鼠标移动消息更新，SetCursorPos 到「和上次相同的位置」
+  # 不会再产生 WM_MOUSEMOVE，此时 down/up 会落到旧命中树上（表现为点了没反应）。
+  [M]::mouse_event(0x0001, 0, 0, 0, 0)
+  Start-Sleep -Milliseconds 80
   [M]::mouse_event(0x0002, 0, 0, 0, 0)
   Start-Sleep -Milliseconds 90
   [M]::mouse_event(0x0004, 0, 0, 0, 0)
@@ -160,6 +176,15 @@ if (-not [string]::IsNullOrEmpty($Text2)) {
   Start-Sleep -Milliseconds 800
 }
 
+if (-not [string]::IsNullOrEmpty($Clicks3)) {
+  foreach ($c in $Clicks3.Split("|")) {
+    if ($c.Trim() -eq "") { continue }
+    $parts = $c.Split(":")
+    Write-Output ("click3 {0},{1}" -f $parts[0], $parts[1])
+    ClickAt ([int]$parts[0]) ([int]$parts[1])
+  }
+}
+
 if (-not [string]::IsNullOrEmpty($Drag)) {
   $d = $Drag.Split(":")
   $x1 = [int]$d[0]; $y1 = [int]$d[1]; $x2 = [int]$d[2]; $y2 = [int]$d[3]
@@ -189,6 +214,8 @@ if ($NoShot) {
   exit 0
 }
 
+# 操作可能改变了窗口尺寸（比如 mini 展开队列），截图前重新取一次
+[M]::GetWindowRect($h, [ref]$r) | Out-Null
 $w = $r.Right - $r.Left
 $ht = $r.Bottom - $r.Top
 $bmp = New-Object System.Drawing.Bitmap($w, $ht)
@@ -204,5 +231,9 @@ $out = Join-Path $dir "$Name.png"
 $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp.Dispose()
 
-Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+if (-not $KeepAlive -and $AttachPid -le 0) {
+  Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+} else {
+  Write-Output ("kept pid={0}" -f $p.Id)
+}
 Write-Output $out

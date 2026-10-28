@@ -135,7 +135,24 @@ pub fn aes_cbc_encrypt_b64(key: &[u8], iv: &[u8], plaintext: &[u8]) -> String {
 }
 
 /// AES-128-CBC(PKCS7) 加密，返回 32 位小写 hex（登录 t1/t2 用）。
+///
+/// 注意：key 必须正好 16 字节。传入 32 字节 key 会在这里直接 panic（而不是在
+/// generic-array 里抛 `assertion left == right failed` 这种看不出原因的断言），
+/// 32 字节 key 的场景请用 [`aes256_cbc_encrypt_hex`]。
+#[allow(dead_code)]
 pub fn aes_cbc_encrypt_hex(key: &[u8], iv: &[u8], plaintext: &[u8]) -> String {
+    assert_eq!(
+        key.len(),
+        16,
+        "aes_cbc_encrypt_hex 是 AES-128，key 必须 16 字节（当前 {}）；32 字节 key 请用 aes256_cbc_encrypt_hex",
+        key.len()
+    );
+    assert_eq!(
+        iv.len(),
+        16,
+        "aes_cbc_encrypt_hex 的 iv 必须 16 字节（当前 {}）",
+        iv.len()
+    );
     let enc = Aes128CbcEnc::new(key.into(), iv.into());
     let ct = enc.encrypt_padded_vec_mut::<Pkcs7>(plaintext);
     hex::encode(ct)

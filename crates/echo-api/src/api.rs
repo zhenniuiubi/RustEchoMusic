@@ -1239,12 +1239,16 @@ impl KuGouClient {
         let (params_hex, temp_key) = crate::crypto::login_aes_encrypt(&payload.to_string());
 
         // 概念版 t1/t2 指纹（对齐 login_cellphone.js）
+        // 注意：JS 里 `utf8WordArray(key)` 把 32 字符的 key 当 UTF-8 直接喂给 CryptoJS，
+        // 长度 32 字节 → CryptoJS 自动选 **AES-256**（IV 仍是 16 字节的 utf8）。
+        // 早前误用 aes_cbc_encrypt_hex(AES-128) 会因 key 长度 32≠16 触发
+        // generic-array 断言 panic → 点「登录」直接崩溃。
         const LITE_T1_KEY: &str = "5e4ef500e9597fe004bd09a46d8add98";
         const LITE_T1_IV: &str = "04bd09a46d8add98";
         const LITE_T2_KEY: &str = "fd14b35e3f81af3817a20ae7adae7020";
         const LITE_T2_IV: &str = "17a20ae7adae7020";
 
-        let t1 = crate::crypto::aes_cbc_encrypt_hex(
+        let t1 = crate::crypto::aes256_cbc_encrypt_hex(
             LITE_T1_KEY.as_bytes(),
             LITE_T1_IV.as_bytes(),
             format!("|{clienttime_ms}").as_bytes(),
@@ -1253,7 +1257,7 @@ impl KuGouClient {
             "{}|0f607264fc6318a92b9e13c65db7cd3c|02:00:00:00:00:00|EchoMusic|{clienttime_ms}",
             dev.guid
         );
-        let t2 = crate::crypto::aes_cbc_encrypt_hex(
+        let t2 = crate::crypto::aes256_cbc_encrypt_hex(
             LITE_T2_KEY.as_bytes(),
             LITE_T2_IV.as_bytes(),
             t2_plain.as_bytes(),

@@ -339,6 +339,13 @@ pub struct AppStore {
     pub fm_cur_mark: i64,
     /// 正在续推下一批 FM（防止一批播完时重复发起）
     pub fm_extending: bool,
+    /// 私人 FM 本批曲目的 hash：用来判断「这一批是不是都播放过了」
+    ///
+    /// 注意这里记的是**队列里这一批**（play_from / fm_extend 时写入），
+    /// 不是 `fm` 那份预览列表 —— 用户点圆盘插播时队列可能和预览不同。
+    pub fm_batch: Vec<String>,
+    /// 私人 FM 本批已经播放过的 hash（播到就记，不要求播完）
+    pub fm_heard: std::collections::HashSet<String>,
     /// 音乐云盘歌曲（登录后拉取）
     pub cloud: Arc<Vec<Song>>,
     pub cloud_loaded: bool,

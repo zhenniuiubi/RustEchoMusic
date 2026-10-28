@@ -15,5 +15,7 @@ pub use api::{
     resolve_urls_from_response, FmBatch, LoginResult, QrState, StyleCategory, StyleGroup,
     StyleRecommend, StyleTag,
 };
-pub use client::{is_auth_expired, ApiError, AuthState, EncryptType, KuGouClient, RequestSpec};
+pub use client::{
+    business_code, is_auth_expired, ApiError, AuthState, EncryptType, KuGouClient, RequestSpec,
+};
 pub use vip::{classify_claim_error, fmt_ts, ClaimError, VipProduct, VipStatus};
