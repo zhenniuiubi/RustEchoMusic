@@ -5,7 +5,6 @@ members = [
     "crates/echo-api",
     "crates/echo-audio",
     "crates/echo-app",
-    "crates/backdrop-demo",
 ]
 
 [workspace.package]
@@ -17,7 +16,6 @@ repository = "https://github.com/hoowhoami/EchoMusic"
 
 [workspace.dependencies]
 anyhow = "1"
-async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 # KRC 歌词解密：base64 → XOR → zlib inflate
@@ -31,18 +29,14 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream",
     "gzip",
-    "brotli",
-    "deflate",
     "blocking",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
-smallvec = "1"
 smol = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 url = "2"
-unicode-segmentation = "1"
 
 # GPUI (Zed UI framework)
 gpui = { version = "0.2.2", features = ["windows-manifest"] }
@@ -53,7 +47,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
-    "Win32_System_Registry",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Input",
     "Win32_UI_Shell",
@@ -77,11 +70,19 @@ raw-window-handle = "0.6"
 
 # --- audio ---
 cpal = "0.16"
-rodio = "0.21"
-symphonia = { version = "0.5", features = ["all-codecs", "all-formats"] }
+# 只留实际会拿到的格式：酷狗 128k 给的是 .ogg（vorbis），320k 是 mp3，无损是 flac，
+# 少量 m4a；wav 保底。去掉了 aiff/alac/adpcm 那些用不上的解码器。
+rodio = { version = "0.21", default-features = false, features = [
+    "playback",
+    "mp3",
+    "vorbis",
+    "flac",
+    "mp4",
+    "wav",
+] }
 
 # --- image / misc ---
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["png"] }
 md-5 = "0.10"
 base64 = "0.22"
 aes = "0.8"
@@ -91,4 +92,7 @@ hex = "0.4"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

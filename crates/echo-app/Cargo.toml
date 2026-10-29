@@ -28,7 +28,6 @@ serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true
 tokio.workspace = true
-unicode-segmentation.workspace = true
 qrcode = { version = "0.14.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
