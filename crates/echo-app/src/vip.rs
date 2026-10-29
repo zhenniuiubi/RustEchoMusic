@@ -214,8 +214,18 @@ pub fn bootstrap(store: &Entity<AppStore>, cx: &mut App) {
         let out = task.await;
         let date = today();
         let _ = store.update(cx, |s, cx| {
-            if let Some(token) = out.refreshed_token.clone() {
-                s.session.update(|x| x.token = token);
+            if let Some(r) = out.refreshed.clone() {
+                s.session.update(|x| {
+                    x.token = r.token.clone();
+                    if !r.t1.is_empty() {
+                        x.t1 = r.t1.clone();
+                    }
+                    if r.expires > 0 {
+                        x.expires = r.expires;
+                    }
+                });
+                s.client.set_t1(&r.t1);
+                s.token_refresh_at = now_ts();
             }
             if out.expired {
                 // token 被服务端判过期：自动退出登录（见 `force_logout`）
@@ -275,6 +285,18 @@ pub fn start_watchdog(store: &Entity<AppStore>, cx: &mut App) {
         loop {
             // 开局先等 30s，避免和启动引导抢着打接口
             smol::Timer::after(std::time::Duration::from_secs(30)).await;
+
+            // ===== 登录态保活 =====
+            // 只在启动时刷新是不够的：一直开着不关，token 到期就掉线。
+            // 这里按「到期前 1 小时」或「距上次续期满 6 小时」续一次，
+            // 续期成功后服务端会换一份新的 token + t1（必须一起落盘）。
+            if store
+                .read_with(cx, |s, _| token_refresh_due(s))
+                .unwrap_or(false)
+            {
+                refresh_login(&store, cx).await;
+            }
+
             let due = match store.read_with(cx, |s, _| {
                 let session = s.session.get();
                 if !session.is_valid() || s.session_expired || !can_auto_claim(s, 3600) {
@@ -293,6 +315,73 @@ pub fn start_watchdog(store: &Entity<AppStore>, cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// 运行期续期的间隔：`/v5/login_by_token` 很轻，但也不宜过密（风控）。
+const TOKEN_REFRESH_GAP: i64 = 6 * 3600;
+/// 续期失败后的重试间隔（别太密：登录类接口调多了会被风控）。
+const TOKEN_RETRY_GAP: i64 = 30 * 60;
+
+/// 是否需要续期 token。
+fn token_refresh_due(s: &AppStore) -> bool {
+    let session = s.session.get();
+    if !session.is_valid() || s.session_expired {
+        return false;
+    }
+    let now = now_ts();
+    // 服务端给的 `expires` 只有当它是**未来的时间戳**时才信：
+    // 也可能是「有效时长」（几百万秒）或已经过去的值，那种按固定间隔续，
+    // 否则会每 30 秒续一次（触发风控）。
+    if session.expires > now {
+        return now >= session.expires - 3600;
+    }
+    // 还没成功续过（比如刚补上 t1 的老会话）立刻续一次
+    if s.token_refresh_at == 0 {
+        return true;
+    }
+    now - s.token_refresh_at >= TOKEN_REFRESH_GAP
+}
+
+/// 续一次登录态：换新 token + 新 t1（+ 到期时间），失败不打断使用。
+async fn refresh_login(store: &Entity<AppStore>, cx: &mut AsyncApp) {
+    let client = match store.read_with(cx, |s, _| s.client.clone()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let task = cx
+        .background_executor()
+        .spawn(async move { crate::ui::run_tokio(client.refresh_token()) });
+    let res = task.await;
+    let _ = store.update(cx, |s, cx| {
+        let now = now_ts();
+        match res {
+            Ok(r) => {
+                s.session.update(|x| {
+                    x.token = r.token.clone();
+                    if !r.t1.is_empty() {
+                        x.t1 = r.t1.clone();
+                    }
+                    if r.expires > 0 {
+                        x.expires = r.expires;
+                    }
+                });
+                s.client.set_t1(&r.t1);
+                s.token_refresh_at = now;
+                log::info!("token 保活 OK expires={}", r.expires);
+            }
+            Err(e) if echo_api::is_auth_expired(&e) => {
+                s.token_refresh_at = now;
+                log::warn!("token 保活：登录态已失效 {e}");
+                crate::views::force_logout(s, "登录已过期，请重新登录");
+            }
+            Err(e) => {
+                // 网络/风控之类的临时失败：半小时后再试，别把用户踢下线
+                s.token_refresh_at = now - TOKEN_REFRESH_GAP + TOKEN_RETRY_GAP;
+                log::warn!("token 保活失败（{TOKEN_RETRY_GAP}s 后重试）: {e}");
+            }
+        }
+        cx.notify();
+    });
 }
 
 fn claim(store: &Entity<AppStore>, force: bool, cx: &mut App) {
@@ -376,7 +465,8 @@ fn claim(store: &Entity<AppStore>, force: bool, cx: &mut App) {
 // ==================== 后台流程 ====================
 
 struct BootOutcome {
-    refreshed_token: Option<String>,
+    /// 刷新 token 的完整结果（token / t1 / expires 都要回写，缺一样都续不上）
+    refreshed: Option<echo_api::LoginResult>,
     user: Option<echo_core::User>,
     expired: bool,
     vip: Option<VipStatus>,
@@ -385,31 +475,46 @@ struct BootOutcome {
 
 async fn run_bootstrap(client: Arc<KuGouClient>, want_claim: bool) -> BootOutcome {
     let mut out = BootOutcome {
-        refreshed_token: None,
+        refreshed: None,
         user: None,
         expired: false,
         vip: None,
         claim: None,
     };
 
+    // 续期失败**不直接判死**：20018/20017 也可能是风控/网关抽风，
+    // 真正算数的是下面 `user_detail` 的结果（两个都说过期才退出登录）。
+    let mut refresh_expired = false;
     match client.refresh_token().await {
         Ok(r) => {
-            log::info!("refresh_token OK userid={} vip_type={}", r.userid, r.vip_type);
-            out.refreshed_token = Some(r.token);
+            log::info!(
+                "refresh_token OK userid={} vip_type={} t1={} expires={}",
+                r.userid,
+                r.vip_type,
+                if r.t1.is_empty() { "无" } else { "有" },
+                r.expires
+            );
+            out.refreshed = Some(r);
         }
         Err(e) => {
             if echo_api::is_auth_expired(&e) {
-                log::warn!("refresh_token: 登录态已过期（需要重新登录）");
-                out.expired = true;
-                return out;
+                // 带上原始错误码：20018 会话过期 / 20017 token 无效 / 20006 缺 token
+                // 三者处理方式不同（20006 说明请求里根本没带上 token）
+                log::warn!("refresh_token: 续期被拒（等 user_detail 复核）：{e}");
+                refresh_expired = true;
+            } else {
+                log::warn!("refresh_token ERR {e}");
             }
-            log::warn!("refresh_token ERR {e}");
         }
     }
 
     match client.user_detail().await {
         Ok(u) => {
             log::info!("user_detail vip_type={}", u.vip_type);
+            if refresh_expired {
+                // 续期失败但普通接口还能用：token 没过期，别把用户踢下线
+                log::warn!("refresh_token 失败但 user_detail 正常 —— 保持登录态");
+            }
             out.user = Some(u);
         }
         Err(e) => {

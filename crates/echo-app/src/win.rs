@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+    ClientToScreen, CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER,
+    DIB_RGB_COLORS,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -371,6 +372,55 @@ pub fn cursor_in_rect(hwnd_raw: isize) -> bool {
             return false;
         }
         pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+    }
+}
+
+/// 光标是否落在窗口**客户区**内的某个矩形里。
+///
+/// 参数用**逻辑像素**（相对客户区左上角），DPI 比例按 `logical_w` 反推：
+/// 客户区实际宽度 / 逻辑宽度。mini 用它把「hover 区」收窄到中间那块
+/// （鼠标停在收藏/队列/歌词上不该把歌名换掉）。
+///
+/// 注意必须用 `GetClientRect` + `ClientToScreen` 而不是 `GetWindowRect`：
+/// 后者含窗口那圈 8px 的不可见边框，坐标会整体偏出去。
+pub fn cursor_in_client_rect(
+    hwnd_raw: isize,
+    logical_w: f32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> bool {
+    if hwnd_raw == 0 || logical_w <= 0.0 {
+        return false;
+    }
+    let win = hwnd_raw as HWND;
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt) == 0 {
+            return false;
+        }
+        let mut rc = RECT::default();
+        if GetClientRect(win, &mut rc) == 0 {
+            return false;
+        }
+        let mut origin = POINT { x: 0, y: 0 };
+        if ClientToScreen(win, &mut origin) == 0 {
+            return false;
+        }
+        let cw = (rc.right - rc.left) as f32;
+        let ch = (rc.bottom - rc.top) as f32;
+        if cw <= 1.0 || ch <= 1.0 {
+            return false;
+        }
+        // 客户区宽度 / 逻辑宽度 = 缩放因子（横向纵向一致）
+        let scale = cw / logical_w;
+        let lx = (pt.x - origin.x) as f32;
+        let ly = (pt.y - origin.y) as f32;
+        lx >= x * scale
+            && lx < (x + w) * scale
+            && ly >= y * scale
+            && ly < (y + h) * scale
     }
 }
 

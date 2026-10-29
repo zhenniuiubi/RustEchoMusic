@@ -225,10 +225,20 @@ fn main() {
 
             // 设备注册（后台）
             let reg_client = client.clone();
+            let reg_dir = data_dir.clone();
             cx.background_executor()
                 .spawn(async move {
                     match ui::run_tokio(reg_client.register_device()) {
-                        Ok(dfid) => log::info!("device registered: {dfid}"),
+                        Ok(dfid) => {
+                            log::info!("device registered: {dfid}");
+                            // 落盘：登录态是绑设备的，下次启动要拿同一个 dfid 出现，
+                            // 不然每次换一个「新设备」，服务端那边看着像异地登录
+                            if let Ok(mut dev) = echo_core::DeviceIdentity::load_or_create(&reg_dir) {
+                                if dev.dfid != dfid {
+                                    let _ = dev.set_dfid(&dfid, &reg_dir);
+                                }
+                            }
+                        }
                         Err(e) => log::warn!("register_dev failed: {e}"),
                     }
                 })
@@ -273,6 +283,9 @@ fn main() {
             let saved = session_store.get();
             if saved.is_valid() {
                 client.set_auth(&saved.token, saved.userid);
+                // 续期凭证也要还原：少了它 `/v5/login_by_token` 续不上，
+                // token 一到期就只能重新登录
+                client.set_t1(&saved.t1);
             }
             let saved_user = if saved.is_valid() {
                 Some(echo_core::User {
@@ -402,6 +415,7 @@ fn main() {
                 vip_claiming: false,
                 vip_note: String::new(),
                 session_expired: false,
+                token_refresh_at: 0,
                 login_redirect: None,
             });
 
@@ -912,7 +926,22 @@ fn main() {
 
                     // ECHO_SMOKE=mini：打开 mini 播放器（自动化验证浮窗）
                     // 与顶栏按钮同一条路径：开 mini + 收主窗口，截图才能拍到 mini
-                    if target == "mini" {
+                    if target == "mini" || target == "mini-play" {
+                        // mini-play：先放一首歌再开 mini，截图里才有封面/歌名
+                        if target == "mini-play" {
+                            let _ = cx.update(|app| {
+                                ui::navigate(&smoke_store, Page::Search("晴天".into()), app)
+                            });
+                            smol::Timer::after(std::time::Duration::from_secs(4)).await;
+                            let _ = cx.update(|app| {
+                                let n = smoke_store.read_with(app, |s, _| s.search.songs.len());
+                                log::warn!("[smoke-mini] search songs n={n}");
+                                if n > 0 {
+                                    ui::play_from(&smoke_store, ui::PlaySource::Search, 0, app);
+                                }
+                            });
+                            smol::Timer::after(std::time::Duration::from_secs(3)).await;
+                        }
                         smol::Timer::after(std::time::Duration::from_secs(2)).await;
                         let _ = cx.update(|app| {
                             crate::desktop::open_mini_player(&smoke_store, app);

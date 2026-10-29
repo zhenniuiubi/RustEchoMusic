@@ -1,9 +1,14 @@
 @echo off
-rem EchoMusic 打包脚本：release 构建并输出到 dist\EchoMusic.exe
-rem 用法：package.bat
+rem EchoMusic packaging script: release build -> dist\EchoMusic.exe
+rem Usage: package.bat
 rem
-rem 注意：全并行 release 编译在本机会卡死（rustc 挂起、CPU 停走），
-rem 因此固定 CARGO_BUILD_JOBS=2；首次约 6~8 分钟，增量编译 1 分钟内。
+rem NOTE: keep every comment here ASCII-only. cmd.exe reads a UTF-8 file as
+rem GBK, so CJK comment bytes can swallow the following line -- that is how
+rem CARGO_BUILD_JOBS=2 silently got lost before.
+rem
+rem NOTE: full-parallel release builds hang on this machine (rustc stalls,
+rem CPU drops to zero), so CARGO_BUILD_JOBS is pinned to 2.
+rem First build ~6-8 min, incremental under 1 min.
 setlocal
 cd /d "%~dp0"
 

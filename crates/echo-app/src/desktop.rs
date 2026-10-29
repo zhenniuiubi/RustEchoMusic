@@ -4,6 +4,7 @@
 //! 不需要跨窗口同步。窗口句柄存在全局静态里，重复点击只是激活而不是再开一个。
 
 use crate::state::AppStore;
+use crate::theme::{CARD_RADIUS, COVER_RADIUS};
 use gpui::{prelude::*, *};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// 桌面歌词窗口句柄。
 static LYRIC_WIN: OnceLock<Mutex<Option<WeakEntity<DesktopLyricView>>>> =
     OnceLock::new();
+
 /// mini 播放器窗口句柄。
 static MINI_WIN: OnceLock<Mutex<Option<WeakEntity<MiniPlayerView>>>> = OnceLock::new();
 
@@ -386,6 +388,11 @@ trait HoverPollable: 'static {
     fn poll_hwnd(&self) -> isize;
     fn poll_hovered(&self) -> bool;
     fn set_poll_hovered(&mut self, v: bool);
+    /// 光标是否算「停在浮窗上」。默认只看整窗矩形；mini 会收窄成
+    /// 「歌名/控制键那一块」，鼠标落在收藏/队列/歌词/图钉上不算。
+    fn poll_inside(&self) -> bool {
+        crate::win::cursor_in_rect(self.poll_hwnd())
+    }
 }
 
 impl HoverPollable for DesktopLyricView {
@@ -410,6 +417,20 @@ impl HoverPollable for MiniPlayerView {
     fn set_poll_hovered(&mut self, v: bool) {
         self.hovered = v;
     }
+    /// 只有停在**中间那块**（歌名 / 播放控制所在的区域）才切到控制键。
+    ///
+    /// 鼠标放到右边的收藏 / 队列 / 歌词 / 图钉上时歌名不能被换掉 —— 那是
+    /// 两件不相干的事：一边在挑按钮，一边把正文换走了会闪。
+    fn poll_inside(&self) -> bool {
+        crate::win::cursor_in_client_rect(
+            self.hwnd_raw,
+            MINI_W,
+            MINI_HOVER_LEFT,
+            0.,
+            MINI_HOVER_RIGHT - MINI_HOVER_LEFT,
+            MINI_H,
+        )
+    }
 }
 
 fn spawn_hover_poll<T: HoverPollable>(weak: WeakEntity<T>, cx: &mut App) {
@@ -420,7 +441,7 @@ fn spawn_hover_poll<T: HoverPollable>(weak: WeakEntity<T>, cx: &mut App) {
         let alive = cx
             .update(|cx| {
                 weak.update(cx, |view, cx| {
-                    let inside = crate::win::cursor_in_rect(view.poll_hwnd());
+                    let inside = view.poll_inside();
                     if inside != view.poll_hovered() {
                         view.set_poll_hovered(inside);
                         cx.notify();
@@ -473,33 +494,44 @@ fn restore_main_window(cx: &mut Context<MiniPlayerView>, maximize: bool) {
 
 // ==================== mini 播放器 ====================
 
-/// mini 播放器窗口尺寸（展开队列时只加高）。
+/// mini 播放器窗口尺寸：**固定 360×64**，不随内部内容（歌名长短、hover 状态、
+/// 圆角）变化。窗口圆角直接取项目统一的卡片圆角 `CARD_RADIUS`（见 render 根节点、
+/// 以及 `open_mini_player` 里的透明窗口），DWM 自己的圆角必须关掉（`remove_window_frame`），
+/// 否则系统会按它自己的 8px 再裁一次，比我们的圆角还小。
 const MINI_W: f32 = 360.;
-/// 窗口整体高度**固定 84**（不再往上加）。留白不够就缩内容，不加窗口。
-const MINI_H: f32 = 84.;
+const MINI_H: f32 = 64.;
+/// 展开队列时才加高的一块（用户主动点按钮触发的 resize，不是内容撑开的）。
 const MINI_QUEUE_H: f32 = 324.;
 const MINI_ROW_H: f32 = 52.;
-/// 行内容的三块（窗口按钮列 / 封面 / 文字+图标）统一高度。
+/// 一行内容的净高 = 封面边长，窗口 64 时上下各留 10。
 ///
-/// 基准正是「歌名顶端 → 播放进度条底部」：三块都取这个高度并在 `MINI_H` 里垂直居中，
-/// 顶边底边自然对齐。60 = 29 + 2 + 29（两个放大按钮竖排），窗口 84 时上下各留 12
-/// （用 68 竖排 33 的按钮时只剩 8，封面几乎贴着窗口边，太挤）。
+/// 三块（窗口按钮列 / 封面 / 文字+图标）都按它对齐，进度条底边也落在封面底边上：
+/// (MINI_H - MINI_BODY_H) / 2 + MINI_BODY_H = 10 + 44 = 54。
+const MINI_BODY_H: f32 = 44.;
+/// 左侧窗口按钮列宽度、两个按钮（关闭 / 恢复主窗口）的边长。
+const MINI_WIN_COL: f32 = 32.;
+const MINI_WIN_BTN: f32 = 24.;
+/// 行的左右内边距。
+const MINI_PAD_L: f32 = 4.;
+const MINI_PAD_R: f32 = 10.;
+/// mini 进度条左端：绝对定位的 `left` 就是相对行元素原点（实测过，`pl` 不会
+/// 再叠加一次），所以直接累加 `PAD_L 4 + 按钮列 32 + gap 4 + 封面 44 + gap 4 + 文字左边距 4`。
+const MINI_PROGRESS_LEFT: f32 = 92.;
+/// 进度条底边与封面底边同一条线（窗口 64 时距底 10）。
+const MINI_PROGRESS_BOTTOM: f32 = 10.;
+/// 中间那块内容（歌名/歌手、播放控制键）整体上抬的距离。
 ///
-/// 注意这个高度是**可见内容的高度**，不是容器高度：容器再高、里面的封面只有 44
-/// 居中，看起来仍然是三块不齐（封面上下各空 12px）。所以：
-/// * 按钮列：正好 29 + 2 + 29 撑满；
-/// * 封面：边长直接取 `MINI_BODY_H`（方图，占满这一条）；
-/// * 第三块：歌名贴顶、进度条贴底，中间自然撑开。
-const MINI_BODY_H: f32 = 60.;
-/// 左上两个窗口按钮（关闭 / 恢复主窗口）的边长。
-const MINI_WIN_BTN: f32 = 29.;
-/// mini 进度条左端：绝对定位的 `left` 就是相对行元素原点（实测过，`pl 6` 不会
-/// 再叠加一次），所以这里直接累加 `pl 6 + 按钮列 36 + gap 8 + 封面 60 + gap 8`。
-const MINI_PROGRESS_LEFT: f32 = 118.;
-/// 进度条距窗口底边的距离：让进度条**底边**正好落在三块内容的底边上。
-/// 块底 = (MINI_H - MINI_BODY_H) / 2 + MINI_BODY_H = 12 + 60 = 72，
-/// 所以窗口 84 时 bottom 取 12。
-const MINI_PROGRESS_BOTTOM: f32 = 12.;
+/// 三者共用一条底边基准会显得「压着进度条」：歌手名离进度条只剩 2~3px。
+/// 用 `pb(2*MINI_LIFT)` 让内容在自己的 44 高带子里居中偏上，正好抬起 `MINI_LIFT`。
+const MINI_LIFT: f32 = 3.;
+/// 右侧那排固定按钮（收藏 / 队列 / 歌词）的总宽：3 × 26 + 2 × 2。
+const MINI_ICONS_W: f32 = 82.;
+/// hover 切换「歌名 ⇄ 播放控制」的水平区间：只认中间那块。
+///
+/// 左端 = 歌名左端，右端 = 右侧按钮组左端。鼠标放到收藏 / 队列 / 歌词 / 图钉上
+/// 时**不算** hover —— 挑按钮的时候把歌名换成控制键会一闪一闪的。
+const MINI_HOVER_LEFT: f32 = MINI_PROGRESS_LEFT;
+const MINI_HOVER_RIGHT: f32 = MINI_W - MINI_PAD_R - MINI_ICONS_W - 4.;
 
 /// mini 播放器视图：封面 + 标题 + 进度 + 播放控制/收藏/列表/桌面歌词/音量 + 置顶（整窗可拖动）。
 pub struct MiniPlayerView {
@@ -568,7 +600,7 @@ impl Render for MiniPlayerView {
             0.0
         };
 
-        // 小圆形图标按钮（hover 高亮）
+        // 小方形图标按钮（hover 高亮）
         let btn = |id: &'static str,
                    icon_path: &'static str,
                    color: gpui::Hsla,
@@ -577,7 +609,7 @@ impl Render for MiniPlayerView {
             div()
                 .id(SharedString::from(id))
                 .size(px(size))
-                .rounded(px(6.))
+                .rounded(px(8.))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -588,39 +620,44 @@ impl Render for MiniPlayerView {
                     move |el| el.bg(bg)
                 })
                 .on_click(move |_, window, cx| action(window, cx))
-                .child(crate::ui::icon(icon_path, size * 0.6, color))
+                .child(crate::ui::icon(icon_path, size * 0.58, color))
         };
 
-        // 播放圆钮稍大一点，用强调色填充
+        // 播放圆钮：参考图里是「浅灰圆底 + 描边三角」，不是主题色实心圆
         let play_btn = {
             let st = store.clone();
             div()
                 .id("mini-play")
-                .size(px(26.))
+                .size(px(34.))
                 .rounded_full()
                 .flex()
                 .items_center()
                 .justify_center()
                 .flex_shrink_0()
                 .cursor_pointer()
-                .bg(theme.accent)
-                .hover(|el| el.opacity(0.88))
+                .bg(theme.bg_hover)
+                .hover(|el| el.opacity(0.9))
                 .on_click(move |_, _, cx| crate::ui::toggle_play(&st, cx))
                 .child(crate::ui::icon(
-                    if playing { "icons/pause.svg" } else { "icons/play.svg" },
-                    15.,
-                    gpui::white(),
+                    if playing {
+                        "icons/mini-pause.svg"
+                    } else {
+                        "icons/mini-play.svg"
+                    },
+                    17.,
+                    theme.text,
                 ))
         };
 
         let fav_btn = {
             let cur = song.clone();
             let st = store.clone();
+            // 参考图里未收藏也是红心（空心），已收藏才是实心
             btn(
                 "mini-fav",
                 if fav { "icons/heart-filled.svg" } else { "icons/heart.svg" },
-                if fav { theme.accent } else { theme.text_secondary },
-                24.,
+                theme.accent,
+                26.,
                 Box::new(move |_, cx| {
                     if let Some(song) = cur.clone() {
                         crate::liked::toggle_like(&st, &song, cx);
@@ -632,9 +669,9 @@ impl Render for MiniPlayerView {
             let st = store.clone();
             btn(
                 "mini-prev",
-                "icons/prev.svg",
+                "icons/mini-prev.svg",
                 theme.text,
-                24.,
+                30.,
                 Box::new(move |_, cx| crate::ui::prev_track(&st, cx)),
             )
         };
@@ -642,18 +679,18 @@ impl Render for MiniPlayerView {
             let st = store.clone();
             btn(
                 "mini-next",
-                "icons/next.svg",
+                "icons/mini-next.svg",
                 theme.text,
-                24.,
+                30.,
                 Box::new(move |_, cx| crate::ui::next_track(&st, false, cx)),
             )
         };
         // 歌曲列表（展开/收起，窗口跟着加高）
         let queue_btn = btn(
             "mini-queue",
-            "icons/queue.svg",
+            "icons/playlist.svg",
             if queue_open { theme.accent } else { theme.text_secondary },
-            24.,
+            26.,
             Box::new(|_, _| {}), // 真动作走下面的 on_click（要 window 改尺寸）
         )
         .on_click(cx.listener(
@@ -681,7 +718,7 @@ impl Render for MiniPlayerView {
                 "mini-lyric",
                 "icons/lyric.svg",
                 if lyric_on { theme.accent } else { theme.text_secondary },
-                24.,
+                26.,
                 Box::new(move |_, cx| {
                     let next = !st.read(cx).settings.get().desktop_lyric;
                     st.update(cx, |s, cx| {
@@ -693,13 +730,14 @@ impl Render for MiniPlayerView {
             )
         };
         // 音量按钮已从 mini 去掉（图里那排按钮到「A」为止）
+        // 置顶图钉：参考图里贴在**窗口右上角**，不在那排按钮里
         let pin_btn = {
             let pinned = crate::win::is_topmost(window);
             btn(
                 "mini-pin",
                 "icons/pin.svg",
-                if pinned { theme.accent } else { theme.text_secondary },
-                24.,
+                if pinned { theme.accent } else { theme.text_tertiary },
+                18.,
                 Box::new(|window, _| {
                     let next = !crate::win::is_topmost(window);
                     crate::win::set_topmost(window, next);
@@ -749,6 +787,10 @@ impl Render for MiniPlayerView {
                     .border_t_1()
                     .border_color(theme.border)
                     .pt_1()
+                    // 左右留 6、底部留 4：列表行的 hover 底色不会盖住窗口下面的
+                    // 两个圆角（gpui 的 overflow_hidden 只按矩形裁，不认圆角）
+                    .px(px(6.))
+                    .pb(px(4.))
                     .on_mouse_move(cx.listener(
                         |view: &mut MiniPlayerView,
                          ev: &gpui::MouseMoveEvent,
@@ -786,6 +828,9 @@ impl Render for MiniPlayerView {
             .relative()
             .flex()
             .flex_col()
+            // 窗口本身是透明窗口（见 open_mini_player），圆角靠这一层画：
+            // 四角之外是透明的，就是「无边框圆角窗口」。取项目统一的卡片圆角。
+            .rounded(px(CARD_RADIUS))
             .bg(theme.bg_main)
             // 底层拖动层：满幅只做命中测试。前景没有 hitbox 的区域（封面/文字）
             // 点击穿透到这一层 → 拖动窗口；按钮 occlude 后不受影响
@@ -811,22 +856,21 @@ impl Render for MiniPlayerView {
                     .relative()
                     .flex()
                     .items_center()
-                    .pl(px(6.))
-                    .pr(px(6.))
-                    .gap_2()
-                    // 第一块：关闭（上）/ 恢复主窗口（下）。三块（按钮列 / 封面 / 其余）
-                    // 统一 h(MINI_BODY_H)，内部各自居中，视觉上就是一条水平基准线。
+                    .pl(px(MINI_PAD_L))
+                    .pr(px(MINI_PAD_R))
+                    .gap(px(4.))
+                    // 第一块：关闭（上）/ 恢复主窗口（下）竖排。列本身只包住两个
+                    // 按钮（24 + 1 + 24），靠 items_center 在行里居中。
                     .child(
                         div()
                             .id("mini-win-controls")
-                            .w(px(36.))
-                            .h(px(MINI_BODY_H))
+                            .w(px(MINI_WIN_COL))
                             .flex_shrink_0()
                             .flex()
                             .flex_col()
                             .items_center()
                             .justify_center()
-                            .gap(px(2.))
+                            .gap(px(1.))
                             .occlude()
                             .child(
                                 // 只关 mini 窗口本身：主窗口保持隐藏状态
@@ -858,7 +902,7 @@ impl Render for MiniPlayerView {
                                     ))
                                     .child(crate::ui::icon(
                                         "icons/close.svg",
-                                        16.,
+                                        13.,
                                         theme.text_tertiary,
                                     )),
                             )
@@ -892,23 +936,27 @@ impl Render for MiniPlayerView {
                                         },
                                     ))
                                     .child(crate::ui::icon(
-                                        "icons/restore.svg",
-                                        16.,
+                                        "icons/maximize.svg",
+                                        12.,
                                         theme.text_tertiary,
                                     )),
                             ),
                     )
-                    // 第二块：封面。边长直接等于 MINI_BODY_H，占满这条带子
-                    // （以前是 44 居中，上下各空 12px，和左右两块看起来就不齐）
+                    // 第二块：封面。边长 = MINI_BODY_H（44），占满这条带子。
+                    // 图片会吃掉鼠标按下（gpui 给图片/文字都建了 hitbox），
+                    // 不自己转成「拖窗口」，在封面上按住就拖不动整个 mini。
                     .child(
                         div()
                             .size(px(MINI_BODY_H))
                             .flex_shrink_0()
+                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                crate::win::start_drag(window);
+                            })
                             .child(
                                 div()
                                     .size_full()
                                     .flex_shrink_0()
-                                    .rounded(px(6.))
+                                    .rounded(px(COVER_RADIUS))
                                     .overflow_hidden()
                                     .bg(theme.bg_hover)
                                     .when_some(song.as_ref(), |el, song| {
@@ -916,23 +964,27 @@ impl Render for MiniPlayerView {
                                             el.child(
                                                 img(SharedUri::from(song.cover_url.clone()))
                                                     .size_full()
-                                                    .rounded(px(6.))
+                                                    .rounded(px(COVER_RADIUS))
                                                     .object_fit(ObjectFit::Cover),
                                             )
                                         })
                                     }),
                             ),
                     )
-                    // 第三块：文字/控制 + 右侧图标。同为 MINI_BODY_H 高：
-                    // 歌名**贴顶**（justify_start），进度条**贴底**，这条带子的高度
-                    // 就是「歌名顶端 → 进度条底部」，与左右两块一致。
+                    // 第三块：文字（默认）/ 播放控制（hover）。左边距 4 → 文字左端 = 92，
+                    // 与下方进度条左端对齐
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
+                            .ml(px(4.))
                             .h(px(MINI_BODY_H))
                             .flex()
                             .items_center()
+                            // 歌名/歌手与播放控制键整体上抬（离进度条远一点）
+                            .pb(px(MINI_LIFT * 2.))
+                            // 这里不挂拖动：hover 一进来文字就被下面的控制键换掉了，
+                            // 鼠标根本按不到文字（封面上挂的那次才是有效的）
                             // 默认：歌名 + 歌手（hover 时隐藏，给控制键让位）
                             .when(!hovered, |el| {
                                 el.child(
@@ -942,15 +994,14 @@ impl Render for MiniPlayerView {
                                         .h_full()
                                         .flex()
                                         .flex_col()
-                                        // 贴顶：歌名顶边 == 封面顶边 == 第一个按钮顶边
-                                        .justify_start()
-                                        // 字体自带 3px 行距（12.5px 字撑出 18px 行盒，字形
-                                        // 上下各空 3px）。不补这 3px，字形看着比封面低一截。
-                                        .mt(px(-3.))
-                                        .gap(px(2.))
+                                        // 两行文字在带子的内容盒里居中（内容盒已被外层
+                                        // 的 pb 抬过一次，所以这里不需要再算偏移）
+                                        .justify_center()
+                                        .gap(px(1.))
                                         .child(
                                             div()
-                                                .text_size(px(12.5))
+                                                .text_size(px(14.))
+                                                .font_weight(gpui::FontWeight::MEDIUM)
                                                 .truncate()
                                                 // 不写 text_color 会用默认色（近黑），
                                                 // 深色主题下歌名几乎看不见
@@ -963,8 +1014,8 @@ impl Render for MiniPlayerView {
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(10.5))
-                                                .text_color(theme.text_tertiary)
+                                                .text_size(px(11.5))
+                                                .text_color(theme.text_secondary)
                                                 .truncate()
                                                 .child(
                                                     song.as_ref()
@@ -981,7 +1032,8 @@ impl Render for MiniPlayerView {
                                         .flex_1()
                                         .flex()
                                         .items_center()
-                                        .gap(px(6.))
+                                        .justify_center()
+                                        .gap(px(8.))
                                         .occlude()
                                         .child(prev_btn)
                                         .child(play_btn)
@@ -989,46 +1041,59 @@ impl Render for MiniPlayerView {
                                 )
                             }),
                     )
-                    // 固定控制：收藏 / 列表 / 桌面歌词 / 置顶（一直显示）
+                    // 固定控制：收藏 / 队列 / 桌面歌词（音量按钮按参考图去掉）
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(2.))
                             .flex_shrink_0()
-                            .h(px(MINI_BODY_H))
                             .occlude()
                             .child(fav_btn)
                             .child(queue_btn)
-                            .child(lyric_btn)
+                            .child(lyric_btn),
+                    )
+                    // 置顶图钉：参考图里贴在窗口**右上角**（不占那排按钮的位置）
+                    .child(
+                        div()
+                            .id("mini-pin-wrap")
+                            .absolute()
+                            .top(px(0.))
+                            .right(px(2.))
+                            .occlude()
                             .child(pin_btn),
                     )
-                    // 进度条：底边与三块内容的底边**同一条线**（见 MINI_PROGRESS_BOTTOM），
-                    // 从封面右缘一路拉到窗口右缘
+                    // 进度条：底边与封面底边**同一条线**（见 MINI_PROGRESS_BOTTOM），
+                    // 从封面右侧（92）拉到窗口右内边距
                     .child(
                         div()
                             .id("mini-progress")
                             .absolute()
                             .bottom(px(MINI_PROGRESS_BOTTOM))
                             .left(px(MINI_PROGRESS_LEFT))
-                            .right(px(6.))
+                            .right(px(MINI_PAD_R))
                             .h(px(3.))
-                            .rounded_full()
-                            .overflow_hidden()
                             .child(
                                 canvas(
                                     |_, _, _| {},
                                     move |bounds: Bounds<Pixels>, _, window, _| {
-                                        window.paint_quad(fill(bounds, theme.progress_track));
+                                        window.paint_quad(
+                                            fill(bounds, theme.progress_track).corner_radii(
+                                                gpui::Corners::all(px(1.5)),
+                                            ),
+                                        );
                                         let w = bounds.size.width * ratio;
                                         if w > px(0.) {
-                                            window.paint_quad(fill(
-                                                Bounds::new(
-                                                    bounds.origin,
-                                                    size(w, bounds.size.height),
-                                                ),
-                                                theme.accent,
-                                            ));
+                                            window.paint_quad(
+                                                fill(
+                                                    Bounds::new(
+                                                        bounds.origin,
+                                                        size(w, bounds.size.height),
+                                                    ),
+                                                    theme.accent,
+                                                )
+                                                .corner_radii(gpui::Corners::all(px(1.5))),
+                                            );
                                         }
                                     },
                                 )
@@ -1215,13 +1280,19 @@ pub fn open_mini_player(store: &Entity<AppStore>, cx: &mut App) {
     let window = cx.open_window(
         WindowOptions {
             titlebar: None,
-            window_background: WindowBackgroundAppearance::Opaque,
+            // **透明窗口**：窗口是 360×64 的方框，圆角由视图根节点的
+            // `rounded(CARD_RADIUS)` 画出来，四角之外必须透出桌面，
+            // 否则那圈就是背景色（看上去还是方的）。
+            // DWM 自己的圆角在 `remove_window_frame` 里关掉了，不然它会按
+            // 自己的 8px 再裁一次，比项目统一的 12px 小。
+            window_background: WindowBackgroundAppearance::Transparent,
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
                 size(px(MINI_W), px(MINI_H)),
                 cx,
             ))),
-            window_min_size: Some(size(px(210.), px(44.))),
+            // 尺寸固定：不允许用户拖边（队列展开是代码里的 resize）
+            window_min_size: Some(size(px(MINI_W), px(MINI_H))),
             is_resizable: false,
             ..Default::default()
         },

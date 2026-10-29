@@ -36,6 +36,12 @@ fn device_cookie(dev: &DeviceIdentity, dfid: Option<&str>, auth: Option<&AuthSta
         if a.userid != 0 {
             c.push_str(&format!("; userid={}", a.userid));
         }
+        // `t1` 是 token 的续期凭证：登录/刷新时服务端给一个新的，下次刷新必须带上，
+        // 否则 `/v5/login_by_token` 续不上，token 到期就只能重新登录
+        // （参考 KuGouMusicApi `module/login_token.js` 里 `res.cookie.push('t1=…')`）
+        if !a.t1.is_empty() {
+            c.push_str(&format!("; t1={}", a.t1));
+        }
         if !a.auth.is_empty() {
             c.push_str(&format!("; auth={}", a.auth));
         }
@@ -131,6 +137,8 @@ pub fn business_code(err: &anyhow::Error) -> Option<i64> {
 pub struct AuthState {
     pub token: String,
     pub userid: u64,
+    /// 登录态续期凭证（换新 token 时要一起带上，见 `device_cookie`）
+    pub t1: String,
     /// `user_verify` 返回的播放授权串，放进 Cookie 供后续接口复用
     pub auth: String,
 }
@@ -178,6 +186,17 @@ impl KuGouClient {
         a.token = token.to_string();
         a.userid = userid;
         a.auth.clear();
+        if userid == 0 {
+            // 退出登录：续期凭证也一起清掉，免得下次登录前还带着上一个账号的 t1
+            a.t1.clear();
+        }
+    }
+
+    /// 记住登录态续期凭证 `t1`（登录 / 刷新的响应里都会给新的）。
+    pub fn set_t1(&self, t1: &str) {
+        if !t1.is_empty() {
+            self.auth.lock().t1 = t1.to_string();
+        }
     }
 
     /// 缓存 `user_verify` 返回的播放授权串（会随 Cookie 发给后续接口）。

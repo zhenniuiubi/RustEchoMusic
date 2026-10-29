@@ -570,3 +570,48 @@ ECHO_SMOKE=login    ./target/debug/echo-music.exe
 - Esc 退出播放页（回首页）；空格播放/暂停（与主界面一致）。实测：PostMessage 发 WM_KEYDOWN(VK_ESCAPE) 后窗口回到首页（esc-after.png）。
 - 播放页顶部 8px 拖动条（window_control_area Drag，与主窗口标题栏同机制），沉浸模式下可拖动窗口。
 - 桌面歌词换 AMLL 统一配色：未唱暗白 0.45、已唱亮白扫光（原为主题色填充）；置顶按钮状态色保留主题色。float-1.png。
+
+### mini v6：固定 360×64 + 圆角 + 布局对齐参考图（2026-10-28）
+
+- 窗口尺寸钉死 **360×64**（原 84 高）：`MINI_W/MINI_H` 常量即尺寸，`window_min_size` 同值、`is_resizable=false`；内容全部按常量算，不再被内部样式/文字撑开。
+- 圆角用项目统一的 `theme::CARD_RADIUS`(12)：窗口改成 `WindowBackgroundAppearance::Transparent`，根节点 `rounded(CARD_RADIUS).bg(bg_main)`，四角之外透出桌面 → 无边框圆角卡片。DWM 自身圆角仍由 `remove_window_frame` 关掉（否则系统按它的 8px 再裁一次，比 12 小）。队列列表补 `px6/pb4` 内边距，行底色不会盖住下面两个圆角（gpui 的 `overflow_hidden` 只按矩形裁，不认圆角）。
+- 布局对齐参考图（音量键按参考图去掉）：左 4px + 32 宽按钮列（关闭/回主窗口，24 按钮）+ 4 + 封面 44（`COVER_RADIUS`）+ 8 + 文案；右侧收藏/队列/歌词三个 26 按钮靠右（10px 内边距）；置顶图钉改到**右上角**（18px 绝对定位）；进度条 `left=92 right=10 bottom=10 h=3`，底边与封面底边同线（改圆头 `corner_radii(1.5)`）。
+- 图标：新增 `mini-play/mini-pause/mini-prev/mini-next`（描边风格，对齐参考图的空心三角）与 `playlist`（点+三行的歌单图标）；播放圆钮 34 浅灰底 + 描边三角（原来是主题色实心）；红心未收藏也是主题色空心。
+- hover 只在**中间那块**（x 92..264）切歌名 ⇄ 播放控制：`HoverPollable::poll_inside` 默认整窗矩形，mini 覆写为 `win::cursor_in_client_rect`（GetClientRect + ClientToScreen 换 DPI，不能用 GetWindowRect —— 它含 8px 不可见边框）。鼠标停在收藏/队列/歌词/图钉上时歌名不再被换掉。
+- 文案与播放控制键整体上抬 `MINI_LIFT`(3)：外层 `pb(2*MINI_LIFT)`，歌手名离进度条 7px。
+- 封面上补 `on_mouse_down(start_drag)`：图片自带 hitbox，不补的话按住封面拖不动窗口（空白处/封面都能拖了）。
+- 自检：`ECHO_SMOKE=mini-play`（先搜「晴天」播第一首再开 mini），`shot_grab.ps1` 新增 `-Hover x:y` 只移不点。实测截图 mini_v5_idle/hover/queue/pin.png；点 ✕ 后窗口 rect 变 0×0（确认关窗）、图钉点后变灰（确认 topmost 反转）。
+
+### 登录态「隔天就过期」修复（2026-10-28）
+
+**现象**：昨天登录的账号，今天启动直接「登录已过期，请重新登录」。
+
+**根因**（对照 `_MoeKoeMusic-main` / `_kgapi` 与 `_ref/EchoMusic-main`）：
+1. 酷狗 token 有有效期，靠 `/v5/login_by_token` **续期**（`_kgapi/docs/README.md`：刷新登录「可以延长 token 过期时间」）。
+2. 续期不是「拿老 token 换新 token」这么简单：登录/刷新的响应里会带一个 **`t1`**（还有 `expires`），
+   服务端每次换新，**下一次续期必须带上**（`_kgapi/module/login_token.js` 里 `res.cookie.push('t1=…')`；
+   `_ref/EchoMusic-main/src/renderer/stores/user.ts` 把 `token/userid/t1/expires` 一起持久化，
+   `utils/request.ts` 每次请求都带 `t1=`）。
+   我们的 `Session` / `AuthState` 里根本没有 `t1`，登录响应解析完就把 `t1`、`expires` 丢了 →
+   续期请求永远缺这一环，token 一到期就再也续不上，只能重新登录。
+3. 只在 `vip::bootstrap`（启动时）续一次：App 一直开着不关、跨过有效期，同样掉线。
+4. 启动引导里「续期失败」直接判过期 → `force_logout`，风控/网关抽风也会被踢下线。
+
+**改动**：
+- 会话加 `t1` / `expires`（`echo-core::Session`，serde default，老 session.json 自动兼容）；
+  `AuthState` 加 `t1`，`set_t1` + 退出登录时清空；`device_cookie` 带上 `t1=`。
+- 登录/刷新响应解析收敛成 `api::parse_login_payload`（原来三条路径各抄一份），
+  统一取出 `token / userid / t1 / expires / nickname / pic / vip_type`；`LoginResult` 带 `t1/expires`；
+  扫码登录的 `QrState` 也带 `t1`。登录落地（`apply_login`）、启动还原（`main.rs`）、
+  引导回写（`vip::bootstrap`）三处都把 `t1/expires` 落盘/注入客户端。
+- 运行期保活：`vip::start_watchdog` 每 30s 判一次 `token_refresh_due` ——
+  `expires`（当它是未来的时间戳）前 1 小时，或距上次续期满 6 小时就续一次；
+  失败按 10 分钟重试（不当场踢人），只有服务端明确 20018/20017 才 `force_logout`。
+- 引导阶段「续期被拒」不再直接登出：先让 `user_detail` 复核，两个都说失效才退登录。
+- `device.json` 的 dfid 现在会落盘（`register_dev` 拿到就存）：登录态绑设备，每次启动换一个新 dfid
+  在服务端看来像异地登录。
+- `refresh_token` 失败日志带上原始 error_code（20018 会话过期 / 20017 token 无效 / 20006 缺 token）。
+
+**验证**：用假 token 灌进 session.json 起 App → 日志 `refresh_token: 续期被拒（等 user_detail 复核）：api status=0 error_code=20017`
+→ `user_detail: 登录态已过期` → 退出登录（说明请求完整、服务端能解析，只是 token 无效；
+也说明复核定案链路要两个都失效才踢人）。清空会话起 App 正常、不误发续期请求。

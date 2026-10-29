@@ -9,7 +9,9 @@ param(
   # drag: "x1:y1:x2:y2"
   [string]$Drag = "",
   # value for ECHO_SMOKE self-test hook (e.g. theme, settings, backdrop-mica)
-  [string]$Smoke = ""
+  [string]$Smoke = "",
+  # hover only (no click): "x:y" window-relative coords
+  [string]$Hover = ""
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -98,6 +100,12 @@ if (-not [string]::IsNullOrEmpty($Clicks)) {
     [G]::mouse_event(0x0004, 0, 0, 0, 0) | Out-Null
     Start-Sleep -Milliseconds 500
   }
+}
+
+if (-not [string]::IsNullOrEmpty($Hover)) {
+  $hp = $Hover.Split(":")
+  MoveTo ($ox + [int]$hp[0]) ($oy + [int]$hp[1])
+  Start-Sleep -Milliseconds 300
 }
 
 $rectBefore = "pos=($ox,$oy) size=${w}x${ht} zoomed=$([G]::IsZoomed($h))"

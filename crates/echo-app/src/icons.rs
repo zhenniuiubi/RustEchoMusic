@@ -24,6 +24,15 @@ pub fn icon_svg(name: &str) -> Option<&'static str> {
         "icons/pause.svg" => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>"#,
         "icons/prev.svg" => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M6 5a1 1 0 0 1 2 0v14a1 1 0 0 1-2 0z"/><path d="M20 5.87v12.26c0 .99-1.1 1.58-1.93 1.03L8.6 13.03a1.24 1.24 0 0 1 0-2.07l9.47-6.12c.83-.55 1.93.04 1.93 1.03z"/></svg>"#,
         "icons/next.svg" => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M16 5a1 1 0 0 1 2 0v14a1 1 0 0 1-2 0z"/><path d="M4 5.87v12.26c0 .99 1.1 1.58 1.93 1.03l9.47-6.13a1.24 1.24 0 0 0 0-2.07L5.93 4.84C5.1 4.29 4 4.88 4 5.87z"/></svg>"#,
+        // mini 播放器用的**描边**风格控制键（参考图里是空心三角，主界面那套是实心）
+        "icons/mini-play.svg" => icon!(r#"<path d="M8 5.4 18.2 12 8 18.6z"/>"#),
+        "icons/mini-pause.svg" => icon!(r#"<path d="M9.5 5v14"/><path d="M14.5 5v14"/>"#),
+        "icons/mini-prev.svg" => icon!(r#"<path d="M7 5v14"/><path d="M19 5.8 9.2 12 19 18.2z"/>"#),
+        "icons/mini-next.svg" => icon!(r#"<path d="M17 5v14"/><path d="M5 5.8 14.8 12 5 18.2z"/>"#),
+        // 播放队列（参考图那排里的「点 + 三行」歌单图标）
+        "icons/playlist.svg" => icon!(
+            r#"<path d="M9 6h12"/><path d="M9 12h12"/><path d="M9 18h8"/><path d="M4 6h.01"/><path d="M4 12h.01"/><path d="M4 18h.01"/>"#
+        ),
         "icons/heart.svg" => icon!(r#"<path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z"/>"#),
         "icons/heart-filled.svg" => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z"/></svg>"#,
         "icons/cloud.svg" => icon!(r#"<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9z"/>"#),

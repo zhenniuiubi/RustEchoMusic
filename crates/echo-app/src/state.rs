@@ -427,6 +427,8 @@ pub struct AppStore {
     pub vip_note: String,
     /// 服务端判定登录态已失效（token 过期 → 20018），需要重新登录
     pub session_expired: bool,
+    /// 上次成功刷新 token 的时间（unix 秒）：运行期保活按它算下一次续期
+    pub token_refresh_at: i64,
     /// 未登录时点开的「需要登录」页面，登录成功后跳回去
     pub login_redirect: Option<Page>,
 }

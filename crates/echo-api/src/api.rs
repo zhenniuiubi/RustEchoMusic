@@ -971,41 +971,8 @@ impl KuGouClient {
         let res = self.request(spec).await?;
         let data = res.get("data").cloned().unwrap_or(Value::Null);
 
-        let mut token = crate::normalize::pick_str(&data, &["token"]);
-        let mut userid = data.get("userid").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
-        let mut nickname = crate::normalize::pick_str(&data, &["nickname", "username"]);
-        let mut vip_type = data.get("vip_type").and_then(|v| v.as_i64()).unwrap_or(0);
-        let mut pic = crate::normalize::pick_str(&data, &["pic", "user_pic", "avatar"]);
-
-        // secu_params 解密后可能是 JSON 对象，也可能是纯 token 字符串
-        if let Some(secu) = data.get("secu_params").and_then(|v| v.as_str()) {
-            if !secu.is_empty() {
-                if let Ok(text) = crate::crypto::login_aes_decrypt(secu, &temp_key) {
-                    let trimmed = text.trim().to_string();
-                    if let Ok(v) = serde_json::from_str::<Value>(&trimmed) {
-                        if token.is_empty() {
-                            token = crate::normalize::pick_str(&v, &["token"]);
-                        }
-                        if userid == 0 {
-                            userid = v.get("userid").and_then(|x| x.as_i64()).unwrap_or(0) as u64;
-                        }
-                        if nickname.is_empty() {
-                            nickname = crate::normalize::pick_str(&v, &["nickname", "username"]);
-                        }
-                        if vip_type == 0 {
-                            vip_type = v.get("vip_type").and_then(|x| x.as_i64()).unwrap_or(0);
-                        }
-                        if pic.is_empty() {
-                            pic = crate::normalize::pick_str(&v, &["pic", "user_pic", "avatar"]);
-                        }
-                    } else if token.is_empty() && !trimmed.is_empty() {
-                        token = trimmed;
-                    }
-                }
-            }
-        }
-
-        if token.is_empty() {
+        let login = parse_login_payload(&data, Some(&temp_key));
+        if login.token.is_empty() {
             let msg = res
                 .get("error")
                 .or_else(|| res.get("errmsg"))
@@ -1015,8 +982,9 @@ impl KuGouClient {
             anyhow::bail!("{msg}");
         }
 
-        self.set_auth(&token, userid);
-        Ok(LoginResult { token, userid, nickname, pic, vip_type })
+        self.set_auth(&login.token, login.userid);
+        self.set_t1(&login.t1);
+        Ok(login)
     }
 
     /// 用本地保存的 token 刷新登录态（`/v5/login_by_token`）。
@@ -1081,48 +1049,17 @@ impl KuGouClient {
         let res = self.request(spec).await?;
         let data = res.get("data").cloned().unwrap_or(Value::Null);
 
-        let mut token = crate::normalize::pick_str(&data, &["token"]);
-        let mut userid = data.get("userid").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
-        let mut nickname = crate::normalize::pick_str(&data, &["nickname", "username"]);
-        let mut vip_type = data.get("vip_type").and_then(|v| v.as_i64()).unwrap_or(0);
-        let mut pic = crate::normalize::pick_str(&data, &["pic", "user_pic", "avatar"]);
-
-        if let Some(secu) = data.get("secu_params").and_then(|v| v.as_str()) {
-            if !secu.is_empty() {
-                if let Ok(text) = crate::crypto::login_aes_decrypt(secu, &temp_key) {
-                    let trimmed = text.trim().to_string();
-                    if let Ok(v) = serde_json::from_str::<Value>(&trimmed) {
-                        if token.is_empty() {
-                            token = crate::normalize::pick_str(&v, &["token"]);
-                        }
-                        if userid == 0 {
-                            userid = v.get("userid").and_then(|x| x.as_i64()).unwrap_or(0) as u64;
-                        }
-                        if nickname.is_empty() {
-                            nickname = crate::normalize::pick_str(&v, &["nickname", "username"]);
-                        }
-                        if vip_type == 0 {
-                            vip_type = v.get("vip_type").and_then(|x| x.as_i64()).unwrap_or(0);
-                        }
-                        if pic.is_empty() {
-                            pic = crate::normalize::pick_str(&v, &["pic", "user_pic", "avatar"]);
-                        }
-                    } else if token.is_empty() && !trimmed.is_empty() {
-                        token = trimmed;
-                    }
-                }
-            }
-        }
-
-        if token.is_empty() {
+        let mut login = parse_login_payload(&data, Some(&temp_key));
+        if login.token.is_empty() {
             anyhow::bail!("{}", response_error(&res));
         }
-        if userid == 0 {
-            userid = auth.userid;
+        if login.userid == 0 {
+            login.userid = auth.userid;
         }
 
-        self.set_auth(&token, userid);
-        Ok(LoginResult { token, userid, nickname, pic, vip_type })
+        self.set_auth(&login.token, login.userid);
+        self.set_t1(&login.t1);
+        Ok(login)
     }
 
     // ==================== 扫码登录 / 短信验证码登录 ====================
@@ -1185,6 +1122,7 @@ impl KuGouClient {
         };
         if status == 4 {
             state.token = crate::normalize::pick_str(&data, &["token"]);
+            state.t1 = crate::normalize::pick_str(&data, &["t1"]);
             state.userid = data.get("userid").and_then(|v| v.as_u64()).unwrap_or_else(|| {
                 data.get("userid")
                     .and_then(|v| v.as_str())
@@ -1196,6 +1134,7 @@ impl KuGouClient {
             state.vip_type = data.get("vip_type").and_then(|v| v.as_i64()).unwrap_or(0);
             if !state.token.is_empty() {
                 self.set_auth(&state.token, state.userid);
+                self.set_t1(&state.t1);
             }
         }
         Ok(state)
@@ -1331,40 +1270,8 @@ impl KuGouClient {
         temp_key: &str,
         fallback_msg: &str,
     ) -> anyhow::Result<LoginResult> {
-        let mut token = crate::normalize::pick_str(data, &["token"]);
-        let mut userid = data.get("userid").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
-        let mut nickname = crate::normalize::pick_str(data, &["nickname", "username"]);
-        let mut vip_type = data.get("vip_type").and_then(|v| v.as_i64()).unwrap_or(0);
-        let mut pic = crate::normalize::pick_str(data, &["pic", "user_pic", "avatar"]);
-
-        if let Some(secu) = data.get("secu_params").and_then(|v| v.as_str()) {
-            if !secu.is_empty() {
-                if let Ok(text) = crate::crypto::login_aes_decrypt(secu, temp_key) {
-                    let trimmed = text.trim().to_string();
-                    if let Ok(v) = serde_json::from_str::<Value>(&trimmed) {
-                        if token.is_empty() {
-                            token = crate::normalize::pick_str(&v, &["token"]);
-                        }
-                        if userid == 0 {
-                            userid = v.get("userid").and_then(|x| x.as_i64()).unwrap_or(0) as u64;
-                        }
-                        if nickname.is_empty() {
-                            nickname = crate::normalize::pick_str(&v, &["nickname", "username"]);
-                        }
-                        if vip_type == 0 {
-                            vip_type = v.get("vip_type").and_then(|x| x.as_i64()).unwrap_or(0);
-                        }
-                        if pic.is_empty() {
-                            pic = crate::normalize::pick_str(&v, &["pic", "user_pic", "avatar"]);
-                        }
-                    } else if token.is_empty() && !trimmed.is_empty() {
-                        token = trimmed;
-                    }
-                }
-            }
-        }
-
-        if token.is_empty() {
+        let login = parse_login_payload(data, Some(temp_key));
+        if login.token.is_empty() {
             let msg = data
                 .get("error")
                 .or_else(|| data.get("errmsg"))
@@ -1374,8 +1281,9 @@ impl KuGouClient {
             anyhow::bail!("{msg}");
         }
 
-        self.set_auth(&token, userid);
-        Ok(LoginResult { token, userid, nickname, pic, vip_type })
+        self.set_auth(&login.token, login.userid);
+        self.set_t1(&login.t1);
+        Ok(login)
     }
 
     /// 用户详情（`/v1/get_my_userinfo`，relation.user.kugou.com）。
@@ -1964,9 +1872,84 @@ impl KuGouClient {
 pub struct LoginResult {
     pub token: String,
     pub userid: u64,
+    /// 续期凭证：下次 `/v5/login_by_token` 必须带上（否则 token 到期续不上）
+    pub t1: String,
+    /// token 到期时间（unix 秒，0 = 服务端没给）
+    pub expires: i64,
     pub nickname: String,
     pub pic: String,
     pub vip_type: i64,
+}
+
+impl LoginResult {
+    fn empty() -> Self {
+        Self {
+            token: String::new(),
+            userid: 0,
+            t1: String::new(),
+            expires: 0,
+            nickname: String::new(),
+            pic: String::new(),
+            vip_type: 0,
+        }
+    }
+
+    /// 用一份响应数据补齐缺失字段（`data` → `secu_params` 解出来的那份）。
+    fn fill_from(&mut self, v: &Value) {
+        if self.token.is_empty() {
+            self.token = crate::normalize::pick_str(v, &["token"]);
+        }
+        if self.userid == 0 {
+            self.userid = crate::normalize::pick_i64(v, &["userid"]).max(0) as u64;
+        }
+        if self.t1.is_empty() {
+            self.t1 = crate::normalize::pick_str(v, &["t1"]);
+        }
+        if self.expires == 0 {
+            self.expires = crate::normalize::pick_i64(v, &["expires", "expire", "token_expires"]);
+        }
+        if self.nickname.is_empty() {
+            self.nickname = crate::normalize::pick_str(v, &["nickname", "username"]);
+        }
+        if self.vip_type == 0 {
+            self.vip_type = crate::normalize::pick_i64(v, &["vip_type"]);
+        }
+        if self.pic.is_empty() {
+            self.pic = crate::normalize::pick_str(v, &["pic", "user_pic", "avatar"]);
+        }
+    }
+}
+
+/// 解析登录 / 刷新响应里的登录态。
+///
+/// 密码登录、验证码登录、token 刷新三条路径结构完全一样：明文在 `data`，
+/// 隐私字段塞在 `data.secu_params`（用本次请求的 `temp_key` 解）。
+/// 以前三处各抄了一份，且都只取了 token/userid/nickname/pic/vip_type，
+/// 把 **`t1`（续期凭证）和 `expires`（到期时间）丢掉了** —— 于是每次刷新都
+/// 拿不到新的 `t1`，下一次续期必失败，token 到期就成了「昨天登录今天过期」。
+fn parse_login_payload(data: &Value, temp_key: Option<&str>) -> LoginResult {
+    let mut out = LoginResult::empty();
+    out.fill_from(data);
+    if let (Some(key), Some(secu)) = (
+        temp_key,
+        data.get("secu_params").and_then(|v| v.as_str()),
+    ) {
+        if !secu.is_empty() {
+            if let Ok(text) = crate::crypto::login_aes_decrypt(secu, key) {
+                let trimmed = text.trim().to_string();
+                match serde_json::from_str::<Value>(&trimmed) {
+                    Ok(v) => out.fill_from(&v),
+                    // secu_params 也可能直接就是一串 token
+                    Err(_) => {
+                        if out.token.is_empty() && !trimmed.is_empty() {
+                            out.token = trimmed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 从失败响应里取可读原因。
@@ -1986,6 +1969,8 @@ pub struct QrState {
     /// 0 过期 / 1 等待扫码 / 2 已扫码待确认 / 4 授权成功
     pub status: i32,
     pub token: String,
+    /// 续期凭证（扫码登录的响应里一般也有，没有就留空 → 靠后续刷新补）
+    pub t1: String,
     pub userid: u64,
     pub nickname: String,
     pub pic: String,

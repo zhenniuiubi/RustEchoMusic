@@ -359,6 +359,10 @@ fn apply_login(store: &Entity<AppStore>, login: echo_api::LoginResult, cx: &mut 
         s.session.set(echo_core::Session {
             token: login.token.clone(),
             userid: login.userid,
+            // t1 / expires 必须落盘：少了 t1，下次 `/v5/login_by_token` 续不上，
+            // token 到期就只能重新登录（「昨天登录今天过期」就是这个）
+            t1: login.t1.clone(),
+            expires: login.expires,
             nickname: login.nickname.clone(),
             pic: login.pic.clone(),
             vip_type: login.vip_type,
@@ -366,6 +370,7 @@ fn apply_login(store: &Entity<AppStore>, login: echo_api::LoginResult, cx: &mut 
             logged_in: true,
         });
         s.client.set_auth(&login.token, login.userid);
+        s.client.set_t1(&login.t1);
         s.user = Some(echo_core::User {
             userid: login.userid,
             token: login.token,
@@ -524,6 +529,8 @@ fn poll_qr_login(store: &Entity<AppStore>, qr_ver: u64, cx: &mut AsyncApp) {
                             logged = Some(echo_api::LoginResult {
                                 token: state.token,
                                 userid: state.userid,
+                                t1: state.t1,
+                                expires: 0,
                                 nickname: state.nickname,
                                 pic: state.pic,
                                 vip_type: state.vip_type,

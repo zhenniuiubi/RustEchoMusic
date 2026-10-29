@@ -9,6 +9,16 @@ use std::sync::Mutex;
 pub struct Session {
     pub token: String,
     pub userid: u64,
+    /// 酷狗登录态里的 `t1`（token 链路的续期凭证）。
+    ///
+    /// `/v5/login_by_token` 刷新出来的新 token 要和 `t1` 一起用：
+    /// 每次登录/刷新服务器都会给一个新的 `t1`，下一次刷新必须带上它，
+    /// 否则 token 到期就再也续不上（表现：昨天还能用，今天直接「登录已过期」）。
+    #[serde(default)]
+    pub t1: String,
+    /// 服务端给的 token 到期时间（unix 秒，0 = 未知）。到点前主动续一次。
+    #[serde(default)]
+    pub expires: i64,
     #[serde(default)]
     pub nickname: String,
     #[serde(default)]
