@@ -229,7 +229,7 @@ pub fn bootstrap(store: &Entity<AppStore>, cx: &mut App) {
             }
             if out.expired {
                 // token 被服务端判过期：自动退出登录（见 `force_logout`）
-                crate::views::force_logout(s, "登录已过期，请重新登录");
+                crate::actions::force_logout(s, "登录已过期，请重新登录");
                 cx.notify();
                 return;
             }
@@ -372,7 +372,7 @@ async fn refresh_login(store: &Entity<AppStore>, cx: &mut AsyncApp) {
             Err(e) if echo_api::is_auth_expired(&e) => {
                 s.token_refresh_at = now;
                 log::warn!("token 保活：登录态已失效 {e}");
-                crate::views::force_logout(s, "登录已过期，请重新登录");
+                crate::actions::force_logout(s, "登录已过期，请重新登录");
             }
             Err(e) => {
                 // 网络/风控之类的临时失败：半小时后再试，别把用户踢下线
@@ -445,7 +445,7 @@ fn claim(store: &Entity<AppStore>, force: bool, cx: &mut App) {
                 };
             } else if claim.expired || s.session_expired {
                 // 登录态已失效：直接退出登录（不是「领取失败」）
-                crate::views::force_logout(s, "登录已过期，请重新登录");
+                crate::actions::force_logout(s, "登录已过期，请重新登录");
             } else {
                 s.vip_note = if claim.err.is_empty() {
                     "今日VIP领取失败".into()

@@ -17,7 +17,7 @@ mod desktop;
 mod smtc;
 mod taskbar;
 mod ui;
-mod views;
+mod actions;
 mod vip;
 mod win;
 mod windows_backdrop;
@@ -30,121 +30,6 @@ use gpui::*;
 use parking_lot::Mutex;
 use state::{AppGlobal, AppStore, Page};
 use std::sync::Arc;
-
-/// 窗口根视图。
-pub struct Root {
-    pub store: Entity<AppStore>,
-    /// 根焦点：没有输入框占用时由它接管键盘（空格播放/暂停）
-    pub root_focus: FocusHandle,
-    pub search_input: Entity<text_input::TextInput>,
-    pub search_focus: FocusHandle,
-    /// 「我最喜爱」页的前端模糊搜索框
-    pub fav_search: Entity<text_input::TextInput>,
-    pub fav_search_focus: FocusHandle,
-    /// 封面图 LRU 缓存（有上限，避免浏览列表时位图无限累积）
-    pub cover_cache: Entity<imgcache::CoverCache>,
-    /// 登录页：账号输入
-    pub login_user: Entity<text_input::TextInput>,
-    /// 登录页：密码输入
-    pub login_pass: Entity<text_input::TextInput>,
-    /// 登录页：手机号输入
-    pub login_phone: Entity<text_input::TextInput>,
-    /// 登录页：短信验证码输入
-    pub login_code: Entity<text_input::TextInput>,
-    /// 进度条 bounds（canvas paint 阶段记录，点击 seek 用）
-    pub progress_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
-    /// 音量滑条 bounds（canvas 记录）
-    pub volume_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
-    /// 主内容区滚动条句柄（自绘滚动条用）
-    pub content_scroll: ScrollHandle,
-    /// 侧栏歌单列表滚动条句柄
-    pub sidebar_scroll: ScrollHandle,
-    /// 播放页歌词列表：当前行变化时把它滚到视口中间
-    pub lyric_scroll: UniformListScrollHandle,
-    /// 上一次已跟随的行号（只在换行时滚，否则会抢掉用户手动滚动）
-    pub lyric_follow: Option<usize>,
-    /// 歌词滚动动画：(起点偏移, 目标偏移, 开始时刻)。换行时启动，
-    /// 用 ease-out-back 缓动滚到「当前句居中」，观感是向上弹一下再稳住
-    pub lyric_scroll_anim: Option<(f32, f32, std::time::Instant)>,
-    /// 用户最后一次手动滚歌词的时间：这段时间内不自动居中，免得抢鼠标
-    pub lyric_user_scroll_at: Option<std::time::Instant>,
-    /// 用户滚过歌词、等着 5 秒后回弹到当前句
-    pub lyric_restore_pending: bool,
-    /// 上一次「程序自己」设的滚动偏移。渲染时和真实偏移一比，
-    /// 差得多说明是用户滚的（uniform_list 会把 wheel 事件吃掉，
-    /// 挂在父节点上的 on_scroll_wheel 根本收不到，只能这样感知）
-    pub lyric_auto_off: f32,
-    /// 上一次写进窗口标题的文本（避免每帧都调 SetWindowText）
-    pub window_title: String,
-}
-
-impl Root {
-    /// 任务栏缩略图按钮跟随播放 / 收藏状态（`taskbar::sync` 内部去重，每帧调也安全）。
-    fn sync_taskbar_buttons(&mut self, cx: &mut Context<Self>) {
-        let (playing, fav) = {
-            let s = self.store.read(cx);
-            let playing = s.player.playing;
-            let fav = s
-                .player
-                .current()
-                .map(|c| {
-                    if s.session.get().userid != 0 {
-                        crate::liked::is_remote_liked(&s, c)
-                    } else {
-                        s.library.is_favorite(c)
-                    }
-                })
-                .unwrap_or(false);
-            (playing, fav)
-        };
-        taskbar::sync(playing, fav);
-    }
-
-    /// 把「正在播放」写进窗口标题。
-    ///
-    /// Windows 的任务栏悬浮提示、任务管理器、Alt-Tab 都读窗口标题，
-    /// 以前一直是固定的 "EchoMusic"，所以外面看不到在放什么歌。
-    fn sync_window_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let title = {
-            let s = self.store.read(cx);
-            match s.player.current() {
-                Some(song) if !song.title.is_empty() => {
-                    if song.artist.is_empty() {
-                        format!("{} - EchoMusic", song.title)
-                    } else {
-                        format!("{} - {} - EchoMusic", song.title, song.artist)
-                    }
-                }
-                _ => "EchoMusic".to_string(),
-            }
-        };
-        if self.window_title != title {
-            window.set_window_title(&title);
-            // 托盘悬浮提示同步（128 字符上限，长了系统会截断）
-            crate::win::set_tray_tip(&title);
-            log::debug!("窗口标题 -> {title}");
-            self.window_title = title;
-        }
-    }
-}
-
-impl Render for Root {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_window_title(window, cx);
-        self.sync_taskbar_buttons(cx);
-        // 整棵树套一层自定义图片缓存：所有 img 都走 LRU，不再无限常驻
-        // 播放页（歌词页）全屏接管：铺满整个窗口，盖住侧栏/标题栏/播放条
-        let content: gpui::AnyElement =
-            if matches!(self.store.read(cx).routes.current(), Some(crate::state::Page::Lyric)) {
-                self.render_lyric(window, cx)
-            } else {
-                self.render_layout(window, cx).into_any_element()
-            };
-        image_cache(self.cover_cache.clone())
-            .size_full()
-            .child(content)
-    }
-}
 
 /// 日志过滤器：只压掉「已知、且上游已自行降级」的噪音，其它照旧透传。
 struct QuietDxgiProbe<L>(L);
@@ -461,57 +346,6 @@ fn main() {
 
             // 打开窗口
             let search_store = store.clone();
-            let search_input = cx.new(|cx| {
-                text_input::TextInput::new(
-                    cx.focus_handle(),
-                    "搜索音乐、歌手、专辑".into(),
-                    Some(Box::new(move |text, _window, cx| {
-                        let kw = text.trim().to_string();
-                        if kw.is_empty() {
-                            return;
-                        }
-                        ui::navigate(&search_store, Page::Search(kw), cx);
-                    })),
-                )
-            });
-            let search_focus = search_input.read(cx).focus();
-
-            // 「我最喜爱」页的前端模糊搜索：输入即过滤（纯本地，不打接口）
-            let fav_store = store.clone();
-            let fav_search = cx.new(|cx| {
-                text_input::TextInput::new(cx.focus_handle(), "在喜欢的音乐中搜索".into(), None)
-                    .with_on_change(Box::new(move |text, _window, cx| {
-                        let next = text.to_string();
-                        fav_store.update(cx, |s, cx| {
-                            if s.fav_filter == next {
-                                return;
-                            }
-                            s.fav_filter = next;
-                            s.refresh_fav_filter();
-                            cx.notify();
-                        });
-                    }))
-            });
-            let fav_search_focus = fav_search.read(cx).focus();
-
-            // 登录页输入框
-            let login_user = cx.new(|cx| {
-                text_input::TextInput::new(cx.focus_handle(), "手机号 / 邮箱".into(), None)
-            });
-            let login_pass = cx.new(|cx| {
-                text_input::TextInput::new(cx.focus_handle(), "密码".into(), None)
-            });
-            let login_phone = cx.new(|cx| {
-                text_input::TextInput::new(cx.focus_handle(), "手机号".into(), None)
-            });
-            let login_code = cx.new(|cx| {
-                text_input::TextInput::new(cx.focus_handle(), "短信验证码".into(), None)
-            });
-
-            // 封面图 LRU 缓存（全局共用一份，跨页面共享命中）
-            let cover_cache = cx.new(|_| imgcache::CoverCache::new(imgcache::DEFAULT_CAP));
-            let root_cache = cover_cache.clone();
-
             // Lite 版：这个 app 只有一条 330×70 的迷你播放条（参考原型即主体）
             let window = crate::lite::open(&store, cx).expect("open window");
 
@@ -721,10 +555,7 @@ fn main() {
             }
 
             // 第三期：登录后拉取自建歌单（侧栏显示 + 新建/删除）
-            crate::views::load_user_playlists(&store, cx);
-
-            // 默认进入首页
-            ui::navigate(&store, Page::Home, cx);
+            crate::actions::load_user_playlists(&store, cx);
 
             // 动画泵：加载态（旋转）/ 停在歌词页或开着桌面歌词且在播放时（AMLL 扫光 ~30fps）重绘
             {
@@ -758,135 +589,15 @@ fn main() {
                 .detach();
             }
 
-            // 自检钩子：ECHO_SMOKE=search|playlist 时自动跳转，便于自动化截图验证
+            // 自检钩子（Lite 只留两条：开箱即播 / 切主题）
+            //   ECHO_SMOKE=play|fm  → 加载私人 FM 并播第一首（截图/自检用）
+            //   ECHO_SMOKE=theme    → 走生产路径切一次深浅色
             if let Ok(target) = std::env::var("ECHO_SMOKE") {
                 let smoke_store = store.clone();
                 cx.spawn(async move |cx: &mut AsyncApp| {
-                    smol::Timer::after(std::time::Duration::from_secs(4)).await;
-                    let page = match target.as_str() {
-                        "explore" => Page::Explore,
-                        "daily" => Page::DailyRecommend,
-                        "ranking" => Page::Ranking,
-                        "rank-top" => Page::Rank("2".into(), "TOP500".into()),
-                        "album" => Page::Album("212206631".into(), "秋风一吹又老一岁".into()),
-                        "search-artist" | "search-album" => Page::Search("周杰伦".into()),
-                        // 搜索补全冒烟：进搜索页后自动切 歌词(4)/MV(5) tab
-                        "search-lyric" | "search-mv" => Page::Search("晴天".into()),
-                        "settings" => Page::Settings,
-                        // ECHO_SMOKE=backdrop-mica|acrylic|system|off：
-                        // 进设置页后直接调用与点击按钮相同的生产路径切换背景特效，
-                        // 供自动化读回验证（绕过合成点击，真实用户仍走按钮点击）
-                        t if t.starts_with("backdrop-") => Page::Settings,
-                        "cloud" => Page::Cloud,
-                        "fm" | "fm-end" | "fm-heard" => Page::Fm,
-                        "lyric" => Page::Lyric,
-                        "purchased" => Page::Purchased,
-                        "profile" => Page::Profile,
-                        "login" => Page::Login,
-                        "login-sms" => {
-                            let _ = smoke_store.update(cx, |s, _| {
-                                s.login.method = state::LoginMethod::Sms;
-                            });
-                            Page::Login
-                        }
-                        "login-password" => {
-                            let _ = smoke_store.update(cx, |s, _| {
-                                s.login.method = state::LoginMethod::Password;
-                            });
-                            Page::Login
-                        }
-                        "favorites" => Page::Favorites,
-                        "collapsed" => {
-                            let _ = smoke_store.update(cx, |s, _| {
-                                s.sidebar_collapsed = true;
-                            });
-                            Page::Home
-                        }
-                        "history" => Page::History,
-                        "search" => Page::Search("周杰伦".into()),
-                        "playlist" => {
-                            let pid = smoke_store
-                                .read_with(cx, |s, _| {
-                                    s.home.recommend_playlists.first().map(|p| (p.id.clone(), p.name.clone()))
-                                })
-                                .ok()
-                                .flatten();
-                            match pid {
-                                Some((id, name)) => Page::Playlist(id, name),
-                                None => Page::Explore,
-                            }
-                        }
-                        _ => Page::Home,
-                    };
-                    println!("[smoke] target={target} page={page:?}");
-                    let _ = cx.update(|app| ui::navigate(&smoke_store, page, app));
-
-                    // ECHO_SMOKE=search-artist|search-album：搜索后切到对应 Tab
-                    if target == "search-artist" || target == "search-album" {
-                        let tab = if target == "search-artist" { 2 } else { 3 };
-                        smol::Timer::after(std::time::Duration::from_secs(3)).await;
-                        let _ = cx.update(|app| {
-                            ui::load_search_tab(&smoke_store, "周杰伦", tab, app);
-                        });
-                    }
-
-                    // ECHO_SMOKE=search-lyric|search-mv：搜索补全（歌词/MV tab）
-                    if target == "search-lyric" || target == "search-mv" {
-                        let tab = if target == "search-lyric" { 4 } else { 5 };
-                        smol::Timer::after(std::time::Duration::from_secs(3)).await;
-                        let _ = cx.update(|app| {
-                            ui::load_search_tab(&smoke_store, "晴天", tab, app);
-                        });
-                    }
-
-                    // ECHO_SMOKE=queue：跳搜索页 → 自动播放第一首 → 打开队列面板（验证队列渲染）
-                    if target == "queue" {
-                        let _ = cx.update(|app| ui::navigate(&smoke_store, Page::Search("晴天".into()), app));
-                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
-                        let _ = cx.update(|app| {
-                            let n = smoke_store.read_with(app, |s, _| s.search.songs.len());
-                            log::warn!("[smoke-queue] search songs n={n}");
-                            if n > 0 {
-                                ui::play_from(&smoke_store, ui::PlaySource::Search, 0, app);
-                            }
-                        });
-                        smol::Timer::after(std::time::Duration::from_secs(3)).await;
-                        let _ = smoke_store.update(cx, |s, cx| {
-                            log::warn!("[smoke-queue] queue len={} index={:?} open=true", s.player.queue.len(), s.player.index);
-                            s.queue_open = true;
-                            cx.notify();
-                        });
-                    }
-
-                    // ECHO_SMOKE=fm-heard：验证「这一批都播过就预取下一批」。
-                    // 进 FM 页 → 等数据 → 播第一首 → 每 1.2s 切下一首（每首只听一小段，
-                    // 不要求播完），日志里应能看到
-                    // 「fm: 本批 N 首已全部播放过，预取下一批」+「fm extend(autoplay=false)」。
-                    if target == "fm-heard" {
-                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
-                        let _ = cx.update(|app| {
-                            let n = smoke_store.read_with(app, |s, _| s.fm.len());
-                            log::warn!("[smoke-fm] fm songs n={n}");
-                            ui::play_from(&smoke_store, ui::PlaySource::Fm, 0, app);
-                        });
-                        for i in 1..8usize {
-                            smol::Timer::after(std::time::Duration::from_millis(1200)).await;
-                            let _ = cx.update(|app| {
-                                let (len, idx) = smoke_store
-                                    .read_with(app, |s, _| (s.player.queue.len(), s.player.index));
-                                log::warn!(
-                                    "[smoke-fm] step {i}: queue={len} idx={idx:?} -> 切歌"
-                                );
-                                // 走真实的「下一首」路径：一轮听完就在这里清空队列换下一轮
-                                ui::next_track(&smoke_store, false, app);
-                            });
-                        }
-                    }
-
-                    // ECHO_SMOKE=play / fm：加载私人 FM 并播第一首
-                    // （Lite 的开箱即播路径，自动化截图/自检用）
                     if target == "play" || target == "fm" {
-                        let _ = cx.update(|app| crate::views::load_fm(&smoke_store, true, app));
+                        smol::Timer::after(std::time::Duration::from_secs(3)).await;
+                        let _ = cx.update(|app| crate::actions::load_fm(&smoke_store, true, app));
                         smol::Timer::after(std::time::Duration::from_secs(4)).await;
                         let _ = cx.update(|app| {
                             let n = smoke_store.read_with(app, |s, _| s.fm.len());
@@ -898,91 +609,19 @@ fn main() {
                         smol::Timer::after(std::time::Duration::from_secs(3)).await;
                     }
 
-                    // ECHO_SMOKE=devswitch：播放一首歌 → 运行中切换输出设备，
-                    // 验证不断流、从原位置继续（日志看「输出设备已切换」）
-                    if target == "devswitch" {
-                        let _ = cx
-                            .update(|app| ui::navigate(&smoke_store, Page::Search("晴天".into()), app));
-                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
-                        let _ = cx.update(|app| {
-                            ui::play_from(&smoke_store, ui::PlaySource::Search, 0, app)
-                        });
-                        smol::Timer::after(std::time::Duration::from_secs(8)).await;
-                        let _ = smoke_store.update(cx, |s, _| {
-                            s.engine.switch_device(None); // 回系统默认（重建输出流）
-                        });
-                    }
-
-                    // ECHO_SMOKE=theme：走与侧边栏按钮相同的 set_theme_mode 触发一次
-                    // 深浅切换（合成鼠标点不到侧边栏底部的小图标，这里直接调生产路径）
                     if target == "theme" {
                         smol::Timer::after(std::time::Duration::from_secs(2)).await;
                         let _ = cx.update(|app| {
-                            // 切到「跟当前相反」的模式：设置会落盘，写死 Dark 的话
-                            // 第二次跑就命中「模式相同直接返回」，动画不会再触发
+                            // 切到「跟当前相反」的模式：写死 Dark 的话第二次跑会命中
+                            // 「模式相同直接返回」，动画不再触发
                             let cur = smoke_store.read(app).settings.get().theme_mode;
                             let next = if cur == echo_core::ThemeMode::Dark {
                                 echo_core::ThemeMode::Light
                             } else {
                                 echo_core::ThemeMode::Dark
                             };
-                            ui::set_theme_mode(
-                                &smoke_store,
-                                next,
-                                Some(gpui::point(px(166.), px(523.))),
-                                app,
-                            );
+                            ui::set_theme_mode(&smoke_store, next, None, app);
                         });
-                    }
-
-                    // ECHO_SMOKE=fm-end：验证「私人 FM 一批播完自动续推」。
-                    // 播起 FM 后直接跳到最后那一首、再拖到结尾前 1 秒，让引擎自己发
-                    // Ended（不用等 3 分钟），日志里应出现 `fm extend:` 并且继续播下一首。
-                    if target == "fm-end" {
-                        smol::Timer::after(std::time::Duration::from_secs(2)).await;
-                        let _ = cx.update(|app| {
-                            ui::play_from(&smoke_store, ui::PlaySource::Fm, 0, app)
-                        });
-                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
-                        let (last, dur) = smoke_store
-                            .read_with(cx, |s, _| {
-                                (s.player.queue.len().saturating_sub(1), s.player.duration)
-                            })
-                            .unwrap_or((0, 0.0));
-                        log::warn!("[fm-end] queue last={last} dur={dur:.1}");
-                        let _ = cx.update(|app| ui::play_index(&smoke_store, last, app));
-                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
-                        let dur = smoke_store
-                            .read_with(cx, |s, _| s.player.duration)
-                            .unwrap_or(0.0);
-                        let _ = smoke_store.update(cx, |s, _| {
-                            s.engine.seek((dur - 1.0).max(0.0));
-                        });
-                    }
-
-                    // ECHO_SMOKE=backdrop-*：走与设置页按钮相同的 set_backdrop_mode
-                    // 后缀 `-dense` / `-clear` 顺带把「浓染色」打开 / 关掉，
-                    // 如 backdrop-acrylic-dense / backdrop-acrylic-clear
-                    if let Some(mode_str) = target.strip_prefix("backdrop-") {
-                        let (mode_str, dense) = match mode_str.strip_suffix("-dense") {
-                            Some(m) => (m, Some(true)),
-                            None => match mode_str.strip_suffix("-clear") {
-                                Some(m) => (m, Some(false)),
-                                None => (mode_str, None),
-                            },
-                        };
-                        if let Some(mode) = windows_backdrop::parse_mode(mode_str) {
-                            // 先落「浓染色」再切模式：set_backdrop_mode 里会重读设置
-                            if let Some(on) = dense {
-                                let _ = smoke_store.update(cx, |s, _| {
-                                    s.settings.update(|st| st.backdrop_dense = on);
-                                });
-                            }
-                            smol::Timer::after(std::time::Duration::from_secs(2)).await;
-                            let _ = cx.update(|app| {
-                                ui::set_backdrop_mode(&smoke_store, mode, app);
-                            });
-                        }
                     }
                 })
                 .detach();

@@ -1344,7 +1344,7 @@ impl LiteView {
                             .bg(theme.accent)
                             .hover(|el| el.opacity(0.9))
                             .on_click(move |_, _, cx| {
-                                crate::views::load_fm(&st, true, cx);
+                                crate::actions::load_fm(&st, true, cx);
                             })
                             .child(
                                 div()
@@ -1409,7 +1409,7 @@ impl LiteView {
                         let bg = theme.bg_hover;
                         move |el| el.bg(bg)
                     })
-                    .on_click(move |_, _, cx| crate::views::load_fm(&st, true, cx))
+                    .on_click(move |_, _, cx| crate::actions::load_fm(&st, true, cx))
                     .child(
                         div()
                             .text_size(px(10.5))
@@ -1796,7 +1796,7 @@ impl LiteView {
                             let bg = theme.bg_hover;
                             move |el| el.bg(bg)
                         })
-                        .on_click(move |_, _, cx| crate::views::logout(&st, cx))
+                        .on_click(move |_, _, cx| crate::actions::logout(&st, cx))
                         .child(
                             div()
                                 .text_size(px(11.))
@@ -1821,7 +1821,7 @@ impl LiteView {
                         .on_click(cx.listener(|v: &mut LiteView, _, window, cx| {
                             v.set_panel(Panel::Login, window, cx);
                             let st = v.store.clone();
-                            crate::views::start_qr_login(&st, cx);
+                            crate::actions::start_qr_login(&st, cx);
                         }))
                         .child(
                             div()
@@ -1998,7 +1998,7 @@ impl LiteView {
 
     /// 扫码登录面板：二维码 + 状态文案 + 刷新/取消。
     ///
-    /// 二维码矩阵与轮询都复用主窗口登录页那套（`views::start_qr_login` 把
+    /// 二维码矩阵与轮询都复用主窗口登录页那套（`actions::start_qr_login` 把
     /// key/url/status 写在 `store.login` 里），这里只换成 330 宽的紧凑版。
     fn login_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.store.read(cx).theme();
@@ -2038,7 +2038,7 @@ impl LiteView {
                 .child(if loading { "生成中…" } else { "点刷新重试" })
                 .into_any_element()
         } else {
-            crate::views::qr_widget(url.clone(), 104., theme.text).into_any_element()
+            crate::actions::qr_widget(url.clone(), 104., theme.text).into_any_element()
         };
 
         let side = div()
@@ -2091,7 +2091,7 @@ impl LiteView {
                                 let bg = theme.bg_hover;
                                 move |el| el.bg(bg)
                             })
-                            .on_click(move |_, _, cx| crate::views::start_qr_login(&st, cx))
+                            .on_click(move |_, _, cx| crate::actions::start_qr_login(&st, cx))
                             .child(
                                 div()
                                     .text_size(px(10.5))

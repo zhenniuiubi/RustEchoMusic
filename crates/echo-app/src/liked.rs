@@ -243,7 +243,7 @@ pub(crate) fn create_playlist(store: &Entity<AppStore>, cx: &mut App) {
                     ok
                 });
             if ok {
-                crate::views::load_user_playlists(&store_c, app);
+                crate::actions::load_user_playlists(&store_c, app);
             }
         });
     })
@@ -276,7 +276,7 @@ pub(crate) fn delete_playlist(store: &Entity<AppStore>, listid: &str, name: &str
                     ok
                 });
             if ok {
-                crate::views::load_user_playlists(&store_c, app);
+                crate::actions::load_user_playlists(&store_c, app);
             }
         });
     })
