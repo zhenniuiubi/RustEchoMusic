@@ -1,4 +1,4 @@
-//! Windows 平台能力：窗口图标、显示/隐藏、最大化切换、系统托盘。
+//! Windows 平台能力：窗口图标、拖动、置顶、媒体命令通道。
 //!
 //! gpui 0.2.2 没提供「设置窗口图标」「隐藏窗口」「还原最大化」这些 API
 //! （它的 `platform_window.zoom()` 只会 `SW_MAXIMIZE`，从不 `SW_RESTORE`，
@@ -10,50 +10,17 @@
 
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER,
     DIB_RGB_COLORS,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW,
-};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture};
-
-/// 托盘菜单命令回调消息。
-const WM_APP_TRAY: u32 = WM_APP + 1;
-
-/// 托盘菜单项 id。
-const ID_SHOW: usize = 1;
-const ID_TOGGLE: usize = 2;
-const ID_PREV: usize = 3;
-const ID_NEXT: usize = 4;
-const ID_QUIT: usize = 5;
-
-/// 托盘 → UI 的命令。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrayEvent {
-    /// 显示并激活主窗口
-    Show,
-    /// 播放 / 暂停
-    TogglePlay,
-    Prev,
-    Next,
-    /// 退出应用
-    Quit,
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
 
 /// 取 gpui 窗口底层的 HWND。
 pub fn hwnd(window: &Window) -> Option<HWND> {
@@ -177,31 +144,6 @@ pub fn apply_window_icon(window: &Window) {
 }
 
 // ==================== 窗口操作 ====================
-
-/// 隐藏窗口（进程继续跑，托盘里还在）。
-pub fn hide_window(window: &Window) {
-    if let Some(h) = hwnd(window) {
-        unsafe {
-            ShowWindow(h, SW_HIDE);
-        }
-        log::info!("窗口已隐藏（进程继续驻留托盘）");
-    }
-}
-
-/// 显示并置前窗口（托盘里点「显示主窗口」）。
-pub fn show_window(hwnd_raw: isize) {
-    if hwnd_raw == 0 {
-        return;
-    }
-    let h = hwnd_raw as HWND;
-    unsafe {
-        if IsIconic(h) != 0 {
-            ShowWindow(h, SW_RESTORE);
-        }
-        ShowWindow(h, SW_SHOW);
-        SetForegroundWindow(h);
-    }
-}
 
 /// 开始拖动窗口（等价于按住系统标题栏）。
 ///
@@ -357,232 +299,33 @@ pub fn set_topmost(window: &Window, on: bool) {
     }
 }
 
-// ==================== 系统托盘 ====================
+// ==================== 媒体命令通道 ====================
 
-struct TrayShared {
-    /// 主窗口 HWND（UI 线程创建后写入）
-    main: Arc<AtomicIsize>,
-    tx: Mutex<Sender<TrayEvent>>,
-}
-
-static TRAY: OnceLock<TrayShared> = OnceLock::new();
-
-/// 托盘窗口句柄（UI 线程更新提示文字时要用）。
-static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
-
-/// 投递托盘事件到主线程（SMTC 按键等内部模块也复用）。
-pub(crate) fn send(ev: TrayEvent) {
-    if let Some(st) = TRAY.get() {
-        if let Ok(tx) = st.tx.lock() {
-            let _ = tx.send(ev);
-        }
-    }
-}
-
-/// 起一个专用线程建托盘图标 + 跑消息循环。
+/// 系统媒体控件（SMTC：任务栏悬浮卡片 / 蓝牙耳机按键）→ UI 线程的命令。
 ///
-/// `main` 是主窗口 HWND 的共享槽位（UI 线程拿到后写入），
-/// 托盘线程只负责转发命令，真正的窗口操作仍在 UI 线程做。
-pub fn start_tray(main: Arc<AtomicIsize>, tx: Sender<TrayEvent>) {
-    let _ = TRAY.set(TrayShared {
-        main: main.clone(),
-        tx: Mutex::new(tx),
-    });
-
-    let spawned = std::thread::Builder::new()
-        .name("echo-tray".into())
-        .spawn(move || unsafe { tray_thread() });
-    if let Err(e) = spawned {
-        log::warn!("托盘线程启动失败：{e}");
-    }
+/// Lite 没有托盘了，这条通道只做「WinRT 线程 → UI 线程」的一次转发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaCmd {
+    TogglePlay,
+    Prev,
+    Next,
 }
 
-unsafe fn tray_thread() {
-    let hinst = GetModuleHandleW(std::ptr::null());
-    let class_name = wide("EchoMusicTrayWnd");
+static MEDIA_TX: OnceLock<Mutex<Sender<MediaCmd>>> = OnceLock::new();
 
-    let wc = WNDCLASSW {
-        style: 0,
-        lpfnWndProc: Some(tray_wnd_proc),
-        cbClsExtra: 0,
-        cbWndExtra: 0,
-        hInstance: hinst,
-        hIcon: app_icon().unwrap_or(std::ptr::null_mut()),
-        hCursor: std::ptr::null_mut(),
-        hbrBackground: std::ptr::null_mut(),
-        lpszMenuName: std::ptr::null(),
-        lpszClassName: class_name.as_ptr(),
-    };
-    if RegisterClassW(&wc) == 0 {
-        log::warn!("托盘窗口类注册失败");
-        return;
-    }
-
-    // 隐藏的普通窗口（不用 HWND_MESSAGE：消息专用窗口 FindWindowW 找不到，不利于自测）：
-    // 不显示、只收托盘回调
-    let hwnd = CreateWindowExW(
-        0,
-        class_name.as_ptr(),
-        wide("EchoMusicTray").as_ptr(),
-        0,
-        0,
-        0,
-        0,
-        0,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-        hinst,
-        std::ptr::null(),
-    );
-    if hwnd.is_null() {
-        log::warn!("托盘窗口创建失败");
-        return;
-    }
-
-    if add_icon(hwnd) {
-        TRAY_HWND.store(hwnd as isize, Ordering::Relaxed);
-        log::info!("托盘图标已就绪");
-    } else {
-        log::warn!("托盘图标添加失败");
-    }
-
-    let mut msg: MSG = std::mem::zeroed();
-    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-    remove_icon(hwnd);
+/// 登记命令通道（UI 线程启动时调一次）。
+pub fn init_media_cmds(tx: Sender<MediaCmd>) {
+    let _ = MEDIA_TX.set(Mutex::new(tx));
 }
 
-unsafe fn add_icon(hwnd: HWND) -> bool {
-    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    nid.hWnd = hwnd;
-    nid.uID = 1;
-    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    nid.uCallbackMessage = WM_APP_TRAY;
-    nid.hIcon = app_icon().unwrap_or(std::ptr::null_mut());
-    let tip = wide("EchoMusic Lite");
-    let n = tip.len().min(nid.szTip.len());
-    nid.szTip[..n].copy_from_slice(&tip[..n]);
-    Shell_NotifyIconW(NIM_ADD, &nid) != 0
-}
-
-unsafe fn remove_icon(hwnd: HWND) {
-    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-    nid.hWnd = hwnd;
-    nid.uID = 1;
-    Shell_NotifyIconW(NIM_DELETE, &nid);
-}
-
-unsafe fn show_menu(hwnd: HWND) {
-    let menu = CreatePopupMenu();
-    if menu.is_null() {
-        return;
-    }
-    let add = |id: usize, text: &str, flags: MENU_ITEM_FLAGS| {
-        AppendMenuW(menu, flags, id, wide(text).as_ptr());
-    };
-    add(ID_SHOW, "显示主窗口", MF_STRING);
-    add(0, "", MF_SEPARATOR);
-    add(ID_TOGGLE, "播放 / 暂停", MF_STRING);
-    add(ID_PREV, "上一首", MF_STRING);
-    add(ID_NEXT, "下一首", MF_STRING);
-    add(0, "", MF_SEPARATOR);
-    add(ID_QUIT, "退出 EchoMusic Lite", MF_STRING);
-
-    let mut pt = POINT_DEFAULT;
-    GetCursorPos(&mut pt);
-    // 必须先把托盘窗口置前，否则点菜单外面菜单不会消失
-    SetForegroundWindow(hwnd);
-    let cmd = TrackPopupMenu(
-        menu,
-        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN,
-        pt.x,
-        pt.y,
-        0,
-        hwnd,
-        std::ptr::null(),
-    );
-    DestroyMenu(menu);
-    PostMessageW(hwnd, WM_NULL, 0, 0);
-
-    if cmd != 0 {
-        dispatch_cmd(cmd as usize, hwnd);
-    }
-}
-
-/// 执行托盘菜单命令（菜单点击与 WM_COMMAND 共用）。
-unsafe fn dispatch_cmd(cmd: usize, hwnd: HWND) {
-    match cmd {
-        ID_SHOW => {
-            let raw = TRAY
-                .get()
-                .map(|s| s.main.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            show_window(raw);
-            send(TrayEvent::Show);
-        }
-        ID_TOGGLE => send(TrayEvent::TogglePlay),
-        ID_PREV => send(TrayEvent::Prev),
-        ID_NEXT => send(TrayEvent::Next),
-        ID_QUIT => {
-            send(TrayEvent::Quit);
-            remove_icon(hwnd);
-            DestroyWindow(hwnd);
-        }
-        _ => {}
-    }
-}
-
-#[allow(non_upper_case_globals)]
-const POINT_DEFAULT: windows_sys::Win32::Foundation::POINT =
-    windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
-
-unsafe extern "system" fn tray_wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_APP_TRAY => {
-            match (lparam as u32) & 0xFFFF {
-                WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
-                    let raw = TRAY
-                        .get()
-                        .map(|s| s.main.load(Ordering::Relaxed))
-                        .unwrap_or(0);
-                    show_window(raw);
-                    send(TrayEvent::Show);
-                }
-                WM_RBUTTONUP => show_menu(hwnd),
-                _ => {}
-            }
-            0
-        }
-        WM_COMMAND => {
-            // 低 16 位是菜单 id（自动化测试与键盘触发菜单都走这里）
-            dispatch_cmd(wparam & 0xFFFF, hwnd);
-            0
-        }
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            0
-        }
-        _ => {
-            // Explorer 重启后会 Broadcast 这个自定义消息，需要重新加图标
-            let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
-            if taskbar_created != 0 && msg == taskbar_created {
-                add_icon(hwnd);
-                return 0;
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+/// 投递命令（SMTC 按键线程调用）。
+pub(crate) fn send_cmd(cmd: MediaCmd) {
+    if let Some(tx) = MEDIA_TX.get() {
+        if let Ok(tx) = tx.lock() {
+            let _ = tx.send(cmd);
         }
     }
 }
-
 
 // ==================== 开机自启 ====================
 
@@ -594,6 +337,12 @@ const VK_MEDIA_NEXT: i32 = 0xB0;
 const VK_MEDIA_PREV: i32 = 0xB1;
 const VK_MEDIA_STOP: i32 = 0xB2;
 const VK_MEDIA_PLAY_PAUSE: i32 = 0xB3;
+
+/// 左键当前是否按着（拖拽在窗口外松手时用来收尾）。
+pub fn left_button_down() -> bool {
+    // VK_LBUTTON = 0x01（windows-sys 里挂在 KeyboardAndMouse 下，这里直接写字面量）
+    unsafe { (GetAsyncKeyState(0x01) as u16 & 0x8000) != 0 }
+}
 
 /// 上一次按键状态（用于「按下沿」判定）。
 static KEY_STATE: std::sync::Mutex<[bool; 4]> = std::sync::Mutex::new([false; 4]);

@@ -6,7 +6,7 @@
 //!
 //! 线程模型：专用 "smtc" 线程持有全部 WinRT 对象（先 `CoInitializeEx`）；
 //! UI 侧通过 `sync()` 往通道里塞快照（4Hz 进度事件也直接塞，线程内去重）；
-//! 按键事件从 WinRT 线程经托盘事件通道（`win::send`）回到主线程，
+//! 按键事件从 WinRT 线程经媒体命令通道（`win::send_cmd`）回到主线程，
 //! 与托盘菜单共用一套播放控制处理。
 //!
 //! 封面：按 URL 拉一次字节（阻塞 HTTP，仅在本线程），写入内存流交给
@@ -120,13 +120,13 @@ impl SmtcSession {
                 let event = match args.Button()? {
                     SystemMediaTransportControlsButton::Play
                     | SystemMediaTransportControlsButton::Pause => {
-                        crate::win::TrayEvent::TogglePlay
+                        crate::win::MediaCmd::TogglePlay
                     }
-                    SystemMediaTransportControlsButton::Next => crate::win::TrayEvent::Next,
-                    SystemMediaTransportControlsButton::Previous => crate::win::TrayEvent::Prev,
+                    SystemMediaTransportControlsButton::Next => crate::win::MediaCmd::Next,
+                    SystemMediaTransportControlsButton::Previous => crate::win::MediaCmd::Prev,
                     _ => return Ok(()),
                 };
-                crate::win::send(event);
+                crate::win::send_cmd(event);
                 Ok(())
             },
         ))?;

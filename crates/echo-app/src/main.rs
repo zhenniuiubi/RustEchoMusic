@@ -255,32 +255,17 @@ fn main() {
             // 播放中会员到期：每 60s 看一次真实到期时间，过期就自动领
             vip::start_watchdog(&store, cx);
 
-            // 启动后加载红心歌单（listid 供收藏切换使用）
+            // 启动后加载远端红心歌单（「我最喜爱」的数据源 + 收藏切换要用的 listid）
             if saved.is_valid() {
-                let liked_store = store.clone();
-                let liked_client = client.clone();
-                let liked_task = cx
-                    .background_executor()
-                    .spawn(async move { ui::run_tokio(liked_client.liked_playlist()) });
-                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-                    if let Ok(Some(pl)) = liked_task.await {
-                        let _ = liked_store.update(cx, |s, cx| {
-                            s.remote_liked_loaded = pl.listid.is_empty();
-                            s.remote_liked_listid = pl.listid;
-                            cx.notify();
-                        });
-                    }
-                })
-                .detach();
+                crate::liked::load_remote_liked(&store, false, cx);
             }
 
             // 打开窗口
-            let _search_store = store.clone();
             // Lite 版：这个 app 只有一条 330×70 的迷你播放条（参考原型即主体）
             let window = crate::lite::open(&store, cx).expect("open window");
 
-            // ===== 窗口图标 / 背景特效 / 关闭即隐藏 / 系统托盘 =====
-            // 主窗口 HWND 共享给托盘线程（托盘线程只转发命令，窗口操作仍在 UI 线程）
+            // ===== 窗口图标 / 关闭即退出 =====
+            // 主窗口 HWND 共享给 SMTC / 任务栏工具栏（它们只转发命令，窗口操作仍在 UI 线程）
             let main_hwnd = Arc::new(std::sync::atomic::AtomicIsize::new(0));
             {
                 let slot = main_hwnd.clone();
@@ -289,64 +274,49 @@ fn main() {
                     if let Some(h) = win::hwnd(window) {
                         slot.store(h as isize, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // 关闭按钮 / Alt+F4 只收起到托盘，真正退出走托盘菜单
-                    window.on_window_should_close(cx, |window, _| {
-                        win::hide_window(window);
-                        false
+                    // Lite 没有托盘：关窗口就是退出
+                    window.on_window_should_close(cx, |_window, cx| {
+                        cx.quit();
+                        true
                     });
                 });
             }
             // ===== SMTC 系统媒体控制（任务栏悬浮卡片 / 蓝牙耳机播放控件）=====
-            // 按键事件经托盘事件通道回主线程，与托盘菜单共用处理逻辑
+            // 按键事件经媒体命令通道回主线程
             crate::smtc::start(main_hwnd.load(std::sync::atomic::Ordering::Relaxed));
 
+            // ===== 系统媒体控件按键 → UI 线程动作 =====
+            // SMTC 的回调在 WinRT 线程，这里桥成 smol channel 回到主线程
             {
-                let (tray_tx, tray_rx) = std::sync::mpsc::channel::<win::TrayEvent>();
-                win::start_tray(main_hwnd.clone(), tray_tx);
-                let tray_store = store.clone();
-                let tray_win = window;
-                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-                    loop {
-                        smol::Timer::after(std::time::Duration::from_millis(250)).await;
-                        loop {
-                            match tray_rx.try_recv() {
-                                Ok(win::TrayEvent::Show) => {
-                                    // 从托盘把播放条叫回来：先 show 再激活
-                                    let _ = tray_win.update(cx, |_, window, _| {
-                                        window.activate_window();
-                                        window.refresh();
-                                    });
-                                }
-                                Ok(win::TrayEvent::TogglePlay) => {
-                                    let _ = tray_win.update(cx, |_, _, cx| {
-                                        ui::toggle_play(&tray_store, cx);
-                                    });
-                                }
-                                Ok(win::TrayEvent::Prev) => {
-                                    let _ = tray_win.update(cx, |_, _, cx| {
-                                        ui::prev_track(&tray_store, cx);
-                                    });
-                                }
-                                Ok(win::TrayEvent::Next) => {
-                                    let _ = tray_win.update(cx, |_, _, cx| {
-                                        ui::next_track(&tray_store, false, cx);
-                                    });
-                                }
-                                Ok(win::TrayEvent::Quit) => {
-                                    let _ = cx.update(|app| app.quit());
-                                    return;
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<win::MediaCmd>();
+                win::init_media_cmds(cmd_tx);
+                let (ui_tx, ui_rx) = smol::channel::unbounded::<win::MediaCmd>();
+                std::thread::Builder::new()
+                    .name("smtc-bridge".into())
+                    .spawn(move || {
+                        for cmd in cmd_rx {
+                            if smol::block_on(ui_tx.send(cmd)).is_err() {
+                                break;
                             }
                         }
+                    })
+                    .ok();
+                let cmd_store = store.clone();
+                let cmd_win = window;
+                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                    while let Ok(cmd) = ui_rx.recv().await {
+                        let _ = cmd_win.update(cx, |_, _, cx| match cmd {
+                            win::MediaCmd::TogglePlay => ui::toggle_play(&cmd_store, cx),
+                            win::MediaCmd::Prev => ui::prev_track(&cmd_store, cx),
+                            win::MediaCmd::Next => ui::next_track(&cmd_store, false, cx),
+                        });
                     }
                 })
                 .detach();
             }
 
             // ===== 任务栏缩略图工具栏（悬停任务栏按钮 → 上一曲/播放暂停/下一曲/收藏）=====
-            // 点击经子类化拦 WM_COMMAND 后走 mpsc 回来，与托盘菜单同一套动作
+            // 点击经子类化拦 WM_COMMAND 后走 mpsc 回来
             {
                 let (tb_tx, tb_rx) = std::sync::mpsc::channel::<taskbar::TaskbarEvent>();
                 taskbar::init(

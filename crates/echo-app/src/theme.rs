@@ -20,6 +20,8 @@ pub struct Theme {
     pub text_tertiary: Hsla,
     /// 边框
     pub border: Hsla,
+    /// 卡片外描边（Lite 播放条那一圈浅灰线，比内部分隔线更实）
+    pub card_border: Hsla,
     /// 播放条进度槽
     pub progress_track: Hsla,
 }
@@ -38,6 +40,7 @@ impl Theme {
             text_secondary: hex(0x7a7a7a),
             text_tertiary: hex(0xb3b3b3),
             border: hex(0x000000).opacity(0.08),
+            card_border: hex(0xe4e4e7),
             progress_track: hex(0x000000).opacity(0.12),
         }
     }
@@ -51,6 +54,7 @@ impl Theme {
             text_secondary: hex(0xa8aeb5),
             text_tertiary: hex(0x7c8791),
             border: hex(0xffffff).opacity(0.10),
+            card_border: hex(0x3a4350),
             progress_track: hex(0xffffff).opacity(0.15),
         }
     }
