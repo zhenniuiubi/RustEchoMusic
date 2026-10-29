@@ -22,7 +22,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -53,38 +53,6 @@ pub enum TrayEvent {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// 主显示器的**逻辑**尺寸（按传入的缩放比例换算）。
-///
-/// 用来给浮窗兜底：大字号桌面歌词可能比屏幕还宽，得先知道屏幕多大。
-pub fn screen_size_logical(scale: f32) -> (f32, f32) {
-    let s = if scale > 0.1 { scale } else { 1.0 };
-    unsafe {
-        (
-            GetSystemMetrics(SM_CXSCREEN) as f32 / s,
-            GetSystemMetrics(SM_CYSCREEN) as f32 / s,
-        )
-    }
-}
-
-/// 移动窗口（保持大小与层级不变）。
-///
-/// gpui 0.2.2 没有暴露 `set_position`，而 `Window::resize` 是以**左上角**为锚点
-/// 的——桌面歌词从 2× 调到 5× 时窗口会向右长出去、直接伸出屏幕。
-pub fn move_window(hwnd_raw: isize, x: f32, y: f32, scale: f32) {
-    let s = if scale > 0.1 { scale } else { 1.0 };
-    unsafe {
-        SetWindowPos(
-            hwnd_raw as HWND,
-            std::ptr::null_mut(),
-            (x * s) as i32,
-            (y * s) as i32,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-    }
 }
 
 /// 取 gpui 窗口底层的 HWND。
@@ -235,44 +203,6 @@ pub fn show_window(hwnd_raw: isize) {
     }
 }
 
-/// 按原始 HWND 请求「还原 / 显示」（不进入 gpui 的 window 上下文）。
-///
-/// 用 `SC_RESTORE` 而不是直接 `ShowWindow`：ShowWindow 会**同步**派发 `WM_SIZE`，
-/// 而 gpui 的 resize 回调又是 `window.update(...)`，在自己的事件/布局周期里调它会重入
-/// （日志里是 “RefCell already borrowed”）。投递系统命令让窗口线程自己处理就绕开了。
-/// `SC_RESTORE` 对 `SW_HIDE` 掉的窗口同样生效——还原会把窗口显示出来。
-pub fn post_restore(hwnd_raw: isize) {
-    if hwnd_raw == 0 {
-        return;
-    }
-    unsafe {
-        PostMessageW(hwnd_raw as HWND, WM_SYSCOMMAND, SC_RESTORE as WPARAM, 0);
-    }
-    log::info!("post_restore -> post SC_RESTORE");
-}
-
-/// 按原始 HWND 请求最大化（不进入 gpui 的 window 上下文，可从任意回调里调）。
-pub fn post_maximize(hwnd_raw: isize) {
-    if hwnd_raw == 0 {
-        return;
-    }
-    unsafe {
-        PostMessageW(hwnd_raw as HWND, WM_SYSCOMMAND, SC_MAXIMIZE as WPARAM, 0);
-    }
-    log::info!("post_maximize -> post SC_MAXIMIZE");
-}
-
-/// 当前是否处于最大化状态。
-///
-/// 直接问系统（而不是自己记标志位）：Win+Up、双击标题栏、边缘吸附导致的
-/// 最大化/还原也能被正确反映到「最大化/还原」按钮的图标上。
-pub fn is_maximized(window: &Window) -> bool {
-    match hwnd(window) {
-        Some(h) => unsafe { IsZoomed(h) != 0 },
-        None => false,
-    }
-}
-
 /// 开始拖动窗口（等价于按住系统标题栏）。
 ///
 /// 为什么不直接用 `window_control_area(Drag)`：
@@ -352,29 +282,6 @@ pub fn remove_window_frame(window: &Window) {
     }
 }
 
-/// 鼠标此刻是否落在窗口矩形内。
-///
-/// gpui 0.2.2 的 Windows 端**没有处理 `WM_MOUSELEAVE`**，鼠标移出窗口后
-/// `on_hover` 不会回调 `false`——浮窗里「hover 才显示的控制条」就会一直挂着。
-/// 所以自己按光标位置判断（只需要原始 HWND，不必进 gpui 的 window 上下文）。
-pub fn cursor_in_rect(hwnd_raw: isize) -> bool {
-    if hwnd_raw == 0 {
-        return false;
-    }
-    let h = hwnd_raw as HWND;
-    unsafe {
-        let mut pt = POINT { x: 0, y: 0 };
-        if GetCursorPos(&mut pt) == 0 {
-            return false;
-        }
-        let mut r = RECT::default();
-        if GetWindowRect(h, &mut r) == 0 {
-            return false;
-        }
-        pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
-    }
-}
-
 /// 光标是否落在窗口**客户区**内的某个矩形里。
 ///
 /// 参数用**逻辑像素**（相对客户区左上角），DPI 比例按 `logical_w` 反推：
@@ -450,26 +357,6 @@ pub fn set_topmost(window: &Window, on: bool) {
     }
 }
 
-/// 请求「最大化 / 还原」。///
-/// **绝对不能在本进程内同步改窗口大小**：`ShowWindow`/`SetWindowPos` 会同步派发
-/// `WM_SIZE`，而 gpui 的 resize 回调是 `window.update(...)`，重入时会失败
-/// （被 `log_err` 吞掉），于是窗口铺开了、布局却还是旧的 ——
-/// 表现就是「只是移动到了左上角」。
-/// 所以这里只把 `WM_SYSCOMMAND` 塞进消息队列，等本轮事件处理完、
-/// gpui 空闲时由主循环派发，就和用户按 Win+Up 完全一样。
-pub fn set_maximized(window: &Window, on: bool) {
-    if let Some(h) = hwnd(window) {
-        let cmd = if on { SC_MAXIMIZE } else { SC_RESTORE };
-        unsafe {
-            PostMessageW(h, WM_SYSCOMMAND, cmd as WPARAM, 0);
-        }
-        log::info!(
-            "set_maximized({on}) -> post {}",
-            if on { "SC_MAXIMIZE" } else { "SC_RESTORE" }
-        );
-    }
-}
-
 // ==================== 系统托盘 ====================
 
 struct TrayShared {
@@ -482,25 +369,6 @@ static TRAY: OnceLock<TrayShared> = OnceLock::new();
 
 /// 托盘窗口句柄（UI 线程更新提示文字时要用）。
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
-
-/// 更新托盘图标的悬浮提示（显示当前播放的歌曲）。
-pub fn set_tray_tip(tip: &str) {
-    let raw = TRAY_HWND.load(Ordering::Relaxed);
-    if raw == 0 {
-        return;
-    }
-    unsafe {
-        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = raw as HWND;
-        nid.uID = 1;
-        nid.uFlags = NIF_TIP;
-        let w = wide(tip);
-        let n = w.len().min(nid.szTip.len());
-        nid.szTip[..n].copy_from_slice(&w[..n]);
-        Shell_NotifyIconW(NIM_MODIFY, &nid);
-    }
-}
 
 /// 投递托盘事件到主线程（SMTC 按键等内部模块也复用）。
 pub(crate) fn send(ev: TrayEvent) {
@@ -594,7 +462,7 @@ unsafe fn add_icon(hwnd: HWND) -> bool {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon = app_icon().unwrap_or(std::ptr::null_mut());
-    let tip = wide("EchoMusic");
+    let tip = wide("EchoMusic Lite");
     let n = tip.len().min(nid.szTip.len());
     nid.szTip[..n].copy_from_slice(&tip[..n]);
     Shell_NotifyIconW(NIM_ADD, &nid) != 0
@@ -622,7 +490,7 @@ unsafe fn show_menu(hwnd: HWND) {
     add(ID_PREV, "上一首", MF_STRING);
     add(ID_NEXT, "下一首", MF_STRING);
     add(0, "", MF_SEPARATOR);
-    add(ID_QUIT, "退出 EchoMusic", MF_STRING);
+    add(ID_QUIT, "退出 EchoMusic Lite", MF_STRING);
 
     let mut pt = POINT_DEFAULT;
     GetCursorPos(&mut pt);
@@ -718,86 +586,6 @@ unsafe extern "system" fn tray_wnd_proc(
 
 // ==================== 开机自启 ====================
 
-/// 开机自启：写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`。
-///
-/// 不用 `reg.exe`：本项目的构建沙箱禁它，而注册表 API 本身不受限。
-pub fn set_auto_start(enable: bool) -> anyhow::Result<()> {
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-        KEY_SET_VALUE, REG_SZ,
-    };
-
-    let sub_key = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    let value = wide("EchoMusic");
-
-    unsafe {
-        let mut key: HKEY = std::ptr::null_mut();
-        let status = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            sub_key.as_ptr(),
-            0,
-            KEY_SET_VALUE,
-            &mut key,
-        );
-        if status != 0 {
-            anyhow::bail!("打开注册表失败：{status}");
-        }
-        let result = if enable {
-            let exe = std::env::current_exe().unwrap_or_default();
-            let exe_w = wide(&exe.to_string_lossy());
-            let bytes: Vec<u8> = exe_w
-                .iter()
-                .flat_map(|c| c.to_le_bytes())
-                .collect();
-            RegSetValueExW(
-                key,
-                value.as_ptr(),
-                0,
-                REG_SZ,
-                bytes.as_ptr(),
-                bytes.len() as u32,
-            )
-        } else {
-            RegDeleteValueW(key, value.as_ptr())
-        };
-        RegCloseKey(key);
-        if result != 0 {
-            anyhow::bail!("写注册表失败：{result}");
-        }
-    }
-    Ok(())
-}
-
-/// 是否已开启开机自启。
-pub fn auto_start_enabled() -> bool {
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
-    };
-
-    let sub_key = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
-    let value = wide("EchoMusic");
-
-    unsafe {
-        let mut key: HKEY = std::ptr::null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, sub_key.as_ptr(), 0, KEY_READ, &mut key) != 0 {
-            return false;
-        }
-        let mut ty: u32 = 0;
-        let mut len: u32 = 0;
-        // 先取长度，成功（含 ERROR_MORE_DATA=234）都算存在
-        let status = RegQueryValueExW(
-            key,
-            value.as_ptr(),
-            std::ptr::null_mut(),
-            &mut ty,
-            std::ptr::null_mut(),
-            &mut len,
-        );
-        RegCloseKey(key);
-        status == 0 || status == 234
-    }
-}
-
 // ==================== 全局媒体键 ====================
 
 /// 虚拟键码（windows-sys 的常量在 Win32_UI_Input_KeyboardAndMouse 里，
@@ -848,25 +636,3 @@ pub enum MediaKey {
     Stop,
 }
 
-/// 从任务栏（和 Alt-Tab）隐藏窗口（mini 模式：任务栏只留主窗口/托盘）。
-///
-/// WS_EX_TOOLWINDOW 的副作用是同时从 Alt-Tab 消失——对 mini 小窗正合适。
-pub fn hide_from_taskbar(window: &Window) {
-    if let Some(h) = hwnd(window) {
-        unsafe {
-            let ex = GetWindowLongW(h, GWL_EXSTYLE) as u32;
-            let new = (ex & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW;
-            SetWindowLongPtrW(h, GWL_EXSTYLE, new as isize);
-            SetWindowPos(
-                h,
-                std::ptr::null_mut(),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-            );
-        }
-        log::debug!("mini 窗口已从任务栏隐藏");
-    }
-}

@@ -1,7 +1,6 @@
-//! 主界面：布局（侧栏 / 顶栏 / 内容区 / 播放条）与交互动作。
+//! 播放动作与通用小件（Lite 版只剩这些）。
 //!
-//! 布局对齐原项目 `layouts/MainLayout.vue + Sidebar.vue + TitleBar.vue`、
-//! 首页对齐 `views/Home.vue`、播放条对齐 `components/PlayerBar.vue`。
+//! 播放队列只有两个来源：私人 FM 与我喜爱；歌单页 / 搜索页那套已经移除。
 
 use crate::state::AppStore;
 use echo_core::Song;
@@ -23,168 +22,6 @@ pub fn run_tokio<F: std::future::Future>(fut: F) -> F::Output {
 
 // ==================== 通用小部件 ====================
 
-pub(crate) fn fmt_time(secs: f64) -> String {
-    let s = secs.max(0.0) as u64;
-    format!("{:02}:{:02}", s / 60, s % 60)
-}
-
-/// 居中旋转加载动画：12 个圆点围成一圈，按墙钟时间推进「头部」位置，
-/// 尾部渐隐形成追逐旋转效果。配合 `any_loading` 重绘泵可持续旋转。
-/// 注：gpui 0.2.2 的 `paint_path` 在 Windows 后端不渲染，故只用 `paint_quad` 绘制。
-pub(crate) fn loading_spinner(size: f32, color: Hsla) -> impl IntoElement {
-    canvas(
-        move |bounds, _, _| bounds,
-        move |bounds, _, window, _| {
-            let w = bounds.size.width;
-            let h = bounds.size.height;
-            let cx = bounds.origin.x + w / 2.0;
-            let cy = bounds.origin.y + h / 2.0;
-            let radius = (w.min(h) / 2.0) - px(4.);
-            if radius <= px(0.) {
-                return;
-            }
-            let dots = 12u32;
-            let dot = px(4.);
-            let half = dot / 2.0;
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f32();
-            // 头部沿环推进，形成旋转
-            let head = (t * 1.4 * dots as f32).rem_euclid(dots as f32);
-            for i in 0..dots {
-                let a = std::f32::consts::TAU * (i as f32 / dots as f32)
-                    - std::f32::consts::FRAC_PI_2;
-                let d = point(cx + radius * a.cos(), cy + radius * a.sin());
-                // 与头部的环形距离：0 = 头部最亮，越远越淡（拖尾）
-                let rel = (i as f32 - head).rem_euclid(dots as f32) / dots as f32;
-                let mut c = color;
-                c.a = color.a * (1.0 - rel * 0.88);
-                window.paint_quad(
-                    fill(
-                        Bounds::new(point(d.x - half, d.y - half), gpui::size(dot, dot)),
-                        c,
-                    )
-                    .corner_radii(half),
-                );
-            }
-        },
-    )
-    .size(px(size))
-}
-
-/// 居中铺满（垂直 + 水平居中）的加载动画，用于列表加载态。
-/// 作为内容区的直接子节点时（overflow_y_scroll 容器内）可填充并居中。
-/// 返回具体 `Div`（而非 `impl IntoElement`），以便调用方将其与主体 `Div()`
-/// 放在同一 `impl IntoElement` 返回分支里而不产生类型不匹配。
-pub(crate) fn centered_spinner(theme: crate::theme::Theme) -> Div {
-    div()
-        .size_full()
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .child(loading_spinner(40., theme.accent))
-}
-
-/// 自绘滚动条 thumb 浮层（gpui 0.2.2 不绘制滚动条，`scrollbar_width` 只预留布局空间）。
-/// 用 canvas 依据 ScrollHandle 实时状态画 thumb；内容不可滚动时不绘制。
-/// 支持按住 thumb 拖拽（`ScrollHandle::set_offset`），点击轨道直接跳转。
-/// 悬浮在滚动容器右缘：外层包一个 `.relative()` 容器，叠加 `absolute` 定位的窄条即可。
-pub(crate) fn scrollbar_overlay(id: &'static str, handle: &ScrollHandle) -> impl IntoElement {
-    let paint_handle = handle.clone();
-    let down_handle = handle.clone();
-    let move_handle = handle.clone();
-    // 拖拽起点：(按下时的鼠标 y, 按下时的 offset.y, 每像素对应的滚动量)
-    let drag: std::sync::Arc<parking_lot::Mutex<Option<(f32, f32, f32)>>> =
-        std::sync::Arc::new(parking_lot::Mutex::new(None));
-    let down_drag = drag.clone();
-    let move_drag = drag.clone();
-    let up_drag = drag.clone();
-
-    let bar = canvas(
-        move |bounds, _, _| bounds,
-        move |bounds, _, window, _| {
-            let viewport_h = paint_handle.bounds().size.height;
-            let max_off = paint_handle.max_offset().height;
-            if max_off <= px(0.) || viewport_h <= px(0.) {
-                return;
-            }
-            let track_h = bounds.size.height;
-            let ratio = viewport_h / (viewport_h + max_off);
-            let thumb_h = (track_h * ratio).max(px(30.));
-            let progress = (-paint_handle.offset().y / max_off).clamp(0.0, 1.0);
-            let thumb_y = bounds.origin.y + (track_h - thumb_h) * progress;
-            // thumb 画在浮层右侧 5px 内，浮层本身留 10px 便于点中
-            let thumb_w = px(5.);
-            window.paint_quad(
-                fill(
-                    Bounds::new(
-                        point(bounds.origin.x + bounds.size.width - thumb_w, thumb_y),
-                        gpui::size(thumb_w, thumb_h),
-                    ),
-                    hsla(0., 0., 0., 0.20),
-                )
-                .corner_radii(px(3.)),
-            );
-        },
-    )
-    .size_full();
-
-    div()
-        .id(id)
-        .size_full()
-        .cursor_pointer()
-        // 按下：记录起点；点在 thumb 外则先按比例跳转过去
-        .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-            let max_off = down_handle.max_offset().height;
-            if max_off <= px(0.) {
-                return;
-            }
-            let viewport_h = down_handle.bounds().size.height;
-            let track_h = (viewport_h - px(8.)).max(px(1.));
-            let thumb_h = (track_h * (viewport_h / (viewport_h + max_off))).max(px(30.));
-            let travel = (track_h - thumb_h).max(px(1.));
-            let per_px = max_off / travel;
-
-            // 点击位置到 thumb 中心的距离：若点在 thumb 外，先把 thumb 移过去
-            let track_top = down_handle.bounds().origin.y + px(4.);
-            let thumb_top = track_top + (-down_handle.offset().y / per_px);
-            let click_y = ev.position.y;
-            let half = thumb_h / 2.0;
-            if click_y < thumb_top || click_y > thumb_top + thumb_h {
-                let want_top = click_y - half;
-                let off = -((want_top - track_top) * per_px)
-                    .clamp(px(0.), max_off);
-                down_handle.set_offset(point(down_handle.offset().x, off));
-                window.refresh();
-                cx.stop_propagation();
-            }
-            *down_drag.lock() = Some((
-                f32::from(ev.position.y),
-                f32::from(down_handle.offset().y),
-                f32::from(per_px),
-            ));
-        })
-        .on_mouse_move(move |ev, window, _| {
-            if ev.pressed_button != Some(MouseButton::Left) {
-                return;
-            }
-            let Some((start_y, start_off, per_px)) = *move_drag.lock() else {
-                return;
-            };
-            let dy = f32::from(ev.position.y) - start_y;
-            let max_off = f32::from(move_handle.max_offset().height);
-            let new_off = (start_off + dy * per_px).clamp(-max_off, 0.0);
-            move_handle.set_offset(point(move_handle.offset().x, px(new_off)));
-            window.refresh();
-        })
-        .on_mouse_up(MouseButton::Left, move |_, _, _| {
-            *up_drag.lock() = None;
-        })
-        .child(bar)
-}
-
 pub(crate) fn icon(path: &str, size: f32, color: Hsla) -> impl IntoElement {
     svg()
         .path(SharedString::from(path.to_string()))
@@ -193,54 +30,6 @@ pub(crate) fn icon(path: &str, size: f32, color: Hsla) -> impl IntoElement {
         .flex_shrink_0()
 }
 
-
-/// 用户 VIP 标签（vip_type：0 普通 / >0 VIP / 8+ 更高等级）。
-pub(crate) fn vip_tag(vip_type: i64) -> Option<AnyElement> {
-    if vip_type <= 0 {
-        return None;
-    }
-    let label = match vip_type {
-        1..=3 => "VIP",
-        4..=7 => "超级 VIP",
-        _ => "黑胶 VIP",
-    };
-    Some(
-        div()
-            .flex_shrink_0()
-            .px_1p5()
-            .py_0p5()
-            .rounded(px(4.))
-            .bg(Hsla { h: 0.11, s: 0.75, l: 0.55, a: 0.18 })
-            .text_size(px(10.))
-            .line_height(px(13.))
-            .text_color(Hsla { h: 0.11, s: 0.75, l: 0.55, a: 1.0 })
-            .child(label)
-            .into_any_element(),
-    )
-}
-
-/// 歌曲权限标签（VIP / 付费 / 版权 / 音源）。
-pub(crate) fn song_tag(song: &Song, theme: &crate::theme::Theme) -> Option<AnyElement> {
-    let (label, color) = match song.privilege_tag()? {
-        echo_core::SongTag::Vip => ("VIP", theme.accent),
-        echo_core::SongTag::Paid => ("付费", gpui::rgb(0xef4444).into()),
-        echo_core::SongTag::NoCopyright => ("版权", gpui::rgb(0x8b5cf6).into()),
-        echo_core::SongTag::Unavailable => ("音源", gpui::rgb(0x6b7280).into()),
-    };
-    Some(
-        div()
-            .flex_shrink_0()
-            .px_1()
-            .py_0p5()
-            .rounded(px(4.))
-            .bg(color.opacity(0.12))
-            .text_size(px(9.5))
-            .line_height(px(12.))
-            .text_color(color)
-            .child(label)
-            .into_any_element(),
-    )
-}
 
 // ==================== 播放动作 ====================
 
@@ -370,13 +159,11 @@ pub fn spawn_resolve(store: &Entity<AppStore>, request_id: u64, song: Song, cx: 
     .detach();
 }
 
-/// 播放来源（Lite 只有这三条取队列的路径）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 播放来源（Lite 只有这两条「整批换队列」的路径）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaySource {
-    /// 我最喜爱（本地收藏 / 登录后的云端红心）
+    /// 我最喜爱（未登录用本地收藏，登录后用云端红心）
     Favorites,
-    /// 播放历史
-    History,
     /// 私人 FM
     Fm,
 }
@@ -384,13 +171,9 @@ pub enum PlaySource {
 /// 从来源列表设置队列并从 index 开始播放。
 pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx: &mut App) {
     let store = store.clone();
-    let (title, songs) = store.update(cx, |s, _| {
-        let (title, songs): (String, Vec<Song>) = match &source {
-            PlaySource::Favorites => ("我最喜爱".into(), s.library.get().favorites.as_ref().clone()),
-            PlaySource::History => ("播放历史".into(), s.library.get().history.as_ref().clone()),
-            PlaySource::Fm => ("私人FM".into(), s.fm.as_ref().clone()),
-        };
-        (title, songs)
+    let (title, songs) = store.update(cx, |s, _| match source {
+        PlaySource::Favorites => ("我最喜爱".to_string(), s.favorites_source().as_ref().clone()),
+        PlaySource::Fm => ("私人FM".to_string(), s.fm.as_ref().clone()),
     });
     if songs.is_empty() {
         return;
@@ -431,29 +214,6 @@ pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx:
         crate::actions::load_lyric(&store, cx);
         start_with_fade(&store, rid, song, cx);
     }
-}
-
-/// 「播放全部」：随机模式下从**随机一首**开始，而不是永远固定第一首。
-///
-/// 目前用在「我最喜爱」页；点单曲仍然走 `play_from(.., index)`，从点的那首开始。
-pub fn play_all(store: &Entity<AppStore>, source: PlaySource, cx: &mut App) {
-    let start = {
-        let s = store.read(cx);
-        let len = match source {
-            PlaySource::Favorites => s.favorites_source().len(),
-            PlaySource::History => s.library.get().history.len(),
-            PlaySource::Fm => s.fm.len(),
-        };
-        if s.player.play_mode == echo_core::PlayMode::Random && len > 0 {
-            use rand::Rng as _;
-            let start = rand::rng().random_range(0..len);
-            log::info!("play_all: 随机模式，从第 {start}/{len} 首开始");
-            start
-        } else {
-            0
-        }
-    };
-    play_from(store, source, start, cx);
 }
 
 /// 切歌淡出：正在播就把旧音源淡出，再解析新地址（避免硬切爆音）。
@@ -546,22 +306,6 @@ pub fn toggle_play(store: &Entity<AppStore>, cx: &mut App) {
     }
 }
 
-/// 清空播放队列（停止播放并清掉落盘快照）。
-pub fn clear_queue(store: &Entity<AppStore>, cx: &mut App) {
-    store.update(cx, |s, cx| {
-        if s.player.queue.is_empty() {
-            return;
-        }
-        // 让在途的解析结果作废，避免刚清空又被塞回来
-        s.player.request_id += 1;
-        s.engine.stop();
-        s.player.clear_queue();
-        s.queue_store.clear();
-        s.toast = "已清空播放队列".into();
-        cx.notify();
-    });
-}
-
 pub fn next_track(store: &Entity<AppStore>, auto: bool, cx: &mut App) {
     // 私人 FM：这一轮的歌都听过了 → 清空队列换下一轮（不再往下接老队列）
     if crate::actions::fm_round_finished(store.read(cx)) {
@@ -586,45 +330,6 @@ pub fn prev_track(store: &Entity<AppStore>, cx: &mut App) {
     if let Some(i) = store.read(cx).player.prev_index() {
         play_index(store, i, cx);
     }
-}
-
-pub(crate) fn cycle_play_mode(store: &Entity<AppStore>, cx: &mut App) {
-    store.update(cx, |s, cx| {
-        s.player.play_mode = s.player.play_mode.next();
-        let mode = s.player.play_mode;
-        s.settings.update(|st| st.play_mode = mode);
-        s.toast = mode.label().into();
-        cx.notify();
-    });
-}
-
-/// 倍速档位（与播放条的循环一致）。
-pub(crate) const SPEED_STEPS: [f64; 5] = [0.75, 1.0, 1.25, 1.5, 2.0];
-
-/// 按档位加减倍速（播放页 `[` / `]` 用）。
-pub(crate) fn step_speed(store: &Entity<AppStore>, dir: i32, cx: &mut App) {
-    store.update(cx, |s, cx| {
-        let cur = s.settings.get().speed;
-        let mut ix = SPEED_STEPS
-            .iter()
-            .position(|v| (*v - cur).abs() < 0.001)
-            .unwrap_or(1) as i32;
-        ix = (ix + dir).clamp(0, SPEED_STEPS.len() as i32 - 1);
-        let next = SPEED_STEPS[ix as usize];
-        s.settings.update(|st| st.speed = next);
-        s.engine.set_speed(next);
-        s.toast = format!("倍速 {next}x");
-        cx.notify();
-    });
-}
-
-pub(crate) fn set_volume(store: &Entity<AppStore>, v: f64, cx: &mut App) {
-    store.update(cx, |s, cx| {
-        s.player.volume = v.clamp(0.0, 1.0);
-        s.engine.set_volume(s.player.volume);
-        s.settings.update(|st| st.volume = s.player.volume);
-        cx.notify();
-    });
 }
 
 /// 播放器事件处理 —— 状态部分（在 store.update 内调用）。
@@ -737,38 +442,15 @@ pub fn handle_player_event_state(
     }
 }
 
-/// 切换浅色/深色主题（带过渡动画，并落盘）。
-pub(crate) fn cycle_theme(
-    store: &Entity<AppStore>,
-    origin: Option<gpui::Point<gpui::Pixels>>,
-    cx: &mut App,
-) {
-    let next = match store.read(cx).settings.get().theme_mode {
-        echo_core::ThemeMode::Dark => echo_core::ThemeMode::Light,
-        _ => echo_core::ThemeMode::Dark,
-    };
-    set_theme_mode(store, next, origin, cx);
-}
-
-/// 指定主题模式：从 `origin`（通常是开关位置）开始的「开关灯」圆形揭示。
-pub(crate) fn set_theme_mode(
-    store: &Entity<AppStore>,
-    mode: echo_core::ThemeMode,
-    origin: Option<gpui::Point<gpui::Pixels>>,
-    cx: &mut App,
-) {
+/// 指定主题模式：落盘并立刻换装。
+///
+/// Lite 只有一条播放条，没有页面级过渡，原来那套「开光灯圆形揭示」动画
+/// （全屏 canvas + 逐帧插值）一并去掉了。
+pub(crate) fn set_theme_mode(store: &Entity<AppStore>, mode: echo_core::ThemeMode, cx: &mut App) {
     if store.read(cx).settings.get().theme_mode == mode {
         return;
     }
     store.update(cx, |s, cx| {
-        // 揭示期间保持旧主题；圆盖满窗口的那一帧切换为新主题
-        let hold = s.theme();
-        s.theme_anim = None;
-        s.theme_reveal = Some(crate::state::ThemeReveal {
-            origin: origin.unwrap_or_else(|| gpui::point(px(64.), px(600.))),
-            hold,
-            started: std::time::Instant::now(),
-        });
         s.settings.update(|st| st.theme_mode = mode);
         s.toast = match mode {
             echo_core::ThemeMode::Dark => "已切换到深色主题".into(),
@@ -777,96 +459,7 @@ pub(crate) fn set_theme_mode(
         };
         cx.notify();
     });
-
-    // 逐帧驱动：圆形扩散 ~550ms（ease-out cubic），结束后收尾换装
-    let anim_store = store.clone();
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        let steps = (crate::theme::THEME_REVEAL_SECS / 0.016).ceil() as usize + 1;
-        for _ in 0..steps {
-            smol::Timer::after(std::time::Duration::from_millis(16)).await;
-            let _ = anim_store.update(cx, |_, cx| cx.notify());
-        }
-        let _ = anim_store.update(cx, |s, cx| {
-            s.theme_reveal = None;
-            s.finish_theme_anim();
-            cx.notify();
-        });
-        // 系统材质（Mica/Acrylic）的明暗跟着主题走，切完主题要重新下发一次属性，
-        // 否则深色 UI 底下还垫着浅色 Mica（或者反过来）
-        let _ = cx.update(|app| apply_backdrop(&anim_store, app));
-    })
-    .detach();
 }
-
-/// 指定背景特效模式（Mica / Acrylic / 跟随系统 / 关闭），落盘并立即应用。
-pub(crate) fn set_backdrop_mode(store: &Entity<AppStore>, mode: echo_core::BackdropMode, cx: &mut App) {
-    // 生效模式与持久化设置都要看：ECHO_BACKDROP 环境变量覆盖时两者可能不同
-    let persisted = store.read(cx).settings.get().backdrop;
-    let effective = store.read(cx).backdrop_effective;
-    if persisted == mode && effective == mode {
-        return;
-    }
-    store.update(cx, |s, cx| {
-        s.backdrop_effective = mode;
-        if s.settings.get().backdrop != mode {
-            s.settings.update(|st| st.backdrop = mode);
-        }
-        s.toast = format!("背景特效：{}", mode.label());
-        cx.notify();
-    });
-    apply_backdrop(store, cx);
-}
-
-/// 把当前设置的背景特效模式应用到主窗口。
-///
-/// 点击回调里只有 `&mut App`（没有 `&mut Window`），所以从 `AppGlobal`
-/// 取出主窗口句柄回到窗口上下文再调 DWM。
-pub(crate) fn apply_backdrop(store: &Entity<AppStore>, cx: &mut App) {
-    let mode = store.read(cx).backdrop_effective;
-    let dark = store.read(cx).settings.get().theme_mode == echo_core::ThemeMode::Dark;
-    let handle = cx.try_global::<crate::state::AppGlobal>()
-        .and_then(|g| g.main_window);
-    if let Some(handle) = handle {
-        let _ = handle.update(cx, |_view, window, _cx| {
-            crate::windows_backdrop::apply(window, mode, dark);
-        });
-        // 材质可见性可能变了（比如关掉特效），主窗口背景要重新配色
-        let _ = store.update(cx, |_, cx| cx.notify());
-    }
-}
-
-/// 最大化 / 还原（点窗口按钮、双击标题栏都走这里）。
-///
-/// **不能在事件派发或绘制过程中同步改窗口**：`ShowWindow`/`SetWindowPos` 会同步派发
-/// `WM_SIZE`，而 gpui 的 resize 回调是 `window.update(...)`，重入时会失败并被
-/// `log_err` 吞掉 —— 结果就是窗口铺开了、布局还是旧的（用户看到的「只是挪到了左上角」）。
-/// 所以延到下一轮消息循环再交给系统处理。
-pub(crate) fn spawn_toggle_maximize(handle: AnyWindowHandle, cx: &mut App) {
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        smol::Timer::after(std::time::Duration::from_millis(60)).await;
-        let before = handle
-            .update(cx, |_, window, _| crate::win::is_maximized(window))
-            .unwrap_or(false);
-        let want = !before;
-        let _ = handle.update(cx, |_, window, _| {
-            crate::win::set_maximized(window, want)
-        });
-        // 万一这条消息没被处理（极少见），按同一个目标补一次：
-        // 注意必须补发「同一个命令」，不能重新取反，否则会把刚生效的操作再翻回去
-        smol::Timer::after(std::time::Duration::from_millis(400)).await;
-        let now = handle
-            .update(cx, |_, window, _| crate::win::is_maximized(window))
-            .unwrap_or(want);
-        if now != want {
-            log::warn!("最大化/还原没生效，补发一次");
-            let _ = handle.update(cx, |_, window, _| {
-                crate::win::set_maximized(window, want)
-            });
-        }
-    })
-    .detach();
-}
-
 
 /// 滚动条轨道上下留白（px）：拇指不会贴到列表最上/最下沿。
 pub(crate) const SB_INSET: f32 = 4.0;
@@ -987,111 +580,3 @@ where
         .child(bar)
 }
 
-/// 按字符数截断并补省略号。
-///
-/// gpui 的 `truncate()` 在临界宽度下可能连「…」一起裁掉（看起来像硬切），
-/// 队列标题这种要紧挨按钮的位置先按字符数截一刀，视觉上更稳。
-pub(crate) fn ellipsize(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(max_chars * 3 + 3);
-    for ch in s.chars().take(max_chars) {
-        out.push(ch);
-    }
-    out.push('…');
-    out
-}
-
-/// 播放量格式化（MV 搜索结果）：105060666 → 1.1亿、9580000 → 958万、12345 → 1.2万。
-fn format_heat(n: u64) -> String {
-    if n >= 100_000_000 {
-        format!("{:.1}亿", n as f64 / 100_000_000.0)
-    } else if n >= 10_000 {
-        format!("{:.0}万", n as f64 / 10_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-/// 模糊匹配：先做子串匹配，不中再按「字符顺序出现」判定（支持跳字，如 `jx` 命中 `江南`…）。
-///
-/// `needle` 必须是小写且已 trim（调用方统一处理）。中文按 char 比较，
-/// 所以「晴 天」「晴天」这种带空格的输入也能命中。
-pub(crate) fn fuzzy_match(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    let hay = haystack.to_lowercase();
-    if hay.contains(needle) {
-        return true;
-    }
-    // 子序列匹配：needle 的每个字符需按顺序出现在 hay 中
-    let mut chars = hay.chars();
-    needle
-        .chars()
-        .all(|n| chars.any(|c| c == n))
-}
-
-
-/// 倍速显示文本（去掉尾随 0：`1.0` → `1`）。
-fn format_speed(s: f64) -> String {
-    let t = format!("{s:.2}");
-    let t = t.trim_end_matches('0').trim_end_matches('.').to_string();
-    if t.is_empty() {
-        "1".to_string()
-    } else {
-        t
-    }
-}
-
-
-/// 设置睡眠定时器（分钟；`None`/0 = 取消）。
-pub fn set_sleep_timer(store: &Entity<AppStore>, minutes: Option<i64>, cx: &mut App) {
-    let until = minutes
-        .filter(|m| *m > 0)
-        .map(|m| chrono::Local::now().timestamp() + m * 60);
-    store.update(cx, |s, cx| {
-        s.sleep_until = until;
-        s.toast = match minutes.unwrap_or(0) {
-            0 => "睡眠定时器已取消".into(),
-            m => format!("{m} 分钟后停止播放"),
-        };
-        cx.notify();
-    });
-    let Some(until) = until else {
-        return;
-    };
-    // 到点淡出并暂停
-    let store_c = store.clone();
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        loop {
-            let left = until - chrono::Local::now().timestamp();
-            if left <= 0 {
-                break;
-            }
-            smol::Timer::after(std::time::Duration::from_secs(left.min(5) as u64)).await;
-        }
-        let _ = cx.update(|app| {
-            let _ = store_c.update(app, |s, cx| {
-                s.sleep_until = None;
-                s.engine.fade_out(0.6);
-                s.player.playing = false;
-                s.toast = "睡眠定时器到点，已停止播放".into();
-                cx.notify();
-            });
-            let store2 = store_c.clone();
-            app.spawn(async move |cx: &mut AsyncApp| {
-                smol::Timer::after(std::time::Duration::from_millis(650)).await;
-                let _ = cx.update(|app| {
-                    let _ = store2.update(app, |s, _| {
-                        s.engine.pause();
-                        s.engine.fade_reset();
-                    });
-                });
-            })
-            .detach();
-        });
-    })
-    .detach();
-}

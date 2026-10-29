@@ -117,10 +117,6 @@ impl CallbackCtl {
         self.paused.store(paused, Ordering::Relaxed);
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
-    }
-
     /// 实时频谱：喂一个样本进 Goertzel 滤波器组（调用方按半采样率节流）。
     ///
     /// 每段窗口走满后取能量（对数刻度 0..1，带峰值衰减），供 UI 画柱。

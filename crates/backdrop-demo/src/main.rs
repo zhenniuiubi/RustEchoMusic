@@ -252,11 +252,11 @@ fn describe(mode: u32) -> &'static str {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_PAINT => {
-            let mut ps = std::mem::zeroed();
+            let mut ps = unsafe { std::mem::zeroed() };
             let hdc = unsafe { windows_sys::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps) };
             if PAINT_BLACK.load(Ordering::Relaxed) != 0 {
                 // 经典 Aero 玻璃约定：扩展边框区域内画纯黑 = 透明
-                let mut rc: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+                let mut rc: windows_sys::Win32::Foundation::RECT = unsafe { std::mem::zeroed() };
                 unsafe {
                     GetClientRect(hwnd, &mut rc);
                     let brush: HBRUSH = CreateSolidBrush(0x00000000);

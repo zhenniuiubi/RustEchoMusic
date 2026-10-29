@@ -244,20 +244,6 @@ fn poll_qr_login(store: &Entity<AppStore>, qr_ver: u64, cx: &mut AsyncApp) {
     .detach();
 }
 
-/// 登录/验证码相关业务错误 → 用户看得懂的中文提示。
-///
-/// `ApiError::Business` 的 Display 是 `api status=0 error_code=20021 msg=` 这种调试串，
-/// 直接丢给用户既看不懂也没法定位，这里按错误码换成人话（未知码仍带上错误码）。
-fn login_error_text(err: &anyhow::Error, prefix: &str) -> String {
-    match echo_api::business_code(err) {
-        Some(20021) => "验证码错误或已失效，请重新获取".into(),
-        Some(20028) => "当前设备被风控拦截，请稍后再试，或改用扫码登录".into(),
-        Some(20006) | Some(20017) | Some(20018) => "登录态已失效，请重新登录".into(),
-        Some(code) => format!("{prefix}（错误码 {code}）"),
-        None => format!("{prefix}：{err}"),
-    }
-}
-
 /// 发送短信验证码。
 pub(crate) fn logout(store: &Entity<AppStore>, cx: &mut App) {
     store.update(cx, |s, cx| {
@@ -466,45 +452,6 @@ pub(crate) fn load_fm(store: &Entity<AppStore>, force: bool, cx: &mut App) {
 
 // ==================== 私人FM 文案 ====================
 
-/// 频道标题（对齐酷狗：红心 / 小众 / 速览 / 电台 Radio）。
-fn fm_mode_title(mode: &str) -> &'static str {
-    match mode {
-        "small" => "小众 Radio",
-        "peak" => "速览 Radio",
-        "radio" => "电台 Radio",
-        _ => "红心 Radio",
-    }
-}
-
-/// 推荐来源文案（对应 `song_pool_id` 0/1/2）。
-fn fm_pool_label(pool: i64) -> &'static str {
-    match pool {
-        1 => "风格",
-        2 => "探索",
-        _ => "口味",
-    }
-}
-
-/// 这一批里出现最多的几位歌手（最多 3 个），用于卡片副标题。
-fn fm_top_artists(songs: &[echo_core::Song]) -> String {
-    let mut names: Vec<String> = Vec::new();
-    for s in songs {
-        if s.artist.is_empty() {
-            continue;
-        }
-        let first = s.artist.split('/').next().unwrap_or("").trim().to_string();
-        if first.is_empty() || names.contains(&first) {
-            continue;
-        }
-        names.push(first);
-        if names.len() >= 3 {
-            break;
-        }
-    }
-    names.join("、")
-}
-
-
 // ==================== 歌词 ====================
 
 /// 加载当前曲目的歌词（切歌时调用）。
@@ -563,29 +510,3 @@ fn key_clone(p: &crate::player::PlayerState) -> String {
 
 // ==================== MV ====================
 
-/// 查当前曲目的 MV（用于「查看 MV」入口）。
-pub(crate) fn load_user_playlists(store: &Entity<AppStore>, cx: &mut App) {
-    if !store.read(cx).session.get().is_valid() {
-        return;
-    }
-    let store_c = store.clone();
-    let client = store.read(cx).client.clone();
-    let task = cx
-        .background_executor()
-        .spawn(async move { run_tokio(client.user_playlists(1, 100)) });
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        let res = task.await;
-        let _ = store_c.update(cx, |s, cx| {
-            s.user_playlists_loaded = true;
-            match res {
-                Ok(list) => {
-                    log::info!("user_playlists: {} 个", list.len());
-                    s.user_playlists = list;
-                }
-                Err(e) => log::warn!("user_playlists ERR {e}"),
-            }
-            cx.notify();
-        });
-    })
-    .detach();
-}

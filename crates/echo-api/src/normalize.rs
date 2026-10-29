@@ -3,8 +3,7 @@
 //! 酷狗不同接口返回的字段名风格不一（大写驼峰 / 小写下划线），
 //! 这里提供多候选字段拾取，对齐原项目 `utils/mappers/*` 的防御式解析思路。
 
-use echo_core::{Album, Artist, Playlist, RankMeta, Song, SongArtist};
-use serde_json::Value;
+use echo_core::{Playlist, Song, SongArtist};
 
 /// 从对象按候选键顺序拾取字符串。
 pub fn pick_str(v: &serde_json::Value, keys: &[&str]) -> String {
@@ -407,78 +406,6 @@ pub fn parse_songs(v: &serde_json::Value) -> Vec<Song> {
     v.as_array().map(|arr| arr.iter().map(parse_song).collect()).unwrap_or_default()
 }
 
-/// 解析音乐云盘列表（`mcloudservice.kugou.com/v1/get_list`）。
-///
-/// 云盘条目的字段和普通歌曲不一样：
-/// - 歌名是 `name`，且带歌手前缀和扩展名，例如 `陈一发儿 - 童话镇.mp3`；
-/// - 歌手只有 `author_name`（不是 `Singers` 数组）；
-/// - 时长是毫秒 `timelen`；
-/// - 还有 `kv_id`（1/2 两套存储）、`hash_std`（标准 hash）。
-pub fn parse_cloud_songs(v: &Value) -> Vec<Song> {
-    let list = v
-        .get("data")
-        .and_then(|d| d.get("list"))
-        .and_then(|l| l.as_array())
-        .or_else(|| v.get("data").and_then(|d| d.as_array()))
-        .or_else(|| v.get("list").and_then(|l| l.as_array()))
-        .or_else(|| v.as_array());
-
-    let Some(list) = list else {
-        return Vec::new();
-    };
-
-    list.iter()
-        .map(|item| {
-            let mut song = parse_song(item);
-            let author = pick_str(item, &["author_name", "singername", "author"]);
-            // `name` = "歌手 - 歌名.mp3"：剥掉扩展名与歌手前缀
-            let raw_name = pick_str(item, &["name", "songname", "filename"]);
-            let cleaned = clean_cloud_name(&raw_name, &author);
-            if !cleaned.is_empty() {
-                song.title = cleaned;
-            }
-            if !author.is_empty() {
-                song.artist = author.clone();
-                song.artists = vec![SongArtist {
-                    id: pick_str(item, &["author_id", "singerid"]),
-                    name: author,
-                    pic: String::new(),
-                }];
-            }
-            song.from_cloud = true;
-            // 云盘 hash 用 kv 里那一条（hash_std 是另一套存储的，不能用）
-            let h = pick_str(item, &["hash"]);
-            if !h.is_empty() {
-                song.hash = h.to_lowercase();
-            }
-            song
-        })
-        .collect()
-}
-
-/// `陈一发儿 - 童话镇.mp3` + 歌手 `陈一发儿` → `童话镇`
-fn clean_cloud_name(name: &str, author: &str) -> String {
-    let mut s = name.trim();
-    // 去扩展名
-    for ext in [".mp3", ".flac", ".m4a", ".wav", ".ape", ".ogg", ".aac"] {
-        if s.to_lowercase().ends_with(ext) {
-            s = &s[..s.len() - ext.len()];
-            break;
-        }
-    }
-    let s = s.trim();
-    // 去 "歌手 - " 前缀
-    if !author.is_empty() {
-        for sep in [" - ", "-", " – "] {
-            let prefix = format!("{author}{sep}");
-            if let Some(rest) = s.strip_prefix(&prefix) {
-                return rest.trim().to_string();
-            }
-        }
-    }
-    s.to_string()
-}
-
 /// 解析歌单（special_recommend / get_list_info 等形态）。
 pub fn parse_playlist(v: &serde_json::Value) -> Playlist {
     let cover_raw = pick_str(
@@ -529,86 +456,6 @@ pub fn parse_playlist(v: &serde_json::Value) -> Playlist {
 pub fn parse_playlists(v: &serde_json::Value) -> Vec<Playlist> {
     v.as_array()
         .map(|arr| arr.iter().map(parse_playlist).collect())
-        .unwrap_or_default()
-}
-
-/// 解析专辑。
-pub fn parse_album(v: &serde_json::Value) -> Album {
-    let cover_raw = pick_str(
-        v,
-        &["sizable_cover", "img", "imgurl", "Image", "pic", "cover"],
-    );
-    Album {
-        id: pick_str(v, &["albumid", "AlbumID", "album_id", "id"]),
-        name: pick_str(v, &["albumname", "AlbumName", "album_name", "name"]),
-        // 320 → 200：歌单/专辑卡展示约 180px，位图内存按 w*h*4 算，省 ~2.5 倍
-        // 320 → 200：卡片展示约 180px，位图按 w*h*4 常驻，尺寸减半省 ~2.5 倍
-        pic: normalize_cover(&cover_raw, 200),
-        intro: pick_str(v, &["album_intro", "intro", "desc"]),
-        singer_name: pick_str(v, &["author_name", "SingerName", "singername", "singer_name"]),
-        singer_id: pick_str(v, &["singerid", "SingerID", "singer_id", "author_id"]),
-        publish_time: pick_str(v, &["publishtime", "PublishTime", "publish_time"]),
-        song_count: pick_i64(v, &["songcount", "SongCount", "song_count"]).max(0) as u64,
-        play_count: pick_i64(v, &["playcount", "play_count"]).max(0) as u64,
-    }
-}
-
-/// 解析歌手。
-pub fn parse_artist(v: &serde_json::Value) -> Artist {
-    // 搜索歌手接口（/v1/search/author）用 PascalCase：AuthorId / AuthorName / Avatar
-    let cover_raw = pick_str(
-        v,
-        &["imgurl", "sizable_cover", "Avatar", "avatar", "Image", "pic"],
-    );
-    Artist {
-        id: pick_str(v, &["AuthorId", "singerid", "SingerID", "author_id", "id"]),
-        name: pick_str(v, &["AuthorName", "singername", "SingerName", "author_name", "name"]),
-        pic: normalize_cover(&cover_raw, 160),
-        intro: pick_str(v, &["intro", "desc"]),
-        song_count: pick_i64(
-            v,
-            &["AudioCount", "songcount", "SongCount", "song_count", "worksnum"],
-        )
-        .max(0) as u64,
-        album_count: pick_i64(v, &["AlbumCount", "albumcount", "AlbumCount", "album_count"]).max(0)
-            as u64,
-        mv_count: pick_i64(v, &["VideoCount", "mvcount", "mv_count"]).max(0) as u64,
-        fans_count: pick_i64(v, &["FansNum", "fanscount", "fans_num"]).max(0) as u64,
-    }
-}
-
-/// 解析榜单。
-pub fn parse_rank(v: &serde_json::Value) -> RankMeta {
-    RankMeta {
-        id: pick_str(v, &["id", "rankid", "rank_id"]),
-        name: pick_str(v, &["name", "rankname", "rank_name"]),
-        pic: normalize_cover(&pick_str(v, &["imgurl", "pic", "Image", "cover"]), 240),
-        update_frequency: pick_str(v, &["updatefrequency", "update_frequency", "retentate"]),
-        description: pick_str(v, &["description", "desc", "intro"]),
-        rank_cid: pick_str(v, &["rank_cid", "rankcid", "cid"]),
-        // `/rank/audio` 的 rank_id 必须用 `rankid`（列表项 `id` 传进去只回 1 首）
-        req_rank_id: {
-            let r = pick_str(v, &["rankid", "rank_id"]);
-            if r.is_empty() {
-                pick_str(v, &["id"])
-            } else {
-                r
-            }
-        },
-    }
-}
-
-/// 解析歌手列表（搜索 / 歌手 Tab）。
-pub fn parse_artist_list(v: &serde_json::Value) -> Vec<Artist> {
-    v.as_array()
-        .map(|arr| arr.iter().map(parse_artist).collect())
-        .unwrap_or_default()
-}
-
-/// 解析专辑列表。
-pub fn parse_albums(v: &serde_json::Value) -> Vec<echo_core::Album> {
-    v.as_array()
-        .map(|arr| arr.iter().map(parse_album).collect())
         .unwrap_or_default()
 }
 

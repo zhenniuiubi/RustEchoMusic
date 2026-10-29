@@ -8,14 +8,14 @@ pub mod session;
 pub mod settings;
 
 pub use device::DeviceIdentity;
-pub use library::{Library, LibraryStore, ListeningStats, PlayLog};
+pub use library::{Library, LibraryStore, PlayLog};
 pub use queue::{QueueStore, SavedQueue};
 pub use models::{
-    Album, Artist, Lyric, LyricLine, LyricWord, MvInfo, MvMeta, Playlist, RankMeta, Song,
-    SongArtist, SongTag, User,
+    Lyric, LyricLine, LyricWord, Playlist, Song,
+    SongArtist, User,
 };
 pub use session::{Session, SessionStore};
-pub use settings::{BackdropMode, PlayMode, Settings, SettingsStore, ThemeMode};
+pub use settings::{PlayMode, Settings, SettingsStore, ThemeMode};
 
 use std::path::PathBuf;
 

@@ -3,7 +3,6 @@
 // release 构建不弹出控制台窗口；debug 构建保留，方便看日志
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod amll;
 mod assets;
 mod icons;
 mod liked;
@@ -11,22 +10,19 @@ mod lite;
 mod player;
 mod state;
 mod theme;
-mod desktop;
 mod smtc;
 mod taskbar;
 mod ui;
 mod actions;
 mod vip;
 mod win;
-mod windows_backdrop;
 
 use assets::{Assets, ReqwestHttpClient};
 use echo_audio::{AudioEngine, PlayerEvent};
 use echo_core::{DeviceIdentity, SettingsStore};
 use gpui::prelude::*;
 use gpui::*;
-use parking_lot::Mutex;
-use state::{AppGlobal, AppStore};
+use state::AppStore;
 use std::sync::Arc;
 
 /// 日志过滤器：只压掉「已知、且上游已自行降级」的噪音，其它照旧透传。
@@ -184,21 +180,10 @@ fn main() {
 
             // ===== 状态 =====
             // 进度条 bounds 的共享槽：canvas 写入、鼠标事件读取（必须是同一个 Arc）
-            let progress_bounds = Arc::new(Mutex::new(None));
-            let volume_bounds = Arc::new(Mutex::new(None));
             let volume = settings.get().volume;
             let play_mode = settings.get().play_mode;
-            // 背景特效模式：ECHO_BACKDROP=system|mica|acrylic|off 可临时覆盖
-            // （只影响本次运行，不写回设置文件，供自动化测试用）。
-            let backdrop_mode = match std::env::var("ECHO_BACKDROP") {
-                Ok(v) => windows_backdrop::parse_mode(&v).unwrap_or_else(|| settings.get().backdrop),
-                Err(_) => settings.get().backdrop,
-            };
-            // 系统材质（Mica/Acrylic）的明暗要跟 App 主题走，见 windows_backdrop::apply
-            let _dark_theme = settings.get().theme_mode == echo_core::ThemeMode::Dark;
             let store = cx.new(|_| AppStore {
                 settings,
-                backdrop_effective: backdrop_mode,
                 client: client.clone(),
                 engine: engine.clone(),
                 player: player::PlayerState {
@@ -216,8 +201,6 @@ fn main() {
                     loaded: false,
                     ..Default::default()
                 },
-                user_playlists: Vec::new(),
-                user_playlists_loaded: false,
                 session: session_store,
                 user: saved_user,
                 login: Default::default(),
@@ -227,7 +210,6 @@ fn main() {
                 lyric: None,
                 lyric_key: String::new(),
                 lyric_loading: false,
-                sleep_until: None,
                 fm: Arc::new(Vec::new()),
                 fm_mode: "peak".into(),
                 fm_pool: 0,
@@ -247,10 +229,6 @@ fn main() {
                 seek_target: 0.0,
                 toast: String::new(),
                 position_at: std::time::Instant::now(),
-                theme_anim: None,
-                theme_reveal: None,
-                progress_bounds_slot: progress_bounds.clone(),
-                volume_bounds_slot: volume_bounds.clone(),
                 vip_claiming: false,
                 vip_note: String::new(),
                 session_expired: false,
@@ -415,16 +393,6 @@ fn main() {
                 .detach();
             }
 
-            // 全局句柄
-            cx.set_global(AppGlobal {                store: store.downgrade(),
-                main_window: Some(window.into()),
-            });
-
-            // 按设置恢复桌面歌词（浮窗之前只能从设置页手动开，重启即丢）
-            if store.read(cx).settings.get().desktop_lyric {
-                crate::desktop::toggle_desktop_lyric(&store, cx);
-            }
-
             // ===== 播放器事件桥接（std mpsc → smol channel → 主线程） =====
             let (ui_tx, ui_rx) = smol::channel::unbounded::<PlayerEvent>();
             std::thread::Builder::new()
@@ -460,8 +428,8 @@ fn main() {
                     if let Some((rid, song)) = to_load {
                         let _ = cx.update(|app| ui::spawn_resolve(&event_store, rid, song, app));
                     }
-                    // 桌面歌词 / mini 播放器是独立窗口，进度变了要跟着重绘
-                    let _ = cx.update(|app| crate::desktop::refresh_float_windows(app));
+                    // Lite 播放条是独立窗口，进度变了要跟着重绘
+                    let _ = cx.update(|app| crate::lite::refresh(app));
                 }
             })
             .detach();
@@ -506,32 +474,23 @@ fn main() {
                 .detach();
             }
 
-            // 第三期：登录后拉取自建歌单（侧栏显示 + 新建/删除）
-            crate::actions::load_user_playlists(&store, cx);
-
-            // 动画泵：加载态（旋转）/ 停在歌词页或开着桌面歌词且在播放时（AMLL 扫光 ~30fps）重绘
+            // 动画泵：有加载态（旋转圈）时按 30fps 重绘，其余时候慢速轮询
             {
                 let pump_store = store.clone();
                 cx.spawn(async move |cx: &mut gpui::AsyncApp| {
                     loop {
-                        let (loading, lyric_anim) = pump_store
-                            .read_with(cx, |s, _| {
-                                (
-                                    s.any_loading(),
-                                    s.player.playing && crate::desktop::lyric_window_open(),
-                                )
-                            })
-                            .unwrap_or((false, false));
-                        if loading || lyric_anim {
+                        let loading = pump_store
+                            .read_with(cx, |s, _| s.any_loading())
+                            .unwrap_or(false);
+                        if loading {
                             let _ = pump_store.update(cx, |_, cx| cx.notify());
-                            if lyric_anim {
-                                // 桌面歌词浮窗跟着刷（独立窗口不吃主窗口重绘）
-                                let _ = cx.update(|app| crate::desktop::refresh_float_windows(app));
-                            }
+                            let _ = cx.update(|app| crate::lite::refresh(app));
                         }
-                        smol::Timer::after(std::time::Duration::from_millis(
-                            if loading || lyric_anim { 33 } else { 300 },
-                        ))
+                        smol::Timer::after(std::time::Duration::from_millis(if loading {
+                            33
+                        } else {
+                            300
+                        }))
                         .await;
                     }
                 })
@@ -569,7 +528,7 @@ fn main() {
                             } else {
                                 echo_core::ThemeMode::Dark
                             };
-                            ui::set_theme_mode(&smoke_store, next, None, app);
+                            ui::set_theme_mode(&smoke_store, next, app);
                         });
                     }
                 })

@@ -39,10 +39,6 @@ impl PlayerState {
         self.index.and_then(|i| self.queue.get_mut(i))
     }
 
-    pub fn is_current(&self, song: &Song) -> bool {
-        self.current().map(|c| c.key() == song.key()).unwrap_or(false)
-    }
-
     /// 设置队列并从 start_index 开始播放。
     pub fn set_queue(&mut self, title: &str, songs: Vec<Song>, start: usize) {
         self.queue = songs;
@@ -50,19 +46,6 @@ impl PlayerState {
         self.index = if self.queue.is_empty() { None } else { Some(start.min(self.queue.len() - 1)) };
         self.loaded = false;
         // 换队列默认不是 FM；`play_from` 会在来源是 FM 时把它置回来
-        self.fm_queue = false;
-    }
-
-    /// 清空队列并停止播放。
-    pub fn clear_queue(&mut self) {
-        self.queue.clear();
-        self.queue_title.clear();
-        self.index = None;
-        self.playing = false;
-        self.loading = false;
-        self.loaded = false;
-        self.position = 0.0;
-        self.duration = 0.0;
         self.fm_queue = false;
     }
 

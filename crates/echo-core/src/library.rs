@@ -4,7 +4,7 @@
 //! UI 每帧取列表只是引用计数递增，不再深拷贝上千首歌。
 
 use crate::models::Song;
-use chrono::{TimeZone, Timelike};
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -53,59 +53,8 @@ pub struct PlayLog {
     pub ts: i64,
 }
 
-/// 听歌统计（七日趋势 / 时段偏好 / 常听歌手）。
-#[derive(Debug, Clone, Default)]
-pub struct ListeningStats {
-    /// 最近 7 天，每天播放次数（下标 0 = 6 天前，6 = 今天）
-    pub days: [u32; 7],
-    /// 24 个小时段的播放次数
-    pub hours: [u32; 24],
-    /// 常听歌手（前 5 名）
-    pub top_artists: Vec<(String, u32)>,
-    pub total: u32,
-}
 
 impl Library {
-    /// 由播放流水算出统计（纯本地计算，不联网）。
-    pub fn listening_stats(&self) -> ListeningStats {
-        let mut days = [0u32; 7];
-        let mut hours = [0u32; 24];
-        let mut artists: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        let local_now = chrono::Local::now();
-        let today = local_now
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .and_then(|d| {
-                chrono::Local
-                    .from_local_datetime(&d)
-                    .single()
-                    .map(|t| t.timestamp())
-            })
-            .unwrap_or_else(|| local_now.timestamp());
-
-        for p in &self.plays {
-            let diff_days = (today - p.ts) / 86_400;
-            if (0..7).contains(&diff_days) {
-                days[(6 - diff_days) as usize] += 1;
-            }
-            if let Some(t) = chrono::DateTime::from_timestamp(p.ts, 0) {
-                let h = t.with_timezone(&chrono::Local).hour() as usize;
-                hours[h.min(23)] += 1;
-            }
-            if !p.artist.is_empty() {
-                *artists.entry(p.artist.clone()).or_default() += 1;
-            }
-        }
-        let mut top: Vec<(String, u32)> = artists.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1));
-        top.truncate(5);
-        ListeningStats {
-            days,
-            hours,
-            top_artists: top,
-            total: self.plays.len() as u32,
-        }
-    }
 }
 
 /// 曲库存储。
@@ -183,25 +132,6 @@ impl LibraryStore {
             let keep = data.plays.len() - 3000;
             data.plays.drain(..keep);
         }
-        let snapshot = data.clone();
-        drop(guard);
-        self.persist(&snapshot);
-    }
-
-    /// 只清空播放流水（统计清零，保留历史列表）。
-    pub fn clear_plays(&self) {
-        let mut guard = self.data.lock().unwrap();
-        let data = Arc::make_mut(&mut *guard);
-        data.plays.clear();
-        let snapshot = data.clone();
-        drop(guard);
-        self.persist(&snapshot);
-    }
-
-    pub fn clear_history(&self) {
-        let mut guard = self.data.lock().unwrap();
-        let data = Arc::make_mut(&mut *guard);
-        data.history = Arc::new(Vec::new());
         let snapshot = data.clone();
         drop(guard);
         self.persist(&snapshot);

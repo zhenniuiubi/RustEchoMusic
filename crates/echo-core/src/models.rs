@@ -90,57 +90,10 @@ pub struct Song {
     pub from_cloud: bool,
 }
 
-/// 歌曲权限标签（对齐原项目 `utils/song.ts`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SongTag {
-    /// 需要 VIP（privilege=10 & pay_type=3）
-    Vip,
-    /// 需要购买（privilege=10 & pay_type=2）
-    Paid,
-    /// 无版权（privilege=5）
-    NoCopyright,
-    /// 音源不可用（privilege=40）
-    Unavailable,
-}
-
 impl Song {
     /// 需要 VIP 才能播放。
     pub fn is_vip(&self) -> bool {
         self.privilege == 10 && self.pay_type != 2
-    }
-
-    /// 需要购买才能播放。
-    pub fn is_paid(&self) -> bool {
-        self.privilege == 8 || (self.privilege == 10 && self.pay_type == 2)
-    }
-
-    /// 无版权。
-    pub fn is_no_copyright(&self) -> bool {
-        self.privilege == 5
-    }
-
-    /// 音源不可用。
-    pub fn is_unavailable(&self) -> bool {
-        self.privilege == 40
-    }
-
-    /// 当前歌曲的权限标签（无则空）。
-    ///
-    /// 列表接口往往只给 `privilege`、`pay_type` 为 0，因此以 privilege 为主：
-    /// 0 免费 / 5 无版权 / 8 需购买 / 10 需 VIP（pay_type=2 时是购买）/ 40 不可用。
-    pub fn privilege_tag(&self) -> Option<SongTag> {
-        match self.privilege {
-            40 => Some(SongTag::Unavailable),
-            5 => Some(SongTag::NoCopyright),
-            10 => Some(if self.pay_type == 2 { SongTag::Paid } else { SongTag::Vip }),
-            8 => Some(SongTag::Paid),
-            _ => None,
-        }
-    }
-
-    /// 是否可播放（未登录时非 VIP 歌曲走 CDN 也能播）。
-    pub fn playable(&self) -> bool {
-        !self.is_unavailable() && !(self.hash.is_empty() && self.audio_url.is_empty())
     }
 
     /// 取播放地址时要传的 `album_audio_id`（= 酷狗 MixSongID）。
@@ -212,62 +165,8 @@ impl Playlist {
     }
 }
 
-/// 专辑模型（对齐 `Album`）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Album {
-    pub id: String,
-    pub name: String,
-    pub pic: String,
-    #[serde(default)]
-    pub intro: String,
-    #[serde(default)]
-    pub singer_name: String,
-    #[serde(default)]
-    pub singer_id: String,
-    #[serde(default)]
-    pub publish_time: String,
-    #[serde(default)]
-    pub song_count: u64,
-    #[serde(default)]
-    pub play_count: u64,
-}
 
-/// 歌手模型（对齐 `Artist`）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Artist {
-    pub id: String,
-    pub name: String,
-    pub pic: String,
-    #[serde(default)]
-    pub intro: String,
-    #[serde(default)]
-    pub song_count: u64,
-    #[serde(default)]
-    pub album_count: u64,
-    #[serde(default)]
-    pub mv_count: u64,
-    #[serde(default)]
-    pub fans_count: u64,
-}
 
-/// 排行榜元信息（对齐 `RankMeta`）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RankMeta {
-    pub id: String,
-    pub name: String,
-    pub pic: String,
-    #[serde(default)]
-    pub update_frequency: String,
-    #[serde(default)]
-    pub description: String,
-    /// 榜单分类 id（`/openapi/kmr/v2/rank/audio` 需要 rank_cid）
-    #[serde(default)]
-    pub rank_cid: String,
-    /// 请求榜单歌曲时用的 `rank_id`（酷狗 `/ocean/v6/rank/list` 里的 `rankid`，
-    /// 与列表项 `id` 不同；传错只会返回 1 首）。
-    #[serde(default)]
-    pub req_rank_id: String,
-}
 
 /// 用户信息（对齐 `User`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -344,34 +243,4 @@ impl Lyric {
     }
 }
 
-/// MV 信息（`/kmr/v1/audio/mv`）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MvInfo {
-    pub mvhash: String,
-    pub songid: String,
-    pub title: String,
-    pub singer: String,
-    /// 封面（{size} 占位已替换为 400）
-    pub thumb: String,
-    pub hd_pic: String,
-    pub duration: u64,
-    pub hit: u64,
-    pub desc: String,
-}
 
-/// MV 搜索结果条目（`/v1/search/mv`，complexsearch）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MvMeta {
-    pub mvhash: String,
-    pub mv_id: String,
-    pub title: String,
-    pub singer: String,
-    /// 秒
-    pub duration: u64,
-    /// 播放量（HistoryHeat）
-    pub heat: u64,
-    /// 清晰度标记（如 "1080P"）
-    pub quality: String,
-    /// 发布日期（如 2003-07-31）
-    pub publish_date: String,
-}

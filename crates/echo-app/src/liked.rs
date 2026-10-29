@@ -7,7 +7,6 @@
 use std::sync::Arc;
 use crate::state::AppStore;
 use crate::ui;
-use crate::ui::run_tokio;
 use gpui::{App, AsyncApp, Entity};
 
 /// 加载远端红心歌单（登录后调用）。
@@ -201,81 +200,3 @@ pub(crate) fn toggle_like(store: &Entity<AppStore>, song: &echo_core::Song, cx: 
 
 // ==================== 歌单管理（第三期） ====================
 
-/// 新建一个云歌单（名字按「我的歌单 N」自动命名），成功后刷新侧栏歌单。
-pub(crate) fn create_playlist(store: &Entity<AppStore>, cx: &mut App) {
-    let logged_in = store.read(cx).session.get().is_valid();
-    if !logged_in {
-        store.update(cx, |s, cx| {
-            s.toast = "需要先登录酷狗账号".into();
-            cx.notify();
-        });
-        return;
-    }
-    let count = store.read(cx).user_playlists.len();
-    let name = format!("我的歌单 {}", count + 1);
-    let store_c = store.clone();
-    let client = store.read(cx).client.clone();
-    let name_c = name.clone();
-    let task = cx
-        .background_executor()
-        .spawn(async move { run_tokio(client.playlist_add(&name_c, false, "", "", "")) });
-    store.update(cx, |s, cx| {
-        s.toast = format!("正在新建「{name}」…");
-        cx.notify();
-    });
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        let res = task.await;
-        let _ = cx.update(|app| {
-            let ok = store_c
-                .update(app, |s, cx| {
-                    let ok = res.is_ok();
-                    match &res {
-                        Ok(()) => s.toast = format!("已新建歌单「{name}」"),
-                        Err(e) => {
-                            log::warn!("新建歌单失败：{e}");
-                            s.toast = format!("新建歌单失败：{e}");
-                        }
-                    }
-                    cx.notify();
-                    ok
-                });
-            if ok {
-                crate::actions::load_user_playlists(&store_c, app);
-            }
-        });
-    })
-    .detach();
-}
-
-/// 删除（或取消收藏）一个歌单。
-pub(crate) fn delete_playlist(store: &Entity<AppStore>, listid: &str, name: &str, cx: &mut App) {
-    let store_c = store.clone();
-    let client = store.read(cx).client.clone();
-    let listid = listid.to_string();
-    let name = name.to_string();
-    let task = cx
-        .background_executor()
-        .spawn(async move { run_tokio(client.playlist_delete(&listid)) });
-    cx.spawn(async move |cx: &mut AsyncApp| {
-        let res = task.await;
-        let _ = cx.update(|app| {
-            let ok = store_c
-                .update(app, |s, cx| {
-                    let ok = res.is_ok();
-                    match &res {
-                        Ok(()) => s.toast = format!("已删除歌单「{name}」"),
-                        Err(e) => {
-                            log::warn!("删除歌单失败：{e}");
-                            s.toast = format!("删除歌单失败：{e}");
-                        }
-                    }
-                    cx.notify();
-                    ok
-                });
-            if ok {
-                crate::actions::load_user_playlists(&store_c, app);
-            }
-        });
-    })
-    .detach();
-}

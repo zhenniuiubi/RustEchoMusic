@@ -122,16 +122,6 @@ pub fn is_auth_expired(err: &anyhow::Error) -> bool {
     )
 }
 
-/// 取业务错误码（网络/解析错误返回 `None`）。
-///
-/// UI 侧据此把 `api status=0 error_code=20021 msg=` 这类原始串换成中文提示。
-pub fn business_code(err: &anyhow::Error) -> Option<i64> {
-    match err.downcast_ref::<ApiError>() {
-        Some(ApiError::Business { error_code, .. }) => Some(*error_code),
-        _ => None,
-    }
-}
-
 /// 登录态。
 #[derive(Debug, Clone, Default)]
 pub struct AuthState {
@@ -413,11 +403,6 @@ impl KuGouClient {
         Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 
-    /// 返回原始字节：cloudlist 之类的接口响应是 AES 密文，不能当 UTF-8 处理。
-    pub async fn request_bytes(&self, spec: RequestSpec) -> Result<Vec<u8>, ApiError> {
-        self.send_request(spec).await
-    }
-
     /// 网关请求：签名 → 发送 → 解析 JSON → 业务状态判断。
     pub async fn request(&self, spec: RequestSpec) -> Result<Value, ApiError> {
         let bytes = self.send_request(spec).await?;
@@ -551,11 +536,6 @@ impl KuGouClient {
             .await
             .map_err(|e| ApiError::Network(e.to_string()))?;
         resp.text().await.map_err(|e| ApiError::Network(e.to_string()))
-    }
-
-    /// 发送原始请求，返回原始响应字节（不解 JSON）。
-    pub async fn send_raw(&self, spec: RequestSpec) -> Result<Vec<u8>, ApiError> {
-        self.raw_request(spec).await
     }
 
     /// 发送原始请求，返回原始响应字节（不解 JSON）。

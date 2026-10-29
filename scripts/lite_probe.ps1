@@ -2,7 +2,8 @@ param(
   [string]$Name = "lite",
   [int]$Wait = 8000,
   [string]$Clicks = "",
-  [string]$Smoke = ""
+  [string]$Smoke = "",
+  [string]$Exe = "D:\RustEchoMusic\target\debug\EchoMusicLite.exe"
 )
 $ErrorActionPreference = "Stop"
 Add-Type @"
@@ -38,7 +39,7 @@ public class LG {
 
 $env:ECHO_LOG_FILE = "D:\RustEchoMusic\.workbuddy\shot_app.log"
 if ($Smoke -ne "") { $env:ECHO_SMOKE = $Smoke } else { Remove-Item Env:ECHO_SMOKE -ErrorAction SilentlyContinue }
-$p = Start-Process -FilePath "D:\RustEchoMusic\target\debug\echo-music.exe" -PassThru
+$p = Start-Process -FilePath $Exe -PassThru
 Start-Sleep -Milliseconds $Wait
 $h = [LG]::Find([uint32]$p.Id)
 if ($h -eq [IntPtr]::Zero) { Stop-Process -Id $p.Id -Force; Write-Output "NO_WINDOW"; exit 1 }

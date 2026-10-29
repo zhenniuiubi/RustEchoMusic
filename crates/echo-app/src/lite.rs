@@ -242,6 +242,7 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
                 }
                 spawn_hover_poll(e.downgrade(), cx);
                 spawn_anim_pump(e.downgrade(), cx);
+                spawn_smoke_panels(handle, cx);
             }
             Some(handle.into())
         }
@@ -253,6 +254,36 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
 }
 
 // ==================== 轮询 / 动画 ====================
+
+/// 自检钩子：`ECHO_SMOKE=panel` 时依次展开各下方面板并打印窗口尺寸。
+///
+/// 远程会话 / CI 里鼠标事件不可用（`GetCursorPos` 会被拒），靠它回归面板高度、
+/// 列表渲染与窗口 resize 这条链路；正常启动时这个任务直接返回。
+fn spawn_smoke_panels(handle: WindowHandle<LiteView>, cx: &mut App) {
+    if std::env::var("ECHO_SMOKE").ok().as_deref() != Some("panel") {
+        return;
+    }
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        for (name, panel) in [
+            ("queue", Panel::Queue),
+            ("lyric", Panel::Lyric),
+            ("account", Panel::Account),
+            ("none", Panel::None),
+        ] {
+            smol::Timer::after(std::time::Duration::from_millis(1500)).await;
+            let _ = handle.update(cx, |v: &mut LiteView, window, cx| {
+                v.set_panel(panel, window, cx);
+                let b = window.bounds();
+                log::warn!(
+                    "[smoke-panel] {name} -> {}x{}",
+                    f32::from(b.size.width),
+                    f32::from(b.size.height)
+                );
+            });
+        }
+    })
+    .detach();
+}
 
 /// gpui 0.2.2 的 Windows 端不处理 `WM_MOUSELEAVE`，鼠标移出窗口后
 /// `on_hover(false)` 不会回调 → 每 120ms 用光标位置校正一次。
@@ -1142,11 +1173,15 @@ impl LiteView {
     }
 
     /// 队列 / 我最喜爱 共用的一行（四列：序号 / 歌名 / 歌手 / 时长）。
+    ///
+    /// `from_favorites` 决定点击行为：队列里点行 = 在当前队列内跳转（`play_index`），
+    /// 收藏里点行 = 先把队列换成收藏列表再播（否则会播到队列里同下标的另一首）。
     fn list_row(
         store: &Entity<AppStore>,
         ix: usize,
         song: &echo_core::Song,
         active: bool,
+        from_favorites: bool,
         theme: &crate::theme::Theme,
     ) -> AnyElement {
         let st = store.clone();
@@ -1168,7 +1203,11 @@ impl LiteView {
             })
             // 面板容器上挂着 on_mouse_up（滚动条收尾），子元素的 on_click 拿不到 up
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                crate::ui::play_index(&st, ix, cx)
+                if from_favorites {
+                    crate::ui::play_from(&st, crate::ui::PlaySource::Favorites, ix, cx);
+                } else {
+                    crate::ui::play_index(&st, ix, cx);
+                }
             })
             .child(
                 div()
@@ -1264,8 +1303,8 @@ impl LiteView {
         let (rows, total) = {
             let s = self.store.read(cx);
             if self.fav_mode {
-                let v = s.library.get().favorites.to_vec();
-                (v.clone(), v.len())
+                let v = s.favorites_source();
+                (v.as_ref().clone(), v.len())
             } else {
                 (s.player.queue.clone(), s.player.queue.len())
             }
@@ -1323,11 +1362,22 @@ impl LiteView {
             let rows_store = store.clone();
             uniform_list("lite-queue-list", count, move |range, _w, cx: &mut App| {
                 let theme = rows_store.read(cx).theme();
-                let active_ix = rows_store.read(cx).player.index;
+                let (active_ix, cur_key) = {
+                    let st = rows_store.read(cx);
+                    (
+                        st.player.index,
+                        st.player.current().map(|c| c.key()),
+                    )
+                };
                 range
                     .map(|ix| match rows.get(ix) {
                         Some(song) => {
-                            Self::list_row(&rows_store, ix, song, active_ix == Some(ix), &theme)
+                            let active = if fav_mode {
+                                cur_key.as_deref() == Some(song.key().as_str())
+                            } else {
+                                active_ix == Some(ix)
+                            };
+                            Self::list_row(&rows_store, ix, song, active, fav_mode, &theme)
                         }
                         None => div().h(px(ROW_H)).into_any_element(),
                     })
@@ -1446,9 +1496,8 @@ impl LiteView {
     fn fav_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.store.read(cx).theme();
         let (rows, total) = {
-            let s = self.store.read(cx);
-            let lib = s.library.get();
-            (lib.favorites.to_vec(), lib.favorites.len())
+            let v = self.store.read(cx).favorites_source();
+            (v.as_ref().clone(), v.len())
         };
         let store = self.store.clone();
         let count = rows.len();
@@ -1514,7 +1563,9 @@ impl LiteView {
                         .cursor_pointer()
                         .bg(theme.accent)
                         .hover(|el| el.opacity(0.9))
-                        .on_click(move |_, _, cx| crate::ui::play_index(&st, 0, cx))
+                        .on_click(move |_, _, cx| {
+                            crate::ui::play_from(&st, crate::ui::PlaySource::Favorites, 0, cx)
+                        })
                         .child(crate::ui::icon("icons/mini-play.svg", 10., hsla(0xffffff)))
                         .child(
                             div()
@@ -1539,11 +1590,12 @@ impl LiteView {
             let rows_store = store.clone();
             uniform_list("lite-fav-list", count, move |range, _w, cx: &mut App| {
                 let theme = rows_store.read(cx).theme();
-                let active_ix = rows_store.read(cx).player.index;
+                let cur_key = rows_store.read(cx).player.current().map(|c| c.key());
                 range
                     .map(|ix| match rows.get(ix) {
                         Some(song) => {
-                            Self::list_row(&rows_store, ix, song, active_ix == Some(ix), &theme)
+                            let active = cur_key.as_deref() == Some(song.key().as_str());
+                            Self::list_row(&rows_store, ix, song, active, true, &theme)
                         }
                         None => div().h(px(ROW_H)).into_any_element(),
                     })
@@ -1646,7 +1698,7 @@ impl LiteView {
                 ses.nickname.clone(),
                 ses.vip_type,
                 ses.vip_end_time,
-                s.library.get().favorites.len(),
+                s.favorites_source().len(),
             )
         };
         let store = self.store.clone();

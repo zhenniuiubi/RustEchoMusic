@@ -83,10 +83,6 @@ impl SessionStore {
         self.update(|s| s.pic = pic.to_string());
     }
 
-    pub fn update_vip_type(&self, vip_type: i64) {
-        self.update(|s| s.vip_type = vip_type);
-    }
-
     /// 同时更新 VIP 等级与到期时间（拉过会员详情后调用）。
     pub fn update_vip(&self, vip_type: i64, vip_end_time: i64) {
         self.update(|s| {

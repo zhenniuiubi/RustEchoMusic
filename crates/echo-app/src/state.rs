@@ -3,7 +3,7 @@ use crate::player::PlayerState;
 use crate::theme::{parse_color, Theme};
 use echo_api::KuGouClient;
 use echo_audio::AudioEngine;
-use echo_core::{Lyric, Playlist, SettingsStore, Song};
+use echo_core::{Lyric, SettingsStore, Song};
 use gpui::Global;
 use std::sync::Arc;
 
@@ -36,17 +36,9 @@ impl Default for LoginForm {
 
 pub struct AppStore {
     pub settings: SettingsStore,
-    /// 当前生效的背景特效模式：启动时 = 设置值（可被 ECHO_BACKDROP 环境变量
-    /// 覆盖），切换设置时由 `set_backdrop_mode` 同步更新。
-    /// UI 配色和 DWM 应用都必须读它，否则环境变量覆盖时会出现
-    /// 「DWM 已关材质、UI 还在半透明」的壁纸透底。
-    pub backdrop_effective: echo_core::BackdropMode,
     pub client: Arc<KuGouClient>,
     pub engine: Arc<AudioEngine>,
     pub player: PlayerState,
-    /// 登录用户的自建歌单（侧栏「自建歌单」）
-    pub user_playlists: Vec<Playlist>,
-    pub user_playlists_loaded: bool,
     /// 登录会话
     pub session: echo_core::SessionStore,
     /// 当前登录用户
@@ -63,8 +55,6 @@ pub struct AppStore {
     /// 歌词归属的歌曲 key（避免切歌时串台）
     pub lyric_key: String,
     pub lyric_loading: bool,
-    /// 睡眠定时器的截止时刻（unix 秒），None = 未设置
-    pub sleep_until: Option<i64>,
     /// 私人 FM 当前这一批歌曲
     pub fm: Arc<Vec<Song>>,
     /// 私人 FM 频道：normal 红心 / small 小众 / peak 速览 / radio 电台
@@ -104,14 +94,6 @@ pub struct AppStore {
     pub toast: String,
     /// 最近一次 Position 事件的时间（歌词扫光按耗时外推，30fps 平滑推进）
     pub position_at: std::time::Instant,
-    /// 播放条进度条 bounds（canvas 记录，点击 seek 用）
-    pub progress_bounds_slot: std::sync::Arc<parking_lot::Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
-    /// 音量滑条 bounds（canvas 记录）
-    pub volume_bounds_slot: std::sync::Arc<parking_lot::Mutex<Option<gpui::Bounds<gpui::Pixels>>>>,
-    /// 主题切换动画：切换前的配色 + 起始时间
-    pub theme_anim: Option<(Theme, std::time::Instant)>,
-    /// 开光灯圆形揭示进行中（此时 theme() 返回 hold 旧主题）
-    pub theme_reveal: Option<ThemeReveal>,
     /// 每日 VIP 领取中
     pub vip_claiming: bool,
     /// 每日 VIP 领取状态文案（空则不显示）
@@ -139,84 +121,9 @@ impl AppStore {
         }
     }
 
-    /// 当前配色（浅/深切换时在 `THEME_TRANSITION_SECS` 内平滑过渡）。
+    /// 当前配色。
     pub fn theme(&self) -> Theme {
-        // 开光灯揭示进行中：整棵 UI 树的颜色从旧主题插值到新主题。
-        //
-        // gpui 0.2.2 没有圆形裁剪（`ContentMask` 只有矩形，见 Windows 后端的
-        // `distance_from_clip_rect`），也没有整页快照，所以拿不到 Web 上 View
-        // Transitions 那种「圆内新 UI、圆外旧 UI」的双层。折中做法：**圆面扩散
-        // 期间底色保持旧主题**，等圆面盖满窗口后，圆面淡出与底色收口同时进行
-        // ——两件事反向交叉，视觉上就是「扫过的地方已经换好了」。
-        //
-        // 千万不要让底色全程跟着插值：那样圆内圆外底色一样，圆面看不出来，
-        // 整窗还会长时间停在灰蒙蒙的中间色（实测过，观感最差的就是这个）。
-        if let Some(r) = &self.theme_reveal {
-            let t = (r.started.elapsed().as_secs_f32() / crate::theme::THEME_REVEAL_SECS)
-                .min(1.0f32);
-            let from = crate::theme::THEME_REVEAL_GROW_FRAC;
-            let k = ((t - from) / (1.0 - from)).clamp(0.0, 1.0);
-            let e = k * k * (3.0 - 2.0 * k); // smoothstep：快速但不硬切
-            return Theme::blend(&r.hold, &self.target_theme(), e);
-        }
-        let target = self.target_theme();
-        match &self.theme_anim {
-            Some((from, started)) => {
-                let t = started.elapsed().as_secs_f32() / crate::theme::THEME_TRANSITION_SECS;
-                if t >= 1.0 {
-                    target
-                } else {
-                    // ease-out：起步快、收尾稳
-                    let e = 1.0 - (1.0 - t).powi(2);
-                    Theme::blend(from, &target, e)
-                }
-            }
-            None => target,
-        }
-    }
-
-    /// 记录切换起点（在修改 theme_mode 之前调用）。
-    pub fn begin_theme_anim(&mut self) {
-        let from = self.theme();
-        self.theme_anim = Some((from, std::time::Instant::now()));
-    }
-
-    /// 动画结束，清理状态。
-    pub fn finish_theme_anim(&mut self) {
-        self.theme_anim = None;
-    }
-
-    /// 系统材质（Mica / Acrylic / 磨砂降级）是否真的垫在主窗口后面。
-    ///
-    /// true 时主窗口的基础背景画成半透明，透明像素透出系统材质；
-    /// false（关闭特效 / 系统不支持）保持不透明配色。
-    pub fn backdrop_active(&self) -> bool {
-        crate::windows_backdrop::material_visible(self.backdrop_effective)
-    }
-
-    /// 材质窗口的基础底色透明度。
-    ///
-    /// 0.45 能明显看出壁纸被磨砂透出来；`backdrop_dense`（「开始菜单风格」）
-    /// 时拉到 0.80——Win11 开始菜单就是这个观感：底层确实是亚克力，但染色很浓，
-    /// 只泛一点壁纸的色调，内容对比度也更高。
-    pub fn backdrop_tint_alpha(&self) -> f32 {
-        if self.settings.get().backdrop_dense {
-            0.80
-        } else {
-            0.45
-        }
-    }
-
-    /// 材质窗口上「面板类」表面（播放条、侧栏）的透明度。
-    ///
-    /// 面板本来就该比底色更实一点（分层），浓染色模式下再收一点，避免
-    /// 与底色糊成一片、看不出层级。
-    pub fn backdrop_panel_alpha(&self) -> f32 {
-        if self.settings.get().backdrop_dense {
-            0.92
-        } else {
-            0.82
-        }
+        self.target_theme()
     }
 
     /// 是否存在任一列表加载态（驱动加载动画持续重绘）。
@@ -245,23 +152,3 @@ impl AppStore {
 
 }
 
-/// 全局弱引用（跨组件回调访问 store）。
-pub struct AppGlobal {
-    #[allow(dead_code)]
-    pub store: gpui::WeakEntity<AppStore>,
-    /// 主窗口句柄：设置页切换背景特效时，从点击回调（只有 `&mut App`）
-    /// 里拿它回到窗口线程改 DWM 属性。
-    pub main_window: Option<gpui::AnyWindowHandle>,
-}
-
-impl Global for AppGlobal {}
-
-/// 主题「开关灯」圆形揭示过渡（起点 = 切换开关位置）。
-#[derive(Clone)]
-pub struct ThemeReveal {
-    /// 圆心（窗口逻辑坐标）
-    pub origin: gpui::Point<gpui::Pixels>,
-    /// 揭示期间保持的旧主题（结束时清空，新主题接管）
-    pub hold: Theme,
-    pub started: std::time::Instant,
-}

@@ -51,45 +51,6 @@ pub enum ThemeMode {
     System,
 }
 
-/// 主窗口背景特效（Windows Mica 云母 / Desktop Acrylic 亚克力）。
-///
-/// 具体落在哪种系统材质由 `echo-app` 的 `windows_backdrop` 模块按系统版本
-/// 决定（Win11 22H2+ 走 DWM 系统背景 API，更老的系统降级磨砂或关闭）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BackdropMode {
-    /// 跟随系统（Win11 22H2+ 由 DWM 按系统设置决定；其余系统降级为磨砂）
-    #[default]
-    System,
-    /// 云母（Mica）
-    Mica,
-    /// 亚克力（Desktop Acrylic）
-    Acrylic,
-    /// 关闭特效（普通不透明背景）
-    Off,
-}
-
-impl BackdropMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            BackdropMode::System => "跟随系统",
-            BackdropMode::Mica => "云母 (Mica)",
-            BackdropMode::Acrylic => "亚克力 (Acrylic)",
-            BackdropMode::Off => "关闭特效",
-        }
-    }
-
-    /// 设置页展示用的简短标签。
-    pub fn short_label(&self) -> &'static str {
-        match self {
-            BackdropMode::System => "跟随系统",
-            BackdropMode::Mica => "云母",
-            BackdropMode::Acrylic => "亚克力",
-            BackdropMode::Off => "关闭",
-        }
-    }
-}
-
 /// 应用设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -100,14 +61,8 @@ pub struct Settings {
     /// 音量 0.0 - 1.0
     pub volume: f64,
     pub play_mode: PlayMode,
-    pub sidebar_collapsed: bool,
-    pub search_history: Vec<String>,
-    /// 上次播放曲目 key
-    pub last_track_key: Option<String>,
     /// 默认音质：128 / 320 / flac / high
     pub audio_quality: String,
-    /// 语言（第一期固定 zh-CN）
-    pub language: String,
     /// 最近一次「每日 VIP」领取尝试的日期（yyyy-mm-dd），同一天不重复打接口
     pub vip_claim_date: String,
     /// 上面那次尝试是否成功
@@ -116,26 +71,8 @@ pub struct Settings {
     pub vip_claim_try_ts: i64,
     /// 播放倍速（0.5–2.0，1.0 为原速）
     pub speed: f64,
-    /// 睡眠定时器（分钟，0 = 关闭）
-    pub sleep_minutes: i64,
     /// 音频输出设备名（空 = 系统默认）
     pub output_device: String,
-    /// 是否显示桌面歌词窗口
-    pub desktop_lyric: bool,
-    /// 桌面歌词字号倍数（2.0–5.0，基准 24px）。
-    ///
-    /// 默认 2 倍：桌面歌词是「隔着一段距离瞥一眼」的场景，24px 太小。
-    pub lyric_scale: f32,
-    /// 桌面歌词窗口位置（x, y；None 时自动居中贴底）
-    pub desktop_lyric_pos: Option<(f64, f64)>,
-    /// 主窗口背景特效模式（Windows Mica / Acrylic）
-    pub backdrop: BackdropMode,
-    /// 材质「浓染色」：底层主题色的 alpha 拉高，只透出一点色调。
-    ///
-    /// Win11 开始菜单就是这种观感——底层确实是亚克力，但染色很浓，看起来
-    /// 「几乎不透明、只泛一点壁纸的颜色」。关掉（默认）更通透，能明显看出
-    /// 壁纸被磨砂透出来。
-    pub backdrop_dense: bool,
     /// Lite 播放条的进度条形态：`wave` 波浪（默认）/ `plain` 普通 / `nyan` 彩虹猫
     pub lite_bar: String,
 }
@@ -147,22 +84,12 @@ impl Default for Settings {
             theme_color: "#f55e55".into(),
             volume: 0.8,
             play_mode: PlayMode::List,
-            sidebar_collapsed: false,
-            search_history: Vec::new(),
-            last_track_key: None,
             audio_quality: "128".into(),
-            language: "zh-CN".into(),
             vip_claim_date: String::new(),
             vip_claim_ok: false,
             vip_claim_try_ts: 0,
             speed: 1.0,
-            sleep_minutes: 0,
             output_device: String::new(),
-            desktop_lyric: false,
-            lyric_scale: 2.0,
-            desktop_lyric_pos: None,
-            backdrop: BackdropMode::default(),
-            backdrop_dense: false,
             lite_bar: "wave".into(),
         }
     }

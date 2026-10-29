@@ -19,11 +19,7 @@ pub const ANDROID_SALT_LITE: &str = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
 pub const REGISTER_SALT: &str = "1014";
 /// signKey 盐（标准版）
 pub const KEY_SALT: &str = "57ae12eb6890223e355ccfcb74edf70d";
-/// signKey 盐（概念版）
-pub const KEY_SALT_LITE: &str = "185672dd44712f60bb1736df5a377e82";
-/// 通用 sign 盐
-pub const SIGN_SALT: &str = "R6snCXJgbCaj9WFRJKefTMIFp0ey6Gza";
-/// 云盘 key 盐
+/// signKey 盐（概念版）/// 通用 sign 盐/// 云盘 key 盐
 pub const CLOUD_KEY_SALT: &str = "ebd1ac3134c880bda6a2194537843caa0162e2e7";
 /// Web 签名盐
 pub const WEB_SALT: &str = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
@@ -97,16 +93,6 @@ pub fn sign_params_key(data: &str, appid: u32, clientver: u32, lite: bool) -> St
 /// 云盘 key：`md5("musicclound" + hash + pid + 盐)`。
 pub fn sign_cloud_key(hash: &str, pid: &str) -> String {
     md5_hex(&format!("musicclound{hash}{pid}{CLOUD_KEY_SALT}"))
-}
-
-/// 通用 sign：参数按 key 排序 `k+v`（无等号），`md5(参数串 + body + 盐)`。
-pub fn sign_params(sorted_params: &[(String, String)], body: &str) -> String {
-    let mut s = String::new();
-    for (k, v) in sorted_params {
-        s.push_str(k);
-        s.push_str(v);
-    }
-    md5_hex(&format!("{s}{body}{SIGN_SALT}"))
 }
 
 /// 24 位随机小写串（song_url 的 dfid 覆盖用）。

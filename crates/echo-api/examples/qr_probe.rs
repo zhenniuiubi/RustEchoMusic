@@ -28,11 +28,5 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => println!("qr_key ERR {e}"),
     }
 
-    // 只验证接口可达性，不发真实短信
-    match client.send_sms_code("13800000000").await {
-        Ok(()) => println!("send_sms_code OK"),
-        Err(e) => println!("send_sms_code ERR {e}"),
-    }
-
     Ok(())
 }

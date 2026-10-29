@@ -6,7 +6,7 @@
 //! 注意：这些接口都**需要登录**，token 过期时统一返回 `20018`（请重新登录）。
 
 use crate::client::{EncryptType, KuGouClient, RequestSpec};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// 单个已开通的会员产品（一个账号可能同时有「超级VIP」和「畅听VIP」）。
 #[derive(Debug, Clone, Default)]
@@ -306,43 +306,4 @@ impl KuGouClient {
         Ok(res.get("data").cloned().unwrap_or(res))
     }
 
-    /// 听歌上报（`/youth/v2/report/listen_song`）：累计听歌时长可兑换 VIP 天数。
-    ///
-    /// `mixsongid` 为歌曲的 mixsongid（`album_audio_id` 优先，缺失时用 hash 查询到的值）。
-    pub async fn report_listen_song(&self, mixsongid: i64) -> anyhow::Result<Value> {
-        let mut spec = RequestSpec {
-            url: "/youth/v2/report/listen_song".into(),
-            encrypt_type: EncryptType::Android,
-            body: Some(json!({ "mixsongid": mixsongid })),
-            user_agent: Some(
-                "Android13-1070-10566-201-0-ReportPlaySongToServerProtocol-wifi".into(),
-            ),
-            ..Default::default()
-        };
-        spec.params.insert("clientver".into(), "10566".into());
-
-        let res = self.request(spec).await?;
-        Ok(res.get("data").cloned().unwrap_or(res))
-    }
-
-    /// 开屏广告播放上报（`/youth/v1/ad/play_report`）：看广告也能领 VIP。
-    ///
-    /// 上报的是一次 30 秒的播放窗口；调用方应真实等过这段时长再上报。
-    pub async fn report_vip_ad(&self) -> anyhow::Result<Value> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as i64;
-        let spec = RequestSpec {
-            url: "/youth/v1/ad/play_report".into(),
-            encrypt_type: EncryptType::Android,
-            body: Some(json!({
-                "ad_id": 12307537187i64,
-                "play_end": now,
-                "play_start": now - 30_000,
-            })),
-            ..Default::default()
-        };
-        let res = self.request(spec).await?;
-        Ok(res.get("data").cloned().unwrap_or(res))
-    }
 }
