@@ -15,6 +15,12 @@ impl AssetSource for Assets {
         if let Some(svg) = crate::icons::icon_svg(path) {
             return Ok(Some(Cow::Borrowed(svg.as_bytes())));
         }
+        // Lite 播放条「彩虹猫」形态的像素猫头（26×20 素材，2x 图）
+        if path == "lite/nyan-cat.png" {
+            return Ok(Some(Cow::Borrowed(include_bytes!(
+                "../assets/lite/nyan-cat.png"
+            ))));
+        }
         Ok(None)
     }
 

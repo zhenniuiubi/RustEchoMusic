@@ -33,6 +33,10 @@ pub fn icon_svg(name: &str) -> Option<&'static str> {
         "icons/playlist.svg" => icon!(
             r#"<path d="M9 6h12"/><path d="M9 12h12"/><path d="M9 18h8"/><path d="M4 6h.01"/><path d="M4 12h.01"/><path d="M4 18h.01"/>"#
         ),
+        // Lite 播放条封面上的「不喜欢」（⊘）
+        "icons/dislike.svg" => icon!(
+            r#"<circle cx="12" cy="12" r="8.4"/><path d="M6.6 17.4 17.4 6.6"/>"#
+        ),
         "icons/heart.svg" => icon!(r#"<path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z"/>"#),
         "icons/heart-filled.svg" => r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z"/></svg>"#,
         "icons/cloud.svg" => icon!(r#"<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9z"/>"#),

@@ -136,6 +136,8 @@ pub struct Settings {
     /// 「几乎不透明、只泛一点壁纸的颜色」。关掉（默认）更通透，能明显看出
     /// 壁纸被磨砂透出来。
     pub backdrop_dense: bool,
+    /// Lite 播放条的进度条形态：`wave` 波浪（默认）/ `plain` 普通 / `nyan` 彩虹猫
+    pub lite_bar: String,
 }
 
 impl Default for Settings {
@@ -161,6 +163,7 @@ impl Default for Settings {
             desktop_lyric_pos: None,
             backdrop: BackdropMode::default(),
             backdrop_dense: false,
+            lite_bar: "wave".into(),
         }
     }
 }

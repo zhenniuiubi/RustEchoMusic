@@ -8,6 +8,7 @@ mod assets;
 mod icons;
 mod imgcache;
 mod liked;
+mod lite;
 mod player;
 mod state;
 mod text_input;
@@ -511,63 +512,20 @@ fn main() {
             let cover_cache = cx.new(|_| imgcache::CoverCache::new(imgcache::DEFAULT_CAP));
             let root_cache = cover_cache.clone();
 
-            let window = cx
-                .open_window(
-                    WindowOptions {
-                        titlebar: None,
-                        window_background: gpui::WindowBackgroundAppearance::Opaque,
-                        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                            None,
-                            size(px(win_w), px(win_h)),
-                            cx,
-                        ))),
-                        window_min_size: Some(size(px(900.), px(560.))),
-                        ..Default::default()
-                    },
-                    |_window, cx| {
-                        cx.new(|cx| Root {
-                            store: store.clone(),
-                            root_focus: cx.focus_handle(),
-                            cover_cache: root_cache.clone(),
-                            search_input: search_input.clone(),
-                            search_focus: search_focus.clone(),
-                            fav_search: fav_search.clone(),
-                            fav_search_focus: fav_search_focus.clone(),
-                            login_user: login_user.clone(),
-                            login_pass: login_pass.clone(),
-                            login_phone: login_phone.clone(),
-                            login_code: login_code.clone(),
-                            progress_bounds: progress_bounds.clone(),
-                            volume_bounds: volume_bounds.clone(),
-                            content_scroll: ScrollHandle::new(),
-                            sidebar_scroll: ScrollHandle::new(),
-                            lyric_scroll: UniformListScrollHandle::new(),
-                            lyric_follow: None,
-                            lyric_scroll_anim: None,
-                            lyric_user_scroll_at: None,
-                            lyric_restore_pending: false,
-                            lyric_auto_off: 0.0,
-                            window_title: String::new(),
-                        })
-                    },
-                )
-                .expect("open window");
+            // Lite 版：这个 app 只有一条 330×70 的迷你播放条（参考原型即主体）
+            let window = crate::lite::open(&store, cx).expect("open window");
 
             // ===== 窗口图标 / 背景特效 / 关闭即隐藏 / 系统托盘 =====
             // 主窗口 HWND 共享给托盘线程（托盘线程只转发命令，窗口操作仍在 UI 线程）
             let main_hwnd = Arc::new(std::sync::atomic::AtomicIsize::new(0));
             {
                 let slot = main_hwnd.clone();
-                let _ = window.update(cx, |root, window, cx| {
+                let _ = window.update(cx, |_, window, cx| {
                     win::apply_window_icon(window);
                     if let Some(h) = win::hwnd(window) {
                         slot.store(h as isize, std::sync::atomic::Ordering::Relaxed);
                     }
-                    // 背景特效（Mica / Acrylic / 磨砂降级），设置项在「设置 → 外观」
-                    windows_backdrop::apply(window, backdrop_mode, dark_theme);
-                    // 键盘默认落点：没有输入框时由根节点接住（空格播放/暂停）
-                    window.focus(&root.root_focus);
-                    // 关闭按钮 / Alt+F4 只隐藏窗口，真正退出走托盘菜单
+                    // 关闭按钮 / Alt+F4 只收起到托盘，真正退出走托盘菜单
                     window.on_window_should_close(cx, |window, _| {
                         win::hide_window(window);
                         false
@@ -589,9 +547,10 @@ fn main() {
                         loop {
                             match tray_rx.try_recv() {
                                 Ok(win::TrayEvent::Show) => {
-                                    let _ = tray_win.update(cx, |_, window, cx| {
+                                    // 从托盘把播放条叫回来：先 show 再激活
+                                    let _ = tray_win.update(cx, |_, window, _| {
                                         window.activate_window();
-                                        cx.notify();
+                                        window.refresh();
                                     });
                                 }
                                 Ok(win::TrayEvent::TogglePlay) => {
@@ -924,34 +883,19 @@ fn main() {
                         }
                     }
 
-                    // ECHO_SMOKE=mini：打开 mini 播放器（自动化验证浮窗）
-                    // 与顶栏按钮同一条路径：开 mini + 收主窗口，截图才能拍到 mini
-                    if target == "mini" || target == "mini-play" {
-                        // mini-play：先放一首歌再开 mini，截图里才有封面/歌名
-                        if target == "mini-play" {
-                            let _ = cx.update(|app| {
-                                ui::navigate(&smoke_store, Page::Search("晴天".into()), app)
-                            });
-                            smol::Timer::after(std::time::Duration::from_secs(4)).await;
-                            let _ = cx.update(|app| {
-                                let n = smoke_store.read_with(app, |s, _| s.search.songs.len());
-                                log::warn!("[smoke-mini] search songs n={n}");
-                                if n > 0 {
-                                    ui::play_from(&smoke_store, ui::PlaySource::Search, 0, app);
-                                }
-                            });
-                            smol::Timer::after(std::time::Duration::from_secs(3)).await;
-                        }
-                        smol::Timer::after(std::time::Duration::from_secs(2)).await;
+                    // ECHO_SMOKE=play / fm：加载私人 FM 并播第一首
+                    // （Lite 的开箱即播路径，自动化截图/自检用）
+                    if target == "play" || target == "fm" {
+                        let _ = cx.update(|app| crate::views::load_fm(&smoke_store, true, app));
+                        smol::Timer::after(std::time::Duration::from_secs(4)).await;
                         let _ = cx.update(|app| {
-                            crate::desktop::open_mini_player(&smoke_store, app);
-                            if let Some(h) = app
-                                .try_global::<crate::state::AppGlobal>()
-                                .and_then(|g| g.main_window)
-                            {
-                                let _ = h.update(app, |_, w, _| crate::win::hide_window(w));
+                            let n = smoke_store.read_with(app, |s, _| s.fm.len());
+                            log::warn!("[smoke-play] fm songs n={n}");
+                            if n > 0 {
+                                ui::play_from(&smoke_store, ui::PlaySource::Fm, 0, app);
                             }
                         });
+                        smol::Timer::after(std::time::Duration::from_secs(3)).await;
                     }
 
                     // ECHO_SMOKE=devswitch：播放一首歌 → 运行中切换输出设备，
