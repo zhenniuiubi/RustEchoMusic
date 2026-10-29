@@ -3,13 +3,11 @@
 //! 布局对齐原项目 `layouts/MainLayout.vue + Sidebar.vue + TitleBar.vue`、
 //! 首页对齐 `views/Home.vue`、播放条对齐 `components/PlayerBar.vue`。
 
-use crate::state::{AppStore, Page};
-use crate::theme::{CARD_RADIUS, CONTROL_RADIUS, COVER_RADIUS};
+use crate::state::AppStore;
 use echo_core::Song;
-use chrono::Timelike;
 use gpui::prelude::*;
 use gpui::*;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 /// tokio 运行时（reqwest(async) 需要 tokio reactor；gpui 是 smol）。
 static TOKIO: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -372,27 +370,15 @@ pub fn spawn_resolve(store: &Entity<AppStore>, request_id: u64, song: Song, cx: 
     .detach();
 }
 
-/// 播放来源（决定从哪个列表取队列）。
+/// 播放来源（Lite 只有这三条取队列的路径）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaySource {
-    Search,
-    StyleSongs,
-    PlaylistDetail,
-    Daily,
-    NewSongs,
-    RankSongs,
-    ArtistSongs,
-    AlbumSongs,
+    /// 我最喜爱（本地收藏 / 登录后的云端红心）
     Favorites,
+    /// 播放历史
     History,
-    /// 「我最喜爱」带前端模糊搜索的视图（下标基于过滤后的列表）
-    FavoritesFiltered,
     /// 私人 FM
     Fm,
-    /// 音乐云盘
-    Cloud,
-    /// 已购单曲
-    Purchased,
 }
 
 /// 从来源列表设置队列并从 index 开始播放。
@@ -400,45 +386,9 @@ pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx:
     let store = store.clone();
     let (title, songs) = store.update(cx, |s, _| {
         let (title, songs): (String, Vec<Song>) = match &source {
-            PlaySource::Search => ("搜索结果".into(), s.search.songs.as_ref().clone()),
-            PlaySource::StyleSongs => ("风格推荐".into(), s.home.style_songs.as_ref().clone()),
-            PlaySource::PlaylistDetail => s
-                .playlist_detail
-                .as_ref()
-                .map(|(pl, songs)| (pl.name.clone(), songs.as_ref().clone()))
-                .unwrap_or_default(),
-            PlaySource::Daily => ("每日推荐".into(), s.daily.as_ref().clone()),
-            PlaySource::NewSongs => ("新歌速递".into(), s.explore.new_songs.as_ref().clone()),
-            PlaySource::RankSongs => (
-                s.rank_view
-                    .ranks
-                    .iter()
-                    .find(|r| r.id == s.rank_view.rank_id)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_else(|| "排行榜".into()),
-                s.rank_view.songs.as_ref().clone(),
-            ),
-            PlaySource::ArtistSongs => s
-                .artist_view
-                .as_ref()
-                .map(|v| (v.artist.name.clone(), v.songs.as_ref().clone()))
-                .unwrap_or_default(),
-            PlaySource::AlbumSongs => s
-                .album_view
-                .as_ref()
-                .map(|v| (v.album.name.clone(), v.songs.as_ref().clone()))
-                .unwrap_or_default(),
-            // 登录用户的「我最喜爱」页面展示的是云歌单（remote_liked），
-            // 队列必须取同一份数据，否则下标对不上、本地收藏为空时点了没反应。
-            // 两种来源都取「当前视图」：有搜索词时就是过滤后的列表。
-            PlaySource::Favorites | PlaySource::FavoritesFiltered => (
-                "我最喜爱".into(),
-                s.favorites_view().as_ref().clone(),
-            ),
+            PlaySource::Favorites => ("我最喜爱".into(), s.library.get().favorites.as_ref().clone()),
             PlaySource::History => ("播放历史".into(), s.library.get().history.as_ref().clone()),
             PlaySource::Fm => ("私人FM".into(), s.fm.as_ref().clone()),
-            PlaySource::Cloud => ("音乐云盘".into(), s.cloud.as_ref().clone()),
-            PlaySource::Purchased => ("已购音乐".into(), s.purchased_songs.as_ref().clone()),
         };
         (title, songs)
     });
@@ -490,9 +440,9 @@ pub fn play_all(store: &Entity<AppStore>, source: PlaySource, cx: &mut App) {
     let start = {
         let s = store.read(cx);
         let len = match source {
-            PlaySource::Favorites | PlaySource::FavoritesFiltered => s.favorites_view().len(),
+            PlaySource::Favorites => s.favorites_source().len(),
             PlaySource::History => s.library.get().history.len(),
-            _ => 0,
+            PlaySource::Fm => s.fm.len(),
         };
         if s.player.play_mode == echo_core::PlayMode::Random && len > 0 {
             use rand::Rng as _;
@@ -608,7 +558,6 @@ pub fn clear_queue(store: &Entity<AppStore>, cx: &mut App) {
         s.player.clear_queue();
         s.queue_store.clear();
         s.toast = "已清空播放队列".into();
-        s.queue_drag = None;
         cx.notify();
     });
 }
@@ -782,9 +731,6 @@ pub fn handle_player_event_state(
         // 只有停在设置页才重绘，否则每秒白刷一帧。
         echo_audio::PlayerEvent::Diagnostics(d) => {
             s.audio_diag = Some(d);
-            if matches!(s.routes.current(), Some(crate::state::Page::Settings)) {
-                cx.notify();
-            }
             None
         }
         echo_audio::PlayerEvent::StateChanged(_) => None,
@@ -1107,7 +1053,6 @@ pub fn set_sleep_timer(store: &Entity<AppStore>, minutes: Option<i64>, cx: &mut 
         .map(|m| chrono::Local::now().timestamp() + m * 60);
     store.update(cx, |s, cx| {
         s.sleep_until = until;
-        s.player_menu = false;
         s.toast = match minutes.unwrap_or(0) {
             0 => "睡眠定时器已取消".into(),
             m => format!("{m} 分钟后停止播放"),

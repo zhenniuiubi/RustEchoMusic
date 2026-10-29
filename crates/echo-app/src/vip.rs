@@ -395,8 +395,6 @@ fn claim(store: &Entity<AppStore>, force: bool, cx: &mut App) {
         if force {
             store.update(cx, |s, cx| {
                 s.toast = "请先登录后再领取VIP".into();
-                s.login_redirect = Some(crate::state::Page::Profile);
-                s.routes.navigate(crate::state::Page::Login);
                 cx.notify();
             });
         }

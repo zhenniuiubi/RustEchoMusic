@@ -70,11 +70,7 @@ fn apply_login(store: &Entity<AppStore>, login: echo_api::LoginResult, cx: &mut 
             pic: login.pic,
             vip_type: login.vip_type,
         });
-        s.login.password.clear();
-        s.login.code.clear();
         s.login.error.clear();
-        s.login.busy = false;
-        s.login.sms_busy = false;
         s.toast = "登录成功".into();
         s.session_expired = false;
         s.vip_note.clear();
@@ -286,11 +282,9 @@ fn clear_login_state(s: &mut AppStore) {
     s.remote_liked_fileids.clear();
     s.remote_liked_loaded = false;
     s.remote_liked_listid.clear();
-    s.fav_filter.clear();
-    s.fav_filtered = Arc::new(Vec::new());
 }
 
-/// 登录态失效（服务端 20018 等）：**自动退出登录**，并把当前页面导到登录页。
+/// 登录态失效（服务端 20018 等）：**自动退出登录**，账号面板会自己变成未登录。
 ///
 /// 用户看到的应该是「已经登出、请重新登录」，而不是一堆接口报错。
 pub(crate) fn force_logout(s: &mut AppStore, msg: &str) {

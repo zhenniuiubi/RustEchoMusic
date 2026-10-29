@@ -6,12 +6,10 @@
 mod amll;
 mod assets;
 mod icons;
-mod imgcache;
 mod liked;
 mod lite;
 mod player;
 mod state;
-mod text_input;
 mod theme;
 mod desktop;
 mod smtc;
@@ -28,7 +26,7 @@ use echo_core::{DeviceIdentity, SettingsStore};
 use gpui::prelude::*;
 use gpui::*;
 use parking_lot::Mutex;
-use state::{AppGlobal, AppStore, Page};
+use state::{AppGlobal, AppStore};
 use std::sync::Arc;
 
 /// 日志过滤器：只压掉「已知、且上游已自行降级」的噪音，其它照旧透传。
@@ -99,8 +97,6 @@ fn main() {
         .with_assets(Assets)
         .with_http_client(ReqwestHttpClient::new().expect("init http client"))
         .run(|cx: &mut App| {
-            text_input::bind_input_keys(cx);
-
             // ===== 数据初始化 =====
             let data_dir = echo_core::data_dir();
             let settings = SettingsStore::load(&data_dir).expect("load settings");
@@ -199,7 +195,7 @@ fn main() {
                 Err(_) => settings.get().backdrop,
             };
             // 系统材质（Mica/Acrylic）的明暗要跟 App 主题走，见 windows_backdrop::apply
-            let dark_theme = settings.get().theme_mode == echo_core::ThemeMode::Dark;
+            let _dark_theme = settings.get().theme_mode == echo_core::ThemeMode::Dark;
             let store = cx.new(|_| AppStore {
                 settings,
                 backdrop_effective: backdrop_mode,
@@ -220,37 +216,18 @@ fn main() {
                     loaded: false,
                     ..Default::default()
                 },
-                routes: Default::default(),
-                home: Default::default(),
-                search: Default::default(),
-                playlist_detail: None,
-                playlists_loaded: Default::default(),
                 user_playlists: Vec::new(),
                 user_playlists_loaded: false,
-                search_hot: Default::default(),
                 session: session_store,
                 user: saved_user,
                 login: Default::default(),
-                explore: Default::default(),
-                daily: Arc::new(Vec::new()),
-                daily_loaded: false,
-                daily_loading: false,
-                artist_view: None,
-                album_view: None,
-                rank_view: Default::default(),
-                artist_loading: false,
-                album_loading: false,
-                rank_loading: false,
                 library: library_store,
                 queue_store,
                 audio_diag: None,
                 lyric: None,
                 lyric_key: String::new(),
                 lyric_loading: false,
-                player_menu: false,
                 sleep_until: None,
-                mv: None,
-                mv_loading: false,
                 fm: Arc::new(Vec::new()),
                 fm_mode: "peak".into(),
                 fm_pool: 0,
@@ -260,53 +237,28 @@ fn main() {
                 fm_extending: false,
                 fm_batch: Vec::new(),
                 fm_heard: Default::default(),
-                cloud: Arc::new(Vec::new()),
-                cloud_loaded: false,
-                cloud_loading: false,
-                purchased_songs: Arc::new(Vec::new()),
-                purchased_albums: Arc::new(Vec::new()),
-                purchased_loaded: false,
-                purchased_loading: false,
-                purchased_tab: 0,
                 remote_liked: Arc::new(Vec::new()),
                 remote_liked_loaded: false,
                 remote_liked_loading: false,
                 remote_liked_listid: String::new(),
                 remote_liked_keys: Default::default(),
                 remote_liked_fileids: Default::default(),
-                queue_open: false,
-                volume_open: false,
                 seeking: false,
                 seek_target: 0.0,
-                search_input: String::new(),
                 toast: String::new(),
                 position_at: std::time::Instant::now(),
-                sidebar_collapsed: false,
-                sidebar_found_open: true,
-                sidebar_lib_open: true,
-                sidebar_tab: 0,
                 theme_anim: None,
                 theme_reveal: None,
                 progress_bounds_slot: progress_bounds.clone(),
                 volume_bounds_slot: volume_bounds.clone(),
-                queue_scroll: gpui::UniformListScrollHandle::new(),
-                queue_drag: None,
-                song_scroll: gpui::UniformListScrollHandle::new(),
-                list_drag: None,
-                queue_bounds: Arc::new(parking_lot::Mutex::new(None)),
-                search_bounds: Arc::new(parking_lot::Mutex::new(None)),
-                fav_search_bounds: Arc::new(parking_lot::Mutex::new(None)),
-                fav_filter: String::new(),
-                fav_filtered: Arc::new(Vec::new()),
                 vip_claiming: false,
                 vip_note: String::new(),
                 session_expired: false,
                 token_refresh_at: 0,
-                login_redirect: None,
             });
 
             // 默认窗口 1100x650；显示器比这小时再按 88% 收缩
-            let (win_w, win_h) = match cx.primary_display() {
+            let (_win_w, _win_h) = match cx.primary_display() {
                 Some(d) => {
                     let b = d.bounds();
                     let (sw, sh) = (f32::from(b.size.width), f32::from(b.size.height));
@@ -345,7 +297,7 @@ fn main() {
             }
 
             // 打开窗口
-            let search_store = store.clone();
+            let _search_store = store.clone();
             // Lite 版：这个 app 只有一条 330×70 的迷你播放条（参考原型即主体）
             let window = crate::lite::open(&store, cx).expect("open window");
 
@@ -564,12 +516,9 @@ fn main() {
                     loop {
                         let (loading, lyric_anim) = pump_store
                             .read_with(cx, |s, _| {
-                                let on_lyric =
-                                    matches!(s.routes.current(), Some(crate::state::Page::Lyric));
                                 (
                                     s.any_loading(),
-                                    s.player.playing
-                                        && (on_lyric || crate::desktop::lyric_window_open()),
+                                    s.player.playing && crate::desktop::lyric_window_open(),
                                 )
                             })
                             .unwrap_or((false, false));

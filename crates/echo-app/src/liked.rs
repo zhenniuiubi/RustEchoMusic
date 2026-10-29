@@ -76,7 +76,6 @@ pub(crate) fn load_remote_liked(store: &Entity<AppStore>, force: bool, cx: &mut 
                 .collect();
             s.remote_liked = Arc::new(songs);
             // 数据源变了：重算「我最喜爱」的模糊搜索结果
-            s.refresh_fav_filter();
             cx.notify();
         });
     })
@@ -102,7 +101,6 @@ pub(crate) fn toggle_like(store: &Entity<AppStore>, song: &echo_core::Song, cx: 
         store.update(cx, |s, cx| {
             let now = s.library.toggle_favorite(&song_c);
             s.toast = if now { "已收藏（本地）".into() } else { "已取消收藏".into() };
-            s.refresh_fav_filter();
             cx.notify();
         });
         return;
@@ -173,7 +171,6 @@ pub(crate) fn toggle_like(store: &Entity<AppStore>, song: &echo_core::Song, cx: 
                     }
                     // 同步本地收藏，保持离线可用
                     let _ = s.library.toggle_favorite(&song_c);
-                    s.refresh_fav_filter();
                 }
                 Err(e) => {
                     s.toast = format!("收藏操作失败：{e}");

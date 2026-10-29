@@ -459,7 +459,7 @@ impl Render for LiteView {
         }
 
         let theme = self.store.read(cx).theme();
-        let (song, playing, position, duration, logged, nickname) = {
+        let (song, playing, position, duration, logged, _nickname) = {
             let s = self.store.read(cx);
             let ses = s.session.get();
             (
