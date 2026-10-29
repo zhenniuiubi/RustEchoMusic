@@ -151,27 +151,12 @@ pub struct LiteView {
     seeking: bool,
     /// 建立时刻（波浪流动 / 彩虹猫跳动的相位基准）
     born: Instant,
-    /// 扫码登录：key / 内容 URL / 状态（0 过期 1 等待 2 待确认 4 成功）
-    qr_key: String,
-    qr_url: String,
-    qr_status: i32,
-    /// 轮询代次：取消 / 重新获取时自增，旧轮询看到代次变了就退出
-    qr_gen: u64,
-    qr_busy: bool,
-    qr_note: String,
 }
 
 static LITE_WIN: OnceLock<Mutex<Option<WeakEntity<LiteView>>>> = OnceLock::new();
 
 fn slot() -> &'static Mutex<Option<WeakEntity<LiteView>>> {
     LITE_WIN.get_or_init(|| Mutex::new(None))
-}
-
-/// 窗口收尾：清掉全局槽位（否则刷新泵会 update 一个已关掉的窗口）。
-fn forget() {
-    if let Ok(mut s) = slot().lock() {
-        s.take();
-    }
 }
 
 /// 主循环里每次播放事件都调它：进度/歌名/登录态变了要重绘。
@@ -191,23 +176,6 @@ pub fn is_open() -> bool {
         .lock()
         .map(|s| s.as_ref().and_then(|w| w.upgrade()).is_some())
         .unwrap_or(false)
-}
-
-/// 把 Lite 窗口显示出来（托盘「显示」走这里；窗口没开过就新建）。
-pub fn show(store: &Entity<AppStore>, cx: &mut App) {
-    if let Ok(s) = slot().lock() {
-        if let Some(weak) = s.as_ref() {
-            if let Some(e) = weak.upgrade() {
-                let _ = e.update(cx, |v, cx| {
-                    v.closed.store(false, Ordering::Relaxed);
-                    v.focus.store(true, Ordering::Relaxed);
-                    cx.notify();
-                });
-                return;
-            }
-        }
-    }
-    open(store, cx);
 }
 
 /// 打开 Lite 播放条窗口（已开则只激活），返回窗口句柄供托盘 / SMTC 使用。
@@ -253,12 +221,6 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
                 queue_drag: None,
                 seeking: false,
                 born: Instant::now(),
-                qr_key: String::new(),
-                qr_url: String::new(),
-                qr_status: 1,
-                qr_gen: 0,
-                qr_busy: false,
-                qr_note: String::new(),
             })
         },
     );
@@ -483,6 +445,8 @@ impl Render for LiteView {
                 })
                 .unwrap_or(false)
         };
+        // 任务栏缩略图工具栏的按钮状态（播放/暂停、红心）跟着走；内部去重，每帧调也安全
+        crate::taskbar::sync(playing, fav);
         let bars = Bars::from_settings(&self.store.read(cx).settings.get().lite_bar);
         let ratio = if duration > 0.01 {
             (position / duration).clamp(0.0, 1.0) as f32
