@@ -92,7 +92,9 @@ rsa = { version = "0.9", features = ["sha2"] }
 hex = "0.4"
 
 [profile.release]
-opt-level = 3
+# 体积优先：相比 opt-level=3 能再砍掉约 10-15% 的代码段（.text），
+# 配合已有的 lto=fat / strip / panic=abort。最终体积靠本机 UPX 压到 ~5M。
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
