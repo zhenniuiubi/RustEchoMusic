@@ -170,7 +170,6 @@ pub enum PlaySource {
 
 /// 从来源列表设置队列并从 index 开始播放。
 pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx: &mut App) {
-    let store = store.clone();
     let (title, songs) = store.update(cx, |s, _| match source {
         PlaySource::Favorites => ("我最喜爱".to_string(), s.favorites_source().as_ref().clone()),
         PlaySource::Fm => ("私人FM".to_string(), s.fm.as_ref().clone()),
@@ -179,8 +178,55 @@ pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx:
         return;
     }
     let start = index.min(songs.len() - 1);
+    play_list(store, title, songs, start, matches!(source, PlaySource::Fm), cx);
+}
+
+/// 播放整份「我最喜爱」：**随机顺序**，从洗好的第一首开始。
+///
+/// 从 FM 切到收藏时用这个 —— 收藏往往几十上百首，按列表顺序从头放太死板。
+/// 返回 false 表示收藏是空的（调用方据此不要把 UI 切到收藏模式）。
+pub fn play_favorites_shuffled(store: &Entity<AppStore>, cx: &mut App) -> bool {
+    let mut songs = store.read(cx).favorites_source().as_ref().clone();
+    if songs.is_empty() {
+        store.update(cx, |s, cx| {
+            s.toast = "还没有收藏的歌曲".into();
+            cx.notify();
+        });
+        return false;
+    }
+    shuffle(&mut songs);
+    play_list(store, "我最喜爱".to_string(), songs, 0, false, cx);
+    true
+}
+
+/// Fisher-Yates 洗牌。
+fn shuffle<T>(v: &mut [T]) {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    for i in (1..v.len()).rev() {
+        let j = rng.random_range(0..=i);
+        v.swap(i, j);
+    }
+}
+
+/// 用一个现成的列表换掉队列并从 `start` 开始播。
+///
+/// `fm` = true 时把这一批的 hash 记进 `fm_batch`/`fm_heard`（「播完换一轮」靠它判断）。
+fn play_list(
+    store: &Entity<AppStore>,
+    title: String,
+    songs: Vec<Song>,
+    start: usize,
+    fm: bool,
+    cx: &mut App,
+) {
+    let store = store.clone();
+    if songs.is_empty() {
+        return;
+    }
+    let start = start.min(songs.len() - 1);
     // 私人 FM：把这一批的 hash 记下来，后面判断「整批都播过」用
-    let fm_hashes: Vec<String> = if matches!(source, PlaySource::Fm) {
+    let fm_hashes: Vec<String> = if fm {
         songs.iter().map(|x| x.hash.clone()).collect()
     } else {
         Vec::new()
@@ -190,8 +236,8 @@ pub fn play_from(store: &Entity<AppStore>, source: PlaySource, index: usize, cx:
         let mode = s.player.play_mode;
         let volume = s.player.volume;
         s.player.set_queue(&title, songs, start);
-        s.player.fm_queue = matches!(source, PlaySource::Fm);
-        if s.player.fm_queue {
+        s.player.fm_queue = fm;
+        if fm {
             s.fm_batch = fm_hashes;
             s.fm_heard.clear();
         }
@@ -307,16 +353,18 @@ pub fn toggle_play(store: &Entity<AppStore>, cx: &mut App) {
 }
 
 pub fn next_track(store: &Entity<AppStore>, auto: bool, cx: &mut App) {
-    // 私人 FM：这一轮的歌都听过了 → 清空队列换下一轮（不再往下接老队列）
-    if crate::actions::fm_round_finished(store.read(cx)) {
-        crate::actions::fm_extend(store, cx);
-        return;
-    }
-    let next = store.read(cx).player.next_index();
+    // FM：只在「这一轮没播过的」里挑下一首；都播过就清空队列换下一轮
+    // （不能等 `next_index()` 返回 None：列表循环到队尾会绕回第 1 首，永远不换轮）
+    let (next, fm) = {
+        let s = store.read(cx);
+        (crate::actions::fm_next_index(s), s.player.fm_queue)
+    };
     match next {
         Some(i) => play_index(store, i, cx),
         None => {
-            if !auto {
+            if fm {
+                crate::actions::fm_extend(store, cx);
+            } else if !auto {
                 store.update(cx, |s, cx| {
                     s.toast = "已经是最后一首了".into();
                     cx.notify();
@@ -390,14 +438,11 @@ pub fn handle_player_event_state(
             // 它会绕回队首，永远碰不到队尾，于是同一批 5 首来回放、再也不去要新歌。
             // 这里只要「这一轮都听过了」或者「已经是队列最后一首」就换一轮
             // （单曲循环除外，那是用户明确要求重播）。
-            let at_tail = s
-                .player
-                .index
-                .map(|i| i + 1 >= s.player.queue.len())
-                .unwrap_or(false);
-            let fm_round_done = s.player.fm_queue
-                && s.player.play_mode != echo_core::PlayMode::Single
-                && (crate::actions::fm_round_finished(s) || at_tail);
+            // 这一轮都播过了 → 换下一轮（单曲循环是用户明确要求的重播，除外）
+            let next = crate::actions::fm_next_index(s);
+            let fm_round_done = next.is_none()
+                && s.player.fm_queue
+                && s.player.play_mode != echo_core::PlayMode::Single;
             if fm_round_done {
                 s.player.loading = true;
                 s.fm_loading = true;
@@ -408,7 +453,7 @@ pub fn handle_player_event_state(
                 })
                 .detach();
                 None
-            } else if let Some(i) = s.player.next_index() {
+            } else if let Some(i) = next {
                 s.player.index = Some(i);
                 s.player.position = 0.0;
                 s.player.loaded = false;

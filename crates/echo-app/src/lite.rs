@@ -76,20 +76,24 @@ const WAVE_AMP: f32 = 1.5;
 /// 波浪线宽（原型 1.5px 描边）。
 const WAVE_THICK: f32 = 1.5;
 
-/// 彩虹猫：条纹带的阶梯块宽（px）与向左流动的速度（px/s）。
-/// 参考 GIF 是 8 帧 × 50ms 循环，一格阶梯 ≈ 2px/帧 ≈ 40px/s；这里放慢一点。
-const NYAN_BLOCK: f32 = 6.;
-const NYAN_SPEED: f32 = 26.;
+/// 猫图宽（px）。
+const NYAN_CAT_W: f32 = 26.;
+/// 猫右缘超出进度末端多少（px）—— 让猫压在彩虹上，而不是贴在末端外侧。
+const NYAN_CAT_LEAD: f32 = NYAN_CAT_W - 6.;
+/// 猫上下颠一帧要走多少相位（px）。波浪是 16.25 px/s，12px ≈ 0.74s 一换帧。
+const NYAN_BOB_STEP: f32 = 12.;
 
 /// 列表滚动条的可拖拽热区宽度（只占右侧一条，不盖住列表行）。
 const SCROLL_STRIP: f32 = 11.;
 
-/// 播放控制那一组的宽度：prev 24 + gap 4 + play 30 + gap 4 + next 24 + gap 4
-/// + 分隔条 3 + gap 4 + mode 22 = 119。
+/// hover 判定区：从歌名/歌手那一块一直铺到收藏按钮左缘 —— 中间这一带
+/// （含文字右侧的空白）鼠标一进来就把文字换成播放控制。
 ///
-/// hover 判定用它：鼠标停在歌名/歌手文字上才浮出控制键，浮出之后要保证
-/// 指针移到控制键上时不会「判断为离开」而闪回去。
-const CTL_W: f32 = 120.;
+/// 纵向只取文字那一条，避开底部的进度槽：指针停在进度条上是要拖它，
+/// 不该顺手把歌名换成控制键。
+const META_ZONE_X: f32 = CONTENT_LEFT - 4.;
+const META_ZONE_Y: f32 = 5.;
+const META_ZONE_H: f32 = 45.;
 
 /// 面板展开 / 收起动画时长（原型 height .42s / 收起 .26s，这里取中间值）。
 const PANEL_ANIM_SECS: f32 = 0.26;
@@ -98,12 +102,17 @@ const PANEL_ANIM_SECS: f32 = 0.26;
 
 const PANEL_QUEUE_H: f32 = 264.;
 const PANEL_FAV_H: f32 = 264.;
-const PANEL_LYRIC_H: f32 = 214.;
+/// 歌词面板只放一行（head 34 + 一行 56 + 底部 6）。
+const PANEL_LYRIC_H: f32 = 96.;
 const PANEL_ACC_H: f32 = 244.;
 const PANEL_ACC_GUEST_H: f32 = 82.;
 const PANEL_LOGIN_H: f32 = 196.;
 /// 队列行高（原型 padding 7 + 单行 20）。
 const ROW_H: f32 = 32.;
+/// 「我最喜爱」入口行的左右内边距（红心离左 = 箭头离右）。
+const FAV_ENTRY_PAD: f32 = 9.;
+/// 歌词字号（迷你面板里只显示当前这一句，字可以大一些）。
+const LYRIC_SIZE: f32 = 18.;
 
 // ==================== 状态 ====================
 
@@ -191,9 +200,11 @@ pub struct LiteView {
     fav_scroll: gpui::UniformListScrollHandle,
     /// 滚动条拖拽中：(被拖的那条列表句柄, 按下时的 `(鼠标 y, 滚动偏移)`)
     list_drag: Option<(gpui::UniformListScrollHandle, (f32, f32))>,
-    /// 歌名 / 歌手文字块的实际绘制矩形 `(x, y, w, h)`（窗口逻辑坐标）。
-    /// hover 只认这一块 —— 鼠标落在同一行右侧的空白上不算「移到歌名上」。
-    meta_rect: Arc<Mutex<Option<(f32, f32, f32, f32)>>>,
+    /// 进度条热区的实际绘制矩形 `(x, y, w, h)`（窗口逻辑坐标）。
+    ///
+    /// 拖拽时按它把鼠标 x 换算成比例 —— 用常量算会和真实位置差一个父容器的
+    /// 左内边距（`bar` 有 `pl(8)`，绝对定位的 `left` 是相对内容盒的）。
+    prog_rect: Arc<Mutex<Option<(f32, f32, f32, f32)>>>,
     /// 进度条拖拽中
     seeking: bool,
     /// 波浪相位（px，0..WAVE_PERIOD）：播放时才前进，暂停即冻结
@@ -204,6 +215,8 @@ pub struct LiteView {
     cur_h: f32,
     /// 面板开合动画（None = 已到位）
     anim: Option<PanelAnim>,
+    /// 上一次写进窗口标题的「歌名 - 歌手」（变了才调一次 set_window_title）
+    title_cache: String,
 }
 
 static LITE_WIN: OnceLock<Mutex<Option<WeakEntity<LiteView>>>> = OnceLock::new();
@@ -277,12 +290,13 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
                     queue_scroll: gpui::UniformListScrollHandle::new(),
                     fav_scroll: gpui::UniformListScrollHandle::new(),
                     list_drag: None,
-                    meta_rect: Arc::new(Mutex::new(None)),
+                    prog_rect: Arc::new(Mutex::new(None)),
                     seeking: false,
                     phase: 0.,
                     tick_at: Instant::now(),
                     cur_h: LITE_H,
                     anim: None,
+                    title_cache: String::new(),
                 }
             })
         },
@@ -306,6 +320,7 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
                 spawn_hover_poll(e.downgrade(), cx);
                 spawn_anim_pump(handle, cx);
                 spawn_smoke_panels(handle, cx);
+                spawn_smoke_state(handle, cx);
             }
             Some(handle.into())
         }
@@ -348,6 +363,58 @@ fn spawn_smoke_panels(handle: WindowHandle<LiteView>, cx: &mut App) {
     .detach();
 }
 
+/// 自检钩子：`ECHO_SMOKE=seek` 时每 400ms 打一行播放状态。
+///
+/// 点击 / 拖拽 seek、歌词联动这些都不能靠肉眼看截图确认（进度条只有几像素的变化），
+/// 这里把 `position / seeking / 当前歌词行` 直接写进日志，脚本读 `ECHO_LOG_FILE` 即可回归。
+fn spawn_smoke_state(handle: WindowHandle<LiteView>, cx: &mut App) {
+    if std::env::var("ECHO_SMOKE").ok().as_deref() != Some("seek") {
+        return;
+    }
+    cx.spawn(async move |cx: &mut AsyncApp| loop {
+        let alive = handle
+            .update(cx, |v: &mut LiteView, window, cx| {
+                let s = v.store.read(cx);
+                let pos = smooth_pos(&s, s.player.playing);
+                let (line_ix, line_text) = s
+                    .lyric
+                    .as_ref()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| {
+                        let i = l.index_at(pos).unwrap_or(0).min(l.lines.len() - 1);
+                        (i, l.lines[i].text.clone())
+                    })
+                    .unwrap_or((usize::MAX, "-".into()));
+                log::warn!(
+                    "[smoke-state] pos={:.2}/{:.2} playing={} seeking={} drag={} panel_lyric={} line={} text={}",
+                    pos,
+                    s.player.duration,
+                    s.player.playing as u8,
+                    s.seeking as u8,
+                    v.seeking as u8,
+                    (v.panel == Panel::Lyric) as u8,
+                    line_ix,
+                    line_text,
+                );
+                let b = window.bounds();
+                log::warn!(
+                    "[smoke-rect] bar={:?} size={}x{}",
+                    v.prog_rect.lock().ok().and_then(|g| *g),
+                    f32::from(b.size.width),
+                    f32::from(b.size.height)
+                );
+            })
+            .is_ok();
+        if !alive {
+            break;
+        }
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(400))
+            .await;
+    })
+    .detach();
+}
+
 /// gpui 0.2.2 的 Windows 端不处理 `WM_MOUSELEAVE`，鼠标移出窗口后
 /// `on_hover(false)` 不会回调 → 每 120ms 用光标位置校正一次。
 fn spawn_hover_poll(weak: WeakEntity<LiteView>, cx: &mut App) {
@@ -358,10 +425,14 @@ fn spawn_hover_poll(weak: WeakEntity<LiteView>, cx: &mut App) {
         let alive = cx
             .update(|cx| {
                 weak.update(cx, |v, cx| {
-                    // 拖滚动条时在窗口外松手：鼠标抬起事件收不到，这里收尾
-                    if v.list_drag.is_some() && !crate::win::left_button_down() {
+                    // 拖滚动条 / 拖进度条时在窗口外松手：鼠标抬起事件收不到，这里收尾
+                    let down = crate::win::left_button_down();
+                    if v.list_drag.is_some() && !down {
                         v.list_drag = None;
                         cx.notify();
+                    }
+                    if v.seeking && !down {
+                        v.commit_seek(cx);
                     }
                     let on_meta = v.cursor_on_meta();
                     let on_cover = v.cursor_on_cover();
@@ -395,7 +466,8 @@ fn spawn_anim_pump(handle: WindowHandle<LiteView>, cx: &mut App) {
                     let bars = Bars::from_settings(&s.settings.get().lite_bar);
                     if bars.animated() || s.player.playing {
                         cx.notify();
-                        33
+                        // 60fps：26px/s 的彩虹 / 16px/s 的波浪按 30fps 走会一格一格挪
+                        16
                     } else {
                         200
                     }
@@ -428,28 +500,42 @@ fn alpha(rgb: u32, a: f32) -> Hsla {
     c.opacity(a)
 }
 
+/// 播放位置在两次 `PlayerEvent::Position` 之间是「一跳一跳」的（音频线程按缓冲周期上报），
+/// 直接用会让进度条末端和彩虹猫一格一格挪。这里用最近一次上报的时间戳做线性外推。
+fn smooth_pos(s: &AppStore, playing: bool) -> f64 {
+    if s.seeking {
+        return s.seek_target;
+    }
+    if !playing {
+        return s.player.position;
+    }
+    let dt = s.position_at.elapsed().as_secs_f64().min(0.20);
+    let pos = s.player.position + dt;
+    if s.player.duration > 0.01 {
+        pos.min(s.player.duration)
+    } else {
+        pos
+    }
+}
+
 fn fmt_time(sec: u64) -> String {
     format!("{}:{:02}", sec / 60, sec % 60)
 }
 
 impl LiteView {
-    /// 光标是否落在「歌名 / 歌手」文字上。
+    /// 光标是否停在中间带上（歌名/歌手 → 收藏按钮之间）。
     ///
-    /// 矩形是文字块真正画出来的范围（`meta_rect`，绘制时记录），不是整条中间区域 ——
-    /// 鼠标停在同一行右侧的空白上不该把歌名换成控制键。
-    ///
-    /// 控制键浮出后按 `CTL_W` 向右放宽，否则指针刚移到「下一首」上就被判成离开，
-    /// 会一阵阵闪回歌名。
+    /// 整块都算：鼠标进到这一带（包括文字右侧的空白）就切成播放控制键。
+    /// 右端止于收藏按钮左缘，所以指针移到控制键上时不会「判成离开」而闪回歌名。
     fn cursor_on_meta(&self) -> bool {
-        let saved = self.meta_rect.lock().ok().and_then(|v| *v);
-        let (x, y, w, h) = saved.unwrap_or((
-            CONTENT_LEFT,
-            (LITE_H - 36.) / 2.,
-            ACTIONS_LEFT - CONTENT_LEFT - 8.,
-            36.,
-        ));
-        let w = if self.hovered { w.max(CTL_W) } else { w };
-        crate::win::cursor_in_client_rect(self.hwnd_raw, LITE_W, x - 2., y - 2., w + 4., h + 4.)
+        crate::win::cursor_in_client_rect(
+            self.hwnd_raw,
+            LITE_W,
+            META_ZONE_X,
+            META_ZONE_Y,
+            ACTIONS_LEFT - META_ZONE_X,
+            META_ZONE_H,
+        )
     }
 
     /// 光标是否停在封面上。
@@ -457,14 +543,39 @@ impl LiteView {
         crate::win::cursor_in_client_rect(self.hwnd_raw, LITE_W, COVER_X, COVER_Y, COVER, COVER)
     }
 
-    /// 按进度条位置 seek：拖拽只改 UI 目标，松手才真正 `engine.seek`。
+    /// 按鼠标 x 算出目标位置（只动 UI，不碰音频）。
+    ///
+    /// 用绘制时记下的热区矩形换算，而不是 `CONTENT_LEFT` 常量：
+    /// 进度条是相对 `bar` 绝对定位的，`bar` 有 `pl(8)`，实际左端比常量多 8px，
+    /// 按常量算整条进度会系统性偏一点（点到最左端也不是 0%）。
     fn seek_to(&mut self, x: Pixels, cx: &mut Context<Self>) {
-        let ratio = ((f32::from(x) - CONTENT_LEFT) / PROG_W).clamp(0., 1.);
+        let ratio = {
+            let saved = self.prog_rect.lock().ok().and_then(|v| *v);
+            let (left, _y, w, _h) = saved.unwrap_or((CONTENT_LEFT, 0., PROG_W, 0.));
+            ((f32::from(x) - left) / w.max(1.)).clamp(0., 1.)
+        };
         self.store.update(cx, |s, _| {
             let target = ratio as f64 * s.player.duration;
             s.seeking = true;
             s.seek_target = target;
             s.player.position = target;
+        });
+        cx.notify();
+    }
+
+    /// 松手：把 UI 目标提交给音频引擎。
+    ///
+    /// 这里必须同时把 `s.seeking` 复位 —— 之前漏了这一步，`smooth_pos` 会永远
+    /// 返回 `seek_target`，第一次点过进度条之后进度条和歌词就再也不动了。
+    fn commit_seek(&mut self, cx: &mut Context<Self>) {
+        if !self.seeking {
+            return;
+        }
+        self.seeking = false;
+        self.store.update(cx, |s, cx| {
+            s.seeking = false;
+            s.engine.seek(s.seek_target);
+            cx.notify();
         });
         cx.notify();
     }
@@ -594,7 +705,7 @@ impl Render for LiteView {
             (
                 s.player.current().cloned(),
                 s.player.playing,
-                s.player.position,
+                smooth_pos(&s, s.player.playing),
                 s.player.duration,
                 ses.userid != 0,
                 ses.nickname.clone(),
@@ -614,6 +725,15 @@ impl Render for LiteView {
         };
         // 任务栏缩略图工具栏的按钮状态（播放/暂停、红心）跟着走；内部去重，每帧调也安全
         crate::taskbar::sync(playing, fav);
+        // 窗口标题 = 当前歌曲：任务栏悬停提示 / Alt-Tab 里都能看到在放什么
+        let title = match &song {
+            Some(c) if !c.title.is_empty() => format!("{} - {}", c.title, c.artist),
+            _ => "EchoMusic Lite".to_string(),
+        };
+        if title != self.title_cache {
+            self.title_cache = title.clone();
+            window.set_window_title(&title);
+        }
         let bars = Bars::from_settings(&self.store.read(cx).settings.get().lite_bar);
         // 自检钩子：`ECHO_SMOKE=half` 把进度钉在 50%，用来截图比对三种进度条形态
         let ratio = if std::env::var("ECHO_SMOKE").ok().as_deref() == Some("half") {
@@ -626,7 +746,6 @@ impl Render for LiteView {
         // 波浪相位只在播放时前进，暂停即冻结
         self.advance_phase(playing);
         let phase = self.phase;
-        let phase_step = (phase / 6.0).floor() as i32;
         let hovered = self.hovered;
         let hover_cover = self.hover_cover;
         // panel = 正在显示的内容（收起动画期间仍是旧面板）
@@ -657,7 +776,8 @@ impl Render for LiteView {
             .child(crate::ui::icon("icons/close.svg", 13., theme.text_secondary));
 
         let avatar_btn = {
-            let active = shown == Panel::Account || shown == Panel::Login;
+            // 收藏面板是从账号面板进去的子页，图标也要保持高亮，不能变灰
+            let active = matches!(shown, Panel::Account | Panel::Login | Panel::Fav);
             let tint = if active {
                 theme.accent
             } else {
@@ -892,7 +1012,26 @@ impl Render for LiteView {
                 move |el| el.text_color(c)
             })
             .on_click(cx.listener(|v: &mut LiteView, _, window, cx| {
-                v.fav_mode = !v.fav_mode;
+                // 切模式 = 换队列重新放：
+                //   切到收藏 → 清空队列，把全部收藏随机播一遍
+                //   切到 FM   → 回到默认口味（fm_pool=0），清空队列拉一批新的
+                let to_fav = !v.fav_mode;
+                let ok = if to_fav {
+                    crate::ui::play_favorites_shuffled(&v.store, cx)
+                } else {
+                    v.store.update(cx, |s, _| {
+                        s.fm_pool = 0;
+                        s.fm_cur_mark = 0;
+                    });
+                    crate::actions::fm_extend(&v.store, cx);
+                    true
+                };
+                if !ok {
+                    // 没有收藏可放：留在原来的模式
+                    cx.notify();
+                    return;
+                }
+                v.fav_mode = to_fav;
                 // 队列面板开着就同步换源（标题里的 FM / 收藏 也会跟着变）
                 if v.shown_panel() == Panel::Queue {
                     v.set_panel(Panel::Queue, window, cx);
@@ -926,8 +1065,6 @@ impl Render for LiteView {
             // 内容整体上抬 7.5：给底下那条波浪线留呼吸位
             .pb(px(15.))
             .when(!hovered, |el| {
-                // 宽度跟着文字走（最多铺满 meta）：hover 判定要的正是「歌名 / 歌手」这一块
-                let rect = self.meta_rect.clone();
                 el.child(
                     div()
                         .relative()
@@ -937,27 +1074,6 @@ impl Render for LiteView {
                         .flex_col()
                         .justify_center()
                         .gap(px(1.))
-                        // 记录这一块的真实矩形（逻辑坐标），hover 轮询按它判定
-                        .child(
-                            canvas(
-                                move |b: Bounds<Pixels>, _, _| {
-                                    if let Ok(mut g) = rect.lock() {
-                                        *g = Some((
-                                            f32::from(b.origin.x),
-                                            f32::from(b.origin.y),
-                                            f32::from(b.size.width),
-                                            f32::from(b.size.height),
-                                        ));
-                                    }
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .left(px(0.))
-                            .top(px(0.))
-                            .right(px(0.))
-                            .bottom(px(0.)),
-                        )
                         .child(
                             div()
                                 .text_size(px(15.))
@@ -1146,6 +1262,10 @@ impl Render for LiteView {
             .w(px(PROG_W))
             .h(px(PROG_H))
             .cursor_pointer()
+            // 必须 occlude：进度条不带的话，按下会一起落到最底层那张拖动层上，
+            // `start_drag` 直接进系统的窗口移动循环，mouse-up 被系统吃掉 ——
+            // 表现就是「点了进度条没反应 / 拖不动 / 松手不生效」。
+            .occlude()
             .child(
                 // 上下各多出来的点击热区
                 div()
@@ -1156,8 +1276,19 @@ impl Render for LiteView {
                     .bottom(px(-PROG_TAIL))
                     .child({
                         let th = theme.clone();
+                        let rect = self.prog_rect.clone();
                         canvas(
-                            |_, _, _| {},
+                            move |b: Bounds<Pixels>, _, _| {
+                                // 记下热区真实矩形：拖拽时按它把鼠标 x 换算成比例
+                                if let Ok(mut g) = rect.lock() {
+                                    *g = Some((
+                                        f32::from(b.origin.x),
+                                        f32::from(b.origin.y),
+                                        f32::from(b.size.width),
+                                        f32::from(b.size.height),
+                                    ));
+                                }
+                            },
                             move |bounds: Bounds<Pixels>, _, window, _| {
                                 paint_bars(window, bounds, ratio, phase, &th, bars);
                             },
@@ -1166,10 +1297,10 @@ impl Render for LiteView {
                     }),
             )
             .when(bars == Bars::Nyan, |el| {
-                // 猫头：右缘随进度走，0% 时停在 30px，100% 时贴右端
-                let x = ((ratio * PROG_W).max(30.) - 26.).max(0.);
-                // GIF 里猫是两帧交替、上下颠 1px 的；相位走一格跳一次
-                let bob = (phase_step.rem_euclid(2)) as f32 * 1.2;
+                // 猫头：往前压住彩虹末端（右缘超进度 6px），0% 时停在 30px
+                let x = ((ratio * PROG_W).max(30.) - NYAN_CAT_LEAD).max(0.);
+                // 上下颠：每走 NYAN_BOB_STEP 相位（约 0.75s）换一帧
+                let bob = (((phase / NYAN_BOB_STEP).floor() as i32) & 1) as f32 * 1.2;
                 el.child(
                     img("lite/nyan-cat.png")
                         .absolute()
@@ -1179,28 +1310,40 @@ impl Render for LiteView {
                         .h(px(20.)),
                 )
             })
+            // 只挂 down：move / up 交给最上层那张「拖拽捕获层」。
+            // gpui 0.2.2 的 `on_mouse_move`/`on_mouse_up` 要求 hitbox 仍处于 hover，
+            // 挂在这条 9px 高的细条上，指针一拖出边界事件就断了（松手也收不到）。
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|v: &mut LiteView, ev: &MouseDownEvent, _, cx| {
                     v.seeking = true;
                     v.seek_to(ev.position.x, cx);
                 }),
-            )
-            .on_mouse_move(
-                cx.listener(|v: &mut LiteView, ev: &MouseMoveEvent, _, cx| {
-                    if v.seeking && ev.pressed_button == Some(MouseButton::Left) {
-                        v.seek_to(ev.position.x, cx);
-                    }
-                }),
-            )
+            );
+
+        // ---------- 拖拽捕获层 ----------
+        // 铺满整个窗口、且**不带** occlude：
+        //   - 它是最前面的 hitbox，所以指针跑到哪儿 move/up 都还落在它身上
+        //     （拖出进度条、甚至拖到面板上都不会断）；
+        //   - 不带 occlude 就不会把下面的按钮/封面挡掉，hover 高亮与点击照旧。
+        let seek_layer = div()
+            .id("lite-seek-layer")
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .on_mouse_move(cx.listener(|v: &mut LiteView, ev: &MouseMoveEvent, _, cx| {
+                if v.seeking && ev.pressed_button == Some(MouseButton::Left) {
+                    v.seek_to(ev.position.x, cx);
+                }
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|v: &mut LiteView, _, _, cx| {
-                    if v.seeking {
-                        v.seeking = false;
-                        v.store.update(cx, |s, _| s.engine.seek(s.seek_target));
-                        cx.notify();
-                    }
+                    // 拖拽期间只更新 UI 目标，这里才真正 seek 一次
+                    // （连续 seek 会阻塞音频控制线程并产生杂音）
+                    v.commit_seek(cx);
                 }),
             );
 
@@ -1259,13 +1402,64 @@ impl Render for LiteView {
                         .child(b),
                 )
             })
+            // 放在最后 = 最前面，专门接住进度条的拖拽 / 松手
+            .child(seek_layer)
             .into_any_element()
     }
 }
 
 // ==================== 进度条绘制 ====================
 
-/// 三种形态都在同一块 canvas 里画（波浪 / 普通胶囊 / 彩虹 + 猫）。
+/// 画一条**直角**横条（「正常」形态：不要圆角）。
+///
+/// 逐行按覆盖率给 alpha：中线常常落在半像素上（槽高 9 + 条高 3 会算出 .5 的 y），
+/// 直接丢一个带小数的 y 画整块 quad，上下边界会糊成两条半透明的脏边。
+/// 右端同理，按小数部分的覆盖率给最后一列 alpha，末端才不会一格一格跳。
+fn paint_bar_square(
+    window: &mut Window,
+    x0: Pixels,
+    y0: Pixels,
+    w: f32,
+    h: f32,
+    color: Hsla,
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let yf = f32::from(y0);
+    let r0 = yf.floor() as i32;
+    let r1 = (yf + h).ceil() as i32;
+    for r in r0..r1 {
+        // 这一行被条覆盖的竖直比例
+        let cov = ((yf + h).min((r + 1) as f32) - yf.max(r as f32)).clamp(0.0, 1.0);
+        if cov <= 0.01 {
+            continue;
+        }
+        let body = w.floor();
+        if body > 0.01 {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(x0, y0 + px(r as f32 - yf)),
+                    size(px(body), px(1.)),
+                ),
+                color.opacity(cov),
+            ));
+        }
+        // 右端的半透明像素（宽度非整数时）
+        let tail = w - body;
+        if tail > 0.01 {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(x0 + px(body), y0 + px(r as f32 - yf)),
+                    size(px(1.), px(1.)),
+                ),
+                color.opacity(cov * tail),
+            ));
+        }
+    }
+}
+
+/// 三种形态都在同一块 canvas 里画（波浪 / 正常直角条 / 彩虹 + 猫）。
 fn paint_bars(
     window: &mut Window,
     bounds: Bounds<Pixels>,
@@ -1286,91 +1480,85 @@ fn paint_bars(
     let center = h - PROG_TAIL - PROG_H / 2.0;
     match bars {
         Bars::Plain => {
-            let bar_h = 4.0;
-            let top = y0 + px(center - bar_h / 2.0);
-            window.paint_quad(
-                fill(
-                    Bounds::new(point(x0, top), size(px(w), px(bar_h))),
-                    theme.progress_track,
-                )
-                .corner_radii(Corners::all(px(2.))),
-            );
+            // 普通形态：一条直角细条（比波浪更窄，也不要圆角）。
+            //
+            // 3px 高、两端切平；逐行 / 逐列按覆盖率给 alpha，半像素的中线也能画出
+            // 干净的边界，不会糊出两条半透明脏边。
+            let bar_h = 3.0;
+            let top = center - bar_h / 2.0;
+            paint_bar_square(window, x0, y0 + px(top), w, bar_h, theme.progress_track);
             let fw = w * ratio;
-            if fw > 0.5 {
-                window.paint_quad(
-                    fill(
-                        Bounds::new(point(x0, top), size(px(fw), px(bar_h))),
-                        theme.accent,
-                    )
-                    .corner_radii(Corners::all(px(2.))),
-                );
+            if fw > 0.2 {
+                paint_bar_square(window, x0, y0 + px(top), fw, bar_h, theme.accent);
             }
         }
         Bars::Wave => {
             // 正弦波：周期 26、振幅 ±1.5、线宽 1.5（= 原型 SVG 路径 + 1.5px 描边）。
             //
-            // gpui 没有描边路径，只能拿小方块拼曲线。这里按**列**画：每一列取左右
-            // 边界处的正弦值，把这一列的竖直包络（|Δy| + 线宽）一次填满 —— 相邻列
-            // 首尾相接，既没有缝也没有 0.8px 小方块错位造成的锯齿。
+            // 抗锯齿：按 1px 的列算竖直包络，再把包络拆到它覆盖的每一行上，
+            // 每行按「覆盖率」给 alpha。行/列之间都不重叠，是真边缘混合 —— 之前
+            // 一根根 0.5px 小方块逐列画，后画的方块压在先画的上面，台阶永远是硬边。
             let fill_w = w * ratio;
             let y_at = |x: f32| {
                 center - WAVE_AMP * (((x - phase) / WAVE_PERIOD) * std::f32::consts::TAU).sin()
             };
-            // 步长 0.5：纵向台阶从 1px 降到 0.5px，边缘交给渲染器的 AA 混合，
-            // 在 330×70 这种小尺寸下才不至于看着像「方波」。
             let mut x = 0.0;
             while x < w {
-                let xr = (x + 0.5).min(w);
-                let ya = y_at(x);
-                let yb = y_at(xr);
-                let top = ya.min(yb) - WAVE_THICK / 2.0;
-                let bot = ya.max(yb) + WAVE_THICK / 2.0;
+                let xr = (x + 1.0).min(w);
+                let top = y_at(x).min(y_at(xr)) - WAVE_THICK / 2.0;
+                let bot = y_at(x).max(y_at(xr)) + WAVE_THICK / 2.0;
                 let mid = (x + xr) / 2.0;
-                let mut color = if mid < fill_w {
+                let mut base = if mid < fill_w {
                     theme.accent
                 } else {
                     theme.progress_track
                 };
+                // 末端 12px 柔化（原型用 mask 渐变收口）
                 if mid < fill_w {
-                    // 末端 12px 柔化（原型用 mask 渐变收口）
-                    let fade = fill_w - 12.0;
-                    if mid > fade {
-                        let t = ((mid - fade) / 12.0).clamp(0.0, 1.0);
-                        color = color.opacity(1.0 - t * 0.85);
+                    let edge = fill_w - 12.0;
+                    if mid > edge {
+                        let t = ((mid - edge) / 12.0).clamp(0.0, 1.0);
+                        base = base.opacity(1.0 - t * 0.85);
                     }
                 }
-                window.paint_quad(
-                    fill(
+                let r0 = top.floor() as i32;
+                let r1 = bot.ceil() as i32;
+                for r in r0..r1 {
+                    let cov = (bot.min((r + 1) as f32) - top.max(r as f32)).clamp(0.0, 1.0);
+                    if cov <= 0.02 {
+                        continue;
+                    }
+                    window.paint_quad(fill(
                         Bounds::new(
-                            point(x0 + px(x), y0 + px(top)),
-                            size(px(xr - x + 0.30), px(bot - top)),
+                            point(x0 + px(x), y0 + px(r as f32)),
+                            size(px(xr - x), px(1.)),
                         ),
-                        color,
-                    )
-                    // 带一点圆角才会走 SDF 抗锯齿分支：纯直角 quad 是硬边，
-                    // 0.5px 的纵向差会原样变成一级级台阶（这就是「锯齿」的来源）。
-                    .corner_radii(px(0.6)),
-                );
-                x += 0.5;
+                        base.opacity(cov),
+                    ));
+                }
+                x += 1.0;
             }
         }
         Bars::Nyan => {
             // 参考 GIF：6 条横带（红橙黄绿蓝紫）拼成的彩虹尾巴跟在像素猫后面。
-            // 每一帧整条带子的「阶梯」向左挪一点 —— 也就是条纹边界按列错位半像素，
-            // 错位方向每 `NYAN_BLOCK` 换一次，看着就是彩虹在流动。
+            //
+            // 这里是**整条连续**的直条带，不再按块做台阶错位 —— 横带的颜色沿 x 方向
+            // 平移本来就看不出来，之前为了让"有流动感"加的半像素错位，反而把 1.5px 的
+            // 带子错成一段一段（远看就是"彩条断开了"）。现在动效交给猫本身。
+            //
+            // 相邻两条带上下各外扩 0.25px：浮点坐标 + DPI 缩放下，两个正好相接的
+            // quad 之间会漏出亚像素白缝，看着像"彩条之间有线"。
             const RAINBOW: [u32; 6] =
                 [0xFF0000, 0xFFCB00, 0xFEFF00, 0x00AD00, 0x008BFF, 0x8D24FF];
             const STRIPE: f32 = 1.5;
+            /// 相邻 quad 的重叠量（px）：吃掉亚像素缝。
+            const BLEED: f32 = 0.25;
             let band_top = center - STRIPE * 3.0;
             let fill_w = (w * ratio).clamp(0.0, w);
-            // 未播放部分：一条淡灰细线（跟波浪形态一个体量）。
-            // 别用整条 9px 的灰带 —— 在小播放条里太重，像加载进度条。
+            // 未播放部分：一条淡灰细线（跟波浪形态一个体量）
             window.paint_quad(
                 fill(
-                    Bounds::new(
-                        point(x0, y0 + px(center - 1.5)),
-                        size(px(w), px(3.)),
-                    ),
+                    Bounds::new(point(x0, y0 + px(center - 1.5)), size(px(w), px(3.))),
                     theme.progress_track,
                 )
                 .corner_radii(Corners::all(px(1.5))),
@@ -1378,35 +1566,15 @@ fn paint_bars(
             if fill_w < 0.5 {
                 return;
             }
-            // phase 是按波浪速度积分的（px），换成彩虹的速度
-            let np = phase * (NYAN_SPEED / WAVE_SPEED);
-            // 6 条带子 = 7 条分界。首尾固定（带子上/下沿是直线），
-            // 中间 5 条按块错位 ±0.6 → 分界形成一级级台阶，正是 GIF 里那种像素彩虹。
-            let mut bounds = [0.0f32; 7];
-            let mut x = 0.0;
-            while x < fill_w {
-                let xr = (x + 1.0).min(fill_w);
-                let blk = ((x + np) / NYAN_BLOCK).floor() as i32;
-                bounds[0] = band_top;
-                bounds[6] = band_top + STRIPE * 6.;
-                // 一整块内所有分界同向错半像素；块与块之间上下交替 —— 看着就是
-                // 一条整体在「一级级往下/往上」走的像素彩虹。逐条纹各错各的会乱成一团。
-                let d = if blk.rem_euclid(2) == 0 { -0.5 } else { 0.5 };
-                for i in 1..6 {
-                    bounds[i] = band_top + STRIPE * i as f32 + d;
-                }
-                for (i, c) in RAINBOW.iter().enumerate() {
-                    let top = bounds[i];
-                    let bot = bounds[i + 1].max(top + 0.9);
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(x0 + px(x), y0 + px(top)),
-                            size(px(xr - x + 0.35), px(bot - top + 0.1)),
-                        ),
-                        hsla(*c),
-                    ));
-                }
-                x += 1.0;
+            for (i, c) in RAINBOW.iter().enumerate() {
+                let top = band_top + STRIPE * i as f32;
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(x0, y0 + px(top - BLEED / 2.)),
+                        size(px(fill_w + BLEED), px(STRIPE + BLEED)),
+                    ),
+                    hsla(*c),
+                ));
             }
         }
     }
@@ -1578,7 +1746,13 @@ impl LiteView {
     ///
     /// 间距一律用 `ml` 而不是 `gap`：这一行里有 `ml_auto`（计数/按钮靠右），
     /// gpui 0.2.2 里同组 flex 一旦有 auto margin，`gap` 就整排失效。
-    fn head(title: &str, sub: &str, count: &str, theme: &crate::theme::Theme) -> Div {
+    fn head(
+        title: &str,
+        sub: &str,
+        count: &str,
+        theme: &crate::theme::Theme,
+        extra: Option<AnyElement>,
+    ) -> Div {
         let mut el = div()
             .h(px(34.))
             .w_full()
@@ -1613,6 +1787,9 @@ impl LiteView {
                         .text_color(theme.accent)
                         .child(sub.to_string()),
                 );
+        }
+        if let Some(extra) = extra {
+            el = el.child(extra);
         }
         if !count.is_empty() {
             el = el.child(
@@ -1673,7 +1850,9 @@ impl LiteView {
                             .bg(theme.accent)
                             .hover(|el| el.opacity(0.9))
                             .on_click(move |_, _, cx| {
-                                crate::actions::load_fm(&st, true, cx);
+                                // 拉一批新的 FM 并直接开播（只调 `load_fm` 只刷新推荐池，
+                                // 队列还是空的，按钮看着像没反应）
+                                crate::actions::fm_extend(&st, cx);
                             })
                             .child(
                                 div()
@@ -1728,38 +1907,110 @@ impl LiteView {
             .into_any_element()
         };
 
-        // FM 模式下头部右侧多一个「换一批」（只刷新推荐，不打断当前播放）
+        // FM 模式下头部右侧多一个「换一批」：清空队列换下一批，并从新批第一首开始播
+        // （之前只调 `load_fm` 刷新推荐池、队列纹丝不动，所以点了「没反应」）
         let refresh_fm = if fav_mode {
             None
         } else {
             let st = store.clone();
+            let busy = self.store.read(cx).fm_loading;
             Some(
                 div()
                     .id("lite-fm-refresh")
                     .ml_auto()
+                    // 右侧不留内边距：底部列表的时长列右端就在「面板内边距 + 行内边距」那条线上，
+                    // 这里要是也留 6px，文字会比时长往左缩 5~6px（之前就是这么错开的）
                     .h(px(20.))
-                    .px(px(7.))
+                    .pl(px(6.))
+                    .pr(px(0.))
                     .rounded(px(5.))
                     .flex()
                     .flex_shrink_0()
                     .items_center()
-                    .cursor_pointer()
+                    .when(!busy, |el| el.cursor_pointer())
                     .hover({
                         let bg = theme.bg_hover;
                         move |el| el.bg(bg)
                     })
-                    .on_click(move |_, _, cx| crate::actions::load_fm(&st, true, cx))
+                    .on_click(move |_, _, cx| {
+                        if !st.read(cx).fm_loading {
+                            crate::actions::fm_extend(&st, cx);
+                        }
+                    })
                     .child(
                         div()
                             .text_size(px(10.5))
-                            .text_color(theme.text_secondary)
+                            .text_color(if busy {
+                                theme.text_tertiary.opacity(0.5)
+                            } else {
+                                theme.text_secondary
+                            })
                             .child("换一批"),
                     ),
             )
         };
 
+        // FM 推荐来源切换（口味 / 风格 / 探索）—— 就挂在「FM」两个字右边。
+        // 换来源 = 清空当前队列，按新来源重新拉一批并从第一首开播。
+        let fm_tabs = if fav_mode {
+            None
+        } else {
+            let cur_pool = self.store.read(cx).fm_pool;
+            let mut row = div().flex().items_center().flex_shrink_0();
+            for (pool, label) in [(0i64, "口味"), (1, "风格"), (2, "探索")] {
+                let st = store.clone();
+                let on = cur_pool == pool;
+                row = row.child(
+                    div()
+                        .id(SharedString::from(format!("lite-fm-mode-{pool}")))
+                        // 这一行里有 `ml_auto`，`gap` 整排失效，间距直接挂 ml
+                        .ml(px(3.))
+                        .h(px(18.))
+                        .px(px(6.))
+                        .rounded(px(9.))
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .cursor_pointer()
+                        .when(on, |el| el.bg(theme.accent.opacity(0.12)))
+                        .hover({
+                            let bg = theme.bg_hover;
+                            move |el| el.bg(bg)
+                        })
+                        .on_click(move |_, _, cx| {
+                            if st.read(cx).fm_pool == pool {
+                                return;
+                            }
+                            // 换来源：游标一起清，否则服务端会带着旧来源的 cur_mark
+                            st.update(cx, |s, _| {
+                                s.fm_pool = pool;
+                                s.fm_cur_mark = 0;
+                            });
+                            crate::actions::fm_extend(&st, cx);
+                        })
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(if on {
+                                    theme.accent
+                                } else {
+                                    theme.text_tertiary
+                                })
+                                .child(label),
+                        ),
+                );
+            }
+            Some(row.into_any_element())
+        };
+
         let head = {
-            let mut h = Self::head("播放队列", if fav_mode { "收藏" } else { "FM" }, "", &theme);
+            let mut h = Self::head(
+                "播放队列",
+                if fav_mode { "收藏" } else { "FM" },
+                "",
+                &theme,
+                fm_tabs,
+            );
             match refresh_fm {
                 Some(btn) => h = h.child(btn),
                 None => {
@@ -1948,55 +2199,69 @@ impl LiteView {
 
     fn lyric_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.store.read(cx).theme();
-        let (lyric, position, loading) = {
+        let (lyric, loading, playing) = {
             let s = self.store.read(cx);
-            (s.lyric.clone(), s.player.position, s.lyric_loading)
+            (s.lyric.clone(), s.lyric_loading, s.player.playing)
         };
-        let cur = lyric
-            .as_ref()
-            .and_then(|l| l.index_at(position * 1000.0))
-            .unwrap_or(0);
-        let lines: Vec<String> = lyric
-            .as_ref()
-            .map(|l| l.lines.iter().map(|line| line.text.clone()).collect())
-            .unwrap_or_default();
+        let pos_ms = {
+            let s = self.store.read(cx);
+            smooth_pos(&s, playing) * 1000.0
+        };
+        let head = Self::head("歌词", "", "", &theme, None);
 
-        let body = if lines.is_empty() {
-            div()
+        // 只显示**当前这一句**（迷你面板放不下多行，也不要换行时的弹性缩放）。
+        // 逐字注水照旧 —— 那才是卡拉 OK 的观感来源。
+        let body: AnyElement = match lyric.filter(|l| !l.is_empty()) {
+            None => div()
                 .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.text_tertiary)
                 .child(if loading { "歌词加载中…" } else { "暂无歌词" })
-                .into_any_element()
-        } else {
-            let start = cur.saturating_sub(2);
-            let end = (cur + 3).min(lines.len());
-            let mut col = div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .gap(px(8.))
-                .px(px(14.));
-            for i in start..end {
-                let active = i == cur;
-                col = col.child(
+                .into_any_element(),
+            Some(lyric) => {
+                let total = lyric.lines.len();
+                // `Lyric::index_at` 的参数是**秒**（内部自己 ×1000 转毫秒），别喂毫秒
+                let cur = lyric
+                    .index_at(pos_ms / 1000.0)
+                    .unwrap_or(0)
+                    .min(total - 1);
+                let line = &lyric.lines[cur];
+                let cfg =
+                    crate::amll::AmllConfig::new(theme.text_tertiary, theme.accent, px(LYRIC_SIZE));
+                let row = if line.words.is_empty() {
+                    // 没有逐字时间轴（QRC）：整行按主题色显示
                     div()
-                        .w_full()
-                        .truncate()
-                        .text_size(px(if active { 14. } else { 12. }))
-                        .text_color(if active {
-                            theme.accent
-                        } else {
-                            theme.text_tertiary
-                        })
-                        .child(lines[i].clone()),
-                );
+                        .text_size(px(LYRIC_SIZE))
+                        .text_color(theme.accent)
+                        .child(line.text.clone())
+                        .into_any_element()
+                } else {
+                    // 逐字注水，但**不套换行弹性**（`current_line` 会带 spring）
+                    let t_in_line =
+                        pos_ms + lyric.offset_ms as f64 - line.time_ms as f64;
+                    crate::amll::line_with_width(
+                        crate::amll::line_words(line, t_in_line),
+                        &cfg,
+                        None,
+                    )
+                    .into_any_element()
+                };
+
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    // 单行：超长句左右裁掉（不裁会画到窗口外面去，折行又变成两行）
+                    .overflow_hidden()
+                    .child(row)
+                    .into_any_element()
             }
-            col.into_any_element()
         };
 
         div()
@@ -2008,13 +2273,11 @@ impl LiteView {
             .flex_col()
             .px(px(4.))
             .pb(px(6.))
-            .child(Self::head("歌词", "", "", &theme))
+            .child(head)
             .child(body)
             .into_any_element()
     }
-}
 
-impl LiteView {
     fn account_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.store.read(cx).theme();
         let (logged, nickname, vip, vip_end, fav_count) = {
@@ -2186,8 +2449,10 @@ impl LiteView {
             .flex_shrink_0()
             .flex()
             .items_center()
-            .gap(px(7.))
-            .px(px(9.))
+            // 左边：红心 → 左内边距 9（= FAV_ENTRY_PAD）
+            // 右边：数量 + 箭头 → 右内边距同样 9，两列严格对称。
+            // 这一行里有 `ml_auto`，`gap` 会整排失效，间距一律用 `ml`。
+            .px(px(FAV_ENTRY_PAD))
             .rounded(px(6.))
             .cursor_pointer()
             .border_1()
@@ -2214,11 +2479,20 @@ impl LiteView {
                     .text_color(theme.text_tertiary)
                     .child(format!("{fav_count} 首")),
             )
-            .child(crate::ui::icon(
-                "icons/arrow-right.svg",
-                12.,
-                theme.text_tertiary,
-            ));
+            .child(
+                div()
+                    .ml(px(6.))
+                    // 图标是 24 视口的描边图，右端有约 1px 的固有留白，
+                    // 用 -1 的右外边距抵掉，箭头的视觉右边距才和红心的左边距一致
+                    .mr(px(-1.))
+                    .flex()
+                    .items_center()
+                    .child(crate::ui::icon(
+                        "icons/arrow-right.svg",
+                        12.,
+                        theme.text_tertiary,
+                    )),
+            );
 
         // ---------- 主题色 ----------
         const SWATCHES: [u32; 7] =
@@ -2479,7 +2753,13 @@ impl LiteView {
             .flex_col()
             .px(px(4.))
             .pb(px(6.))
-            .child(Self::head("账号", if logged { "已登录" } else { "未登录" }, "", &theme))
+            .child(Self::head(
+                "账号",
+                if logged { "已登录" } else { "未登录" },
+                "",
+                &theme,
+                None,
+            ))
             .child(
                 div()
                     .flex_1()

@@ -1,8 +1,11 @@
 //! EchoMusic 桌面应用入口（gpui）。
 
-// release 构建不弹出控制台窗口；debug 构建保留，方便看日志
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 一律不弹控制台黑窗（自动化截图/冒烟测试时尤其碍事）。
+// debug 构建如果是从终端启动的，`attach_parent_console()` 会挂回父控制台，
+// 日志照旧能看见；从资源管理器/脚本启动则什么都不弹。
+#![windows_subsystem = "windows"]
 
+mod amll;
 mod assets;
 mod icons;
 mod liked;
@@ -61,7 +64,22 @@ fn is_dxgi_probe_noise(record: &log::Record<'_>) -> bool {
     record.level() == log::Level::Error && record.args().to_string().contains("0x887A002D")
 }
 
+/// debug 构建：如果父进程有控制台（终端里 `cargo run`），把 stdout/stderr 接回去。
+///
+/// GUI 子系统的进程不会自己开控制台，所以从资源管理器 / 脚本启动时不会弹黑窗。
+#[cfg(debug_assertions)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn attach_parent_console() {}
+
 fn main() {
+    attach_parent_console();
     ui::init_tokio();
     // 初始化日志：debug 构建默认输出 info+ 到控制台；RUST_LOG 可覆盖；
     // ECHO_LOG_FILE 可把日志重定向到文件（自动化测试用）。
@@ -473,7 +491,7 @@ fn main() {
             if let Ok(target) = std::env::var("ECHO_SMOKE") {
                 let smoke_store = store.clone();
                 cx.spawn(async move |cx: &mut AsyncApp| {
-                    if target == "play" || target == "fm" {
+                    if target == "play" || target == "fm" || target == "seek" {
                         smol::Timer::after(std::time::Duration::from_secs(3)).await;
                         let _ = cx.update(|app| crate::actions::load_fm(&smoke_store, true, app));
                         smol::Timer::after(std::time::Duration::from_secs(4)).await;

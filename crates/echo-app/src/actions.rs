@@ -283,24 +283,175 @@ pub(crate) fn force_logout(s: &mut AppStore, msg: &str) {
 
 pub(crate) fn note_fm_heard(store: &Entity<AppStore>, song: &echo_core::Song, cx: &mut App) {
     let _ = store.update(cx, |s, _| {
-        if !s.player.fm_queue || s.fm_batch.is_empty() {
+        if !s.player.fm_queue {
             return false;
         }
-        // 队列里插了别的歌（非 FM）时不算数
-        if !s.fm_batch.iter().any(|h| h == &song.hash) {
+        // 队列里插了别的歌（非本批 FM）时不算数
+        if !s.fm_batch.is_empty() && !s.fm_batch.iter().any(|h| h == &song.hash) {
             return false;
         }
+        // `fm_batch` 为空（重启还原队列）时也要记：切歌判断靠的就是这份「播过没有」
         s.fm_heard.insert(song.hash.clone());
-        s.fm_batch.iter().all(|h| s.fm_heard.contains(h))
+        !s.fm_batch.is_empty() && s.fm_batch.iter().all(|h| s.fm_heard.contains(h))
     });
 }
 
-/// 私人 FM 这一轮的歌是不是都听过了（切歌时据此决定「清空队列换下一轮」）。
-pub(crate) fn fm_round_finished(s: &AppStore) -> bool {
-    s.player.fm_queue
-        && !s.fm_batch.is_empty()
-        && s.fm_batch.iter().all(|h| s.fm_heard.contains(h))
+/// 这一轮的歌是不是都播过了（据此清空队列换下一轮）。
+///
+/// 不能只看 `next_index()` 有没有值：列表循环播到队尾会绕回第 1 首，
+/// 于是同一批歌被反复重播、永远等不到「换一轮」。
+///
+/// 纯逻辑版本（不依赖 `AppStore`，方便单测）。
+fn fm_queue_exhausted_at(
+    p: &crate::player::PlayerState,
+    heard: &std::collections::HashSet<String>,
+) -> bool {
+    if !p.fm_queue || p.queue.is_empty() {
+        return false;
+    }
+    p.queue.iter().all(|x| heard.contains(&x.hash))
 }
+
+/// FM 的「下一首」：**只在没播过的里面挑**。
+///
+/// - 返回 `None` = 这一轮都播过了 → 调用方去 `fm_extend` 换下一轮；
+/// - 随机模式下也不会挑到已播过的（否则一轮没放完就开始重复）；
+/// - 顺序模式：往后找第一个没播过的，走到队尾就绕回队头继续。
+pub(crate) fn fm_next_index(s: &AppStore) -> Option<usize> {
+    fm_next_index_at(&s.player, &s.fm_heard)
+}
+
+/// `fm_next_index` 的纯逻辑版本（不依赖 `AppStore`，方便单测）。
+fn fm_next_index_at(
+    p: &crate::player::PlayerState,
+    heard: &std::collections::HashSet<String>,
+) -> Option<usize> {
+    let cur = p.index?;
+    if !p.fm_queue || p.queue.is_empty() {
+        return p.next_index();
+    }
+    if p.play_mode == echo_core::PlayMode::Single {
+        // 单曲循环是用户明确要求的重播
+        return Some(cur);
+    }
+    if fm_queue_exhausted_at(p, heard) {
+        return None;
+    }
+    let fresh: Vec<usize> = (0..p.queue.len())
+        .filter(|i| !heard.contains(&p.queue[*i].hash))
+        .collect();
+    if p.play_mode == echo_core::PlayMode::Random {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        return Some(fresh[rng.random_range(0..fresh.len())]);
+    }
+    // 顺序：先看当前之后，走到底了就从队头再挑
+    fresh.iter().copied().find(|i| *i > cur).or(Some(fresh[0]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fm_next_index_at, fm_queue_exhausted_at};
+    use crate::player::PlayerState;
+    use echo_core::Song;
+    use std::collections::HashSet;
+
+    fn song(h: &str) -> Song {
+        Song {
+            hash: h.into(),
+            ..Default::default()
+        }
+    }
+
+    fn state(hashes: &[&str], index: usize) -> PlayerState {
+        PlayerState {
+            queue: hashes.iter().map(|h| song(h)).collect(),
+            index: Some(index),
+            fm_queue: true,
+            ..Default::default()
+        }
+    }
+
+    fn heard(hashes: &[&str]) -> HashSet<String> {
+        hashes.iter().map(|h| h.to_string()).collect()
+    }
+
+    #[test]
+    fn not_exhausted_while_unheard_remain() {
+        assert!(!fm_queue_exhausted_at(&state(&["a", "b", "c"], 0), &heard(&["a"])));
+    }
+
+    #[test]
+    fn exhausted_when_rest_all_heard() {
+        assert!(fm_queue_exhausted_at(
+            &state(&["a", "b", "c"], 1),
+            &heard(&["a", "b", "c"])
+        ));
+    }
+
+    #[test]
+    fn at_tail_with_unheard_head_keeps_playing() {
+        // 手动跳过前两首、播到队尾：队头没听过 → 绕回去继续播，不算换轮
+        assert!(!fm_queue_exhausted_at(&state(&["a", "b", "c"], 2), &heard(&["c"])));
+    }
+
+    #[test]
+    fn at_tail_all_heard_is_exhausted() {
+        assert!(fm_queue_exhausted_at(
+            &state(&["a", "b", "c"], 2),
+            &heard(&["a", "b", "c"])
+        ));
+    }
+
+    #[test]
+    fn non_fm_queue_never_exhausted() {
+        let mut p = state(&["a"], 0);
+        p.fm_queue = false;
+        assert!(!fm_queue_exhausted_at(&p, &heard(&["a"])));
+    }
+
+    #[test]
+    fn next_is_never_a_heard_song() {
+        // 顺序：跳掉已播的 a，取下一个没播过的
+        assert_eq!(
+            fm_next_index_at(&state(&["a", "b", "c"], 0), &heard(&["a"])),
+            Some(1)
+        );
+        // 走到队尾：绕回队头挑没播过的
+        assert_eq!(
+            fm_next_index_at(&state(&["a", "b", "c"], 2), &heard(&["b", "c"])),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn next_in_random_mode_skips_heard() {
+        let mut p = state(&["a", "b", "c", "d"], 0);
+        p.play_mode = echo_core::PlayMode::Random;
+        let h = heard(&["a", "b"]);
+        for _ in 0..40 {
+            let i = fm_next_index_at(&p, &h).expect("还有没播过的");
+            assert!((2..=3).contains(&i), "随机挑到了已播过的 {i}");
+        }
+    }
+
+    #[test]
+    fn next_is_none_when_round_finished() {
+        assert_eq!(
+            fm_next_index_at(&state(&["a", "b"], 1), &heard(&["a", "b"])),
+            None
+        );
+    }
+
+    #[test]
+    fn single_loop_still_repeats() {
+        let mut p = state(&["a", "b"], 1);
+        p.play_mode = echo_core::PlayMode::Single;
+        assert_eq!(fm_next_index_at(&p, &heard(&["a", "b"])), Some(1));
+    }
+}
+
+/// 私人 FM 这一轮的歌是不是都听过了（切歌时据此决定「清空队列换下一轮」）。
 
 /// 私人 FM 换一轮：带着上一轮的 `cur_mark` 再要一批，**清空队列换成新一轮**，
 /// 从新批第一首开始播。
@@ -332,6 +483,7 @@ pub(crate) fn fm_extend(store: &Entity<AppStore>, cx: &mut App) {
         for round in 0..3 {
             let client_c = client.clone();
             let mode_c = mode.clone();
+            let mode_log = mode_c.clone();
             let res = cx
                 .background_executor()
                 .spawn(async move {
@@ -350,9 +502,9 @@ pub(crate) fn fm_extend(store: &Entity<AppStore>, cx: &mut App) {
                         })
                         .collect();
                     log::info!(
-                        "fm extend round {round}: 收到 {} 首，去重后剩 {} 首（cur_mark={mark}）",
-                        total,
-                        fresh.len()
+                        "fm extend round {round}: 收到 {total} 首，去重后剩 {} 首（mode={}, pool={pool}, cur_mark={mark}）",
+                        fresh.len(),
+                        mode_log,
                     );
                     if !fresh.is_empty() {
                         picked = fresh;

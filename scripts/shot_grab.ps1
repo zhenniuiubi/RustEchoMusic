@@ -11,7 +11,9 @@ param(
   # value for ECHO_SMOKE self-test hook (e.g. theme, settings, backdrop-mica)
   [string]$Smoke = "",
   # hover only (no click): "x:y" window-relative coords
-  [string]$Hover = ""
+  [string]$Hover = "",
+  # 1 = 用 PostMessage 直接给窗口投鼠标消息（合成输入被吞掉 / GetCursorPos 失败时）
+  [int]$Post = 0
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -31,6 +33,8 @@ public class G {
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, int extra);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdcBlt, uint nFlags);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wParam, IntPtr lParam);
   public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
   public struct RECT { public int Left, Top, Right, Bottom; }
   public static IntPtr FindAppWindow(uint pid) {
@@ -87,10 +91,25 @@ function MoveTo([int]$sx, [int]$sy) {
 }
 
 if (-not [string]::IsNullOrEmpty($Clicks)) {
+  # warm-up: gpui caches the mouse hit-test, so the very first synthetic click
+  # right after the cursor enters the window can land on the previous hitbox.
+  MoveTo ($ox + [int]($w / 2)) ($oy + 8)
+  Start-Sleep -Milliseconds 400
   foreach ($c in $Clicks.Split("|")) {
     if ($c.Trim() -eq "") { continue }
     $parts = $c.Split(":")
     $x = $ox + [int]$parts[0]; $y = $oy + [int]$parts[1]
+    if ($Post -eq 1) {
+      # 客户区坐标（本来就是，不能再加窗口原点）
+      $cx = [int]$parts[0]; $cy = [int]$parts[1]
+      $lp = [IntPtr](($cy -shl 16) -bor ($cx -band 0xFFFF))
+      [G]::PostMessage($h, 0x0200, [IntPtr]::Zero, $lp) | Out-Null
+      Start-Sleep -Milliseconds 120
+      [G]::PostMessage($h, 0x0201, [IntPtr]1, $lp) | Out-Null
+      Start-Sleep -Milliseconds 80
+      [G]::PostMessage($h, 0x0202, [IntPtr]::Zero, $lp) | Out-Null
+      Start-Sleep -Milliseconds 500
+    } else {
     MoveTo ($x - 12) ($y - 12)
     Start-Sleep -Milliseconds 120
     MoveTo $x $y
@@ -98,7 +117,8 @@ if (-not [string]::IsNullOrEmpty($Clicks)) {
     [G]::mouse_event(0x0002, 0, 0, 0, 0) | Out-Null
     Start-Sleep -Milliseconds 90
     [G]::mouse_event(0x0004, 0, 0, 0, 0) | Out-Null
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 500
+    }
   }
 }
 
@@ -142,7 +162,16 @@ Start-Sleep -Milliseconds $After
 $size = New-Object System.Drawing.Size($w, $ht)
 $bmp = New-Object System.Drawing.Bitmap($w, $ht)
 $g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($ox, $oy, 0, 0, $size)
+try {
+  $g.CopyFromScreen($ox, $oy, 0, 0, $size)
+} catch {
+  # GDI 抓屏偶尔报 "句柄无效"（桌面会话抓不到），退回 PrintWindow。
+  # GPU 合成窗口常常只给到黑图，但至少不会让整条脚本失败。
+  $hdc = $g.GetHdc()
+  [G]::PrintWindow($h, $hdc, 2) | Out-Null
+  $g.ReleaseHdc($hdc)
+  Write-Warning "CopyFromScreen failed -> PrintWindow"
+}
 $g.Dispose()
 $dir = "D:\RustEchoMusic\docs\screenshots"
 if (!(Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
