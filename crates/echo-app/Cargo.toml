@@ -29,6 +29,8 @@ serde_json.workspace = true
 smol.workspace = true
 tokio.workspace = true
 qrcode = { version = "0.14.1", default-features = false }
+# 汉字 → GBK（「我最喜爱」的拼音首字母搜索，纯前端查表）
+encoding_rs = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

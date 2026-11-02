@@ -13,7 +13,9 @@ param(
   # hover only (no click): "x:y" window-relative coords
   [string]$Hover = "",
   # 1 = 用 PostMessage 直接给窗口投鼠标消息（合成输入被吞掉 / GetCursorPos 失败时）
-  [int]$Post = 0
+  [int]$Post = 0,
+  # extra wait after hover (ms) - tooltips need a moment before they pop
+  [int]$HoverWait = 300
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
@@ -33,7 +35,7 @@ public class G {
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, int data, int extra);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr h);
-  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdcBlt, uint nFlags);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdcBlt, uint nFlags);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wParam, IntPtr lParam);
   public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
   public struct RECT { public int Left, Top, Right, Bottom; }
@@ -117,7 +119,7 @@ if (-not [string]::IsNullOrEmpty($Clicks)) {
     [G]::mouse_event(0x0002, 0, 0, 0, 0) | Out-Null
     Start-Sleep -Milliseconds 90
     [G]::mouse_event(0x0004, 0, 0, 0, 0) | Out-Null
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 500
     }
   }
 }
@@ -125,7 +127,10 @@ if (-not [string]::IsNullOrEmpty($Clicks)) {
 if (-not [string]::IsNullOrEmpty($Hover)) {
   $hp = $Hover.Split(":")
   MoveTo ($ox + [int]$hp[0]) ($oy + [int]$hp[1])
-  Start-Sleep -Milliseconds 300
+  # second pass: the element may only exist after the first move changed the layout
+  Start-Sleep -Milliseconds 400
+  MoveTo ($ox + [int]$hp[0]) ($oy + [int]$hp[1])
+  Start-Sleep -Milliseconds $HoverWait
 }
 
 $rectBefore = "pos=($ox,$oy) size=${w}x${ht} zoomed=$([G]::IsZoomed($h))"

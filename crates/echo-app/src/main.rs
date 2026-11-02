@@ -10,6 +10,7 @@ mod assets;
 mod icons;
 mod liked;
 mod lite;
+mod pinyin;
 mod player;
 mod state;
 mod theme;
@@ -299,6 +300,50 @@ fn main() {
                     });
                 });
             }
+            // ===== 系统托盘（左键叫回播放条；右键：显示/播放暂停/上下曲/退出）=====
+            {
+                let (tray_tx, tray_rx) = std::sync::mpsc::channel::<win::TrayEvent>();
+                win::start_tray(main_hwnd.clone(), tray_tx);
+                let tray_store = store.clone();
+                let tray_win = window;
+                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                    loop {
+                        smol::Timer::after(std::time::Duration::from_millis(200)).await;
+                        loop {
+                            match tray_rx.try_recv() {
+                                Ok(win::TrayEvent::Show) => {
+                                    // 托盘线程已经 ShowWindow 过了，这里补一次激活 + 重绘
+                                    let _ = tray_win.update(cx, |_, window, _cx| {
+                                        window.activate_window();
+                                        window.refresh();
+                                    });
+                                }
+                                Ok(win::TrayEvent::TogglePlay) => {
+                                    let _ = tray_win
+                                        .update(cx, |_, _, cx| ui::toggle_play(&tray_store, cx));
+                                }
+                                Ok(win::TrayEvent::Prev) => {
+                                    let _ = tray_win
+                                        .update(cx, |_, _, cx| ui::prev_track(&tray_store, cx));
+                                }
+                                Ok(win::TrayEvent::Next) => {
+                                    let _ = tray_win.update(cx, |_, _, cx| {
+                                        ui::next_track(&tray_store, false, cx)
+                                    });
+                                }
+                                Ok(win::TrayEvent::Quit) => {
+                                    let _ = cx.update(|app| app.quit());
+                                    return;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+
             // ===== SMTC 系统媒体控制（任务栏悬浮卡片 / 蓝牙耳机播放控件）=====
             // 按键事件经媒体命令通道回主线程
             crate::smtc::start(main_hwnd.load(std::sync::atomic::Ordering::Relaxed));

@@ -10,14 +10,19 @@
 
 use gpui::Window;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER,
     DIB_RGB_COLORS,
+};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture};
@@ -34,6 +39,7 @@ pub fn hwnd(window: &Window) -> Option<HWND> {
 // ==================== 图标 ====================
 
 static ICON: OnceLock<isize> = OnceLock::new();
+static TRAY_ICON: OnceLock<isize> = OnceLock::new();
 
 /// 应用图标（HICON），首次调用时由内嵌 PNG 生成，失败返回 None。
 pub fn app_icon() -> Option<HICON> {
@@ -41,6 +47,34 @@ pub fn app_icon() -> Option<HICON> {
         create_icon(include_bytes!("../assets/icon.png"))
             .map(|h| h as isize)
             .unwrap_or(0)
+    });
+    if raw == 0 {
+        None
+    } else {
+        Some(raw as HICON)
+    }
+}
+
+/// 托盘图标：内嵌的音符 PNG（200×200 描边图）。
+///
+/// 直接按**系统小图标尺寸**（`SM_CXSMICON`，100% DPI 下是 16px）用 Lanczos 缩一次。
+/// 不要塞 32×32 让系统自己缩到 16 —— 二次降采样会把细描边糊成一团灰边。
+pub fn tray_icon() -> Option<HICON> {
+    let raw = *TRAY_ICON.get_or_init(|| {
+        let icon = image::load_from_memory(include_bytes!("../assets/tray.png"))
+            .ok()
+            .map(|img| {
+                let n = unsafe { GetSystemMetrics(SM_CXSMICON) }.clamp(16, 64) as u32;
+                let small = image::imageops::resize(
+                    &img.to_rgba8(),
+                    n,
+                    n,
+                    image::imageops::FilterType::Lanczos3,
+                );
+                rgba_to_icon(n as i32, n as i32, small.as_raw())
+            })
+            .flatten();
+        icon.map(|h| h as isize).unwrap_or(0)
     });
     if raw == 0 {
         None
@@ -144,6 +178,56 @@ pub fn apply_window_icon(window: &Window) {
 }
 
 // ==================== 窗口操作 ====================
+
+/// 把窗口叫回前台（托盘线程用裸 HWND 调用）。
+fn show_window_raw(hwnd_raw: isize) {
+    if hwnd_raw == 0 {
+        return;
+    }
+    let h = hwnd_raw as HWND;
+    unsafe {
+        if IsIconic(h) != 0 {
+            ShowWindow(h, SW_RESTORE);
+        }
+        ShowWindow(h, SW_SHOW);
+        SetForegroundWindow(h);
+    }
+}
+
+/// 收进托盘：只隐藏，不销毁（窗口与 gpui 状态都留着，点托盘立刻回来）。
+pub fn hide_window(window: &Window) {
+    if let Some(h) = hwnd(window) {
+        unsafe {
+            ShowWindow(h, SW_HIDE);
+        }
+        log::debug!("hide_window: 收进托盘");
+    }
+}
+
+/// 从托盘回到桌面。
+#[allow(dead_code)]
+pub fn show_window(window: &Window) {
+    if let Some(h) = hwnd(window) {
+        show_window_raw(h as isize);
+    }
+}
+
+/// 窗口是否处于最大化状态（Win+Up / SC_MAXIMIZE / 系统吸附都会置上）。
+pub fn is_maximized(window: &Window) -> bool {
+    match hwnd(window) {
+        Some(h) => unsafe { IsZoomed(h) != 0 },
+        None => false,
+    }
+}
+
+/// 退出最大化（回到普通状态；尺寸由调用方再校正）。
+pub fn restore(window: &Window) {
+    if let Some(h) = hwnd(window) {
+        unsafe {
+            ShowWindow(h, SW_RESTORE);
+        }
+    }
+}
 
 /// 开始拖动窗口（等价于按住系统标题栏）。
 ///
@@ -323,6 +407,251 @@ pub(crate) fn send_cmd(cmd: MediaCmd) {
     if let Some(tx) = MEDIA_TX.get() {
         if let Ok(tx) = tx.lock() {
             let _ = tx.send(cmd);
+        }
+    }
+}
+
+// ==================== 系统托盘 ====================
+
+/// 托盘菜单命令回调消息。
+const WM_APP_TRAY: u32 = WM_APP + 1;
+
+/// 托盘菜单项 id。
+const ID_SHOW: usize = 1;
+const ID_TOGGLE: usize = 2;
+const ID_PREV: usize = 3;
+const ID_NEXT: usize = 4;
+const ID_QUIT: usize = 5;
+
+/// 托盘 → UI 的命令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayEvent {
+    /// 显示并激活主窗口
+    Show,
+    /// 播放 / 暂停
+    TogglePlay,
+    Prev,
+    Next,
+    /// 退出应用
+    Quit,
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+struct TrayShared {
+    /// 主窗口 HWND（UI 线程创建后写入）
+    main: Arc<AtomicIsize>,
+    tx: Mutex<Sender<TrayEvent>>,
+}
+
+static TRAY: OnceLock<TrayShared> = OnceLock::new();
+
+/// 投递托盘事件到主线程。
+fn send(ev: TrayEvent) {
+    if let Some(st) = TRAY.get() {
+        if let Ok(tx) = st.tx.lock() {
+            let _ = tx.send(ev);
+        }
+    }
+}
+
+/// 起一个专用线程建托盘图标 + 跑自己的消息循环。
+///
+/// `main` 是主窗口 HWND 的共享槽位（UI 线程拿到后写入），
+/// 托盘线程只负责转发命令，真正的窗口操作仍在 UI 线程做。
+pub fn start_tray(main: Arc<AtomicIsize>, tx: Sender<TrayEvent>) {
+    let _ = TRAY.set(TrayShared {
+        main,
+        tx: Mutex::new(tx),
+    });
+    let spawned = std::thread::Builder::new()
+        .name("echo-tray".into())
+        .spawn(move || unsafe { tray_thread() });
+    if let Err(e) = spawned {
+        log::warn!("托盘线程启动失败：{e}");
+    }
+}
+
+unsafe fn tray_thread() {
+    let hinst = GetModuleHandleW(std::ptr::null());
+    let class_name = wide("EchoMusicTrayWnd");
+
+    let wc = WNDCLASSW {
+        style: 0,
+        lpfnWndProc: Some(tray_wnd_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinst,
+        hIcon: tray_icon().or_else(app_icon).unwrap_or(std::ptr::null_mut()),
+        hCursor: std::ptr::null_mut(),
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: class_name.as_ptr(),
+    };
+    if RegisterClassW(&wc) == 0 {
+        log::warn!("托盘窗口类注册失败");
+        return;
+    }
+
+    // 隐藏的普通窗口（不用 HWND_MESSAGE：消息专用窗口 EnumWindows 找不到，不利于自测）
+    let hwnd = CreateWindowExW(
+        0,
+        class_name.as_ptr(),
+        wide("EchoMusicTray").as_ptr(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        hinst,
+        std::ptr::null(),
+    );
+    if hwnd.is_null() {
+        log::warn!("托盘窗口创建失败");
+        return;
+    }
+
+    if add_icon(hwnd) {
+        // 英文标记给自动化脚本抓（中文在 PS 里会乱码）
+        log::info!("tray ready wnd={hwnd:p}");
+    } else {
+        log::warn!("托盘图标添加失败");
+    }
+
+    let mut msg: MSG = std::mem::zeroed();
+    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    remove_icon(hwnd);
+}
+
+unsafe fn add_icon(hwnd: HWND) -> bool {
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_APP_TRAY;
+    nid.hIcon = tray_icon().or_else(app_icon).unwrap_or(std::ptr::null_mut());
+    let tip = wide("EchoMusic Lite");
+    let n = tip.len().min(nid.szTip.len());
+    nid.szTip[..n].copy_from_slice(&tip[..n]);
+    Shell_NotifyIconW(NIM_ADD, &nid) != 0
+}
+
+unsafe fn remove_icon(hwnd: HWND) {
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+unsafe fn show_menu(hwnd: HWND) {
+    let menu = CreatePopupMenu();
+    if menu.is_null() {
+        return;
+    }
+    let add = |id: usize, text: &str, flags: MENU_ITEM_FLAGS| {
+        AppendMenuW(menu, flags, id, wide(text).as_ptr());
+    };
+    add(ID_SHOW, "显示播放条", MF_STRING);
+    add(0, "", MF_SEPARATOR);
+    add(ID_TOGGLE, "播放 / 暂停", MF_STRING);
+    add(ID_PREV, "上一首", MF_STRING);
+    add(ID_NEXT, "下一首", MF_STRING);
+    add(0, "", MF_SEPARATOR);
+    add(ID_QUIT, "退出 EchoMusic Lite", MF_STRING);
+
+    let mut pt = POINT { x: 0, y: 0 };
+    GetCursorPos(&mut pt);
+    // 必须先把托盘窗口置前，否则点菜单外面菜单不会消失
+    SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        std::ptr::null(),
+    );
+    DestroyMenu(menu);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+
+    if cmd != 0 {
+        dispatch_cmd(cmd as usize, hwnd);
+    }
+}
+
+/// 执行托盘菜单命令（菜单点击与 WM_COMMAND 共用）。
+unsafe fn dispatch_cmd(cmd: usize, hwnd: HWND) {
+    match cmd {
+        ID_SHOW => {
+            // 托盘线程直接 ShowWindow：UI 线程可能正忙（隐藏后没有渲染帧）
+            let raw = TRAY
+                .get()
+                .map(|s| s.main.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            show_window_raw(raw);
+            send(TrayEvent::Show);
+        }
+        ID_TOGGLE => send(TrayEvent::TogglePlay),
+        ID_PREV => send(TrayEvent::Prev),
+        ID_NEXT => send(TrayEvent::Next),
+        ID_QUIT => {
+            send(TrayEvent::Quit);
+            remove_icon(hwnd);
+            DestroyWindow(hwnd);
+        }
+        _ => {}
+    }
+}
+
+unsafe extern "system" fn tray_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_APP_TRAY => {
+            match (lparam as u32) & 0xFFFF {
+                WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+                    let raw = TRAY
+                        .get()
+                        .map(|s| s.main.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    show_window_raw(raw);
+                    send(TrayEvent::Show);
+                }
+                WM_RBUTTONUP => show_menu(hwnd),
+                _ => {}
+            }
+            0
+        }
+        WM_COMMAND => {
+            // 低 16 位是菜单 id（自动化测试与键盘触发菜单都走这里）
+            dispatch_cmd(wparam & 0xFFFF, hwnd);
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => {
+            // Explorer 重启后会 Broadcast 这个自定义消息，需要重新加图标
+            let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
+            if taskbar_created != 0 && msg == taskbar_created {
+                add_icon(hwnd);
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
     }
 }

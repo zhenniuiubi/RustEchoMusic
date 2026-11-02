@@ -86,14 +86,20 @@ const NYAN_BOB_STEP: f32 = 12.;
 /// 列表滚动条的可拖拽热区宽度（只占右侧一条，不盖住列表行）。
 const SCROLL_STRIP: f32 = 11.;
 
-/// hover 判定区：从歌名/歌手那一块一直铺到收藏按钮左缘 —— 中间这一带
-/// （含文字右侧的空白）鼠标一进来就把文字换成播放控制。
+/// hover 判定区：从歌名文字上沿一直铺到收藏按钮左缘 —— 这一带（含文字右侧的空白）
+/// 鼠标一进来就把文字换成播放控制。
+///
+/// 上边沿从 y=16 开始 —— 上面那条（窗口顶部 → 歌名上沿）**留给拖拽窗口**：
+/// 指针停在那儿不弹控制键，按下去就是系统的窗口移动。
 ///
 /// 纵向只取文字那一条，避开底部的进度槽：指针停在进度条上是要拖它，
 /// 不该顺手把歌名换成控制键。
 const META_ZONE_X: f32 = CONTENT_LEFT - 4.;
-const META_ZONE_Y: f32 = 5.;
-const META_ZONE_H: f32 = 45.;
+const META_ZONE_Y: f32 = 16.;
+const META_ZONE_H: f32 = 34.;
+/// 控制条容器离 meta 顶部的距离：和 `META_ZONE_Y` 对齐，
+/// 容器外（顶部那条）不吃鼠标 → 落在底层拖动层上。
+const CTL_TOP: f32 = 16.;
 
 /// 面板展开 / 收起动画时长（原型 height .42s / 收起 .26s，这里取中间值）。
 const PANEL_ANIM_SECS: f32 = 0.26;
@@ -101,9 +107,10 @@ const PANEL_ANIM_SECS: f32 = 0.26;
 // ==================== 面板高度 ====================
 
 const PANEL_QUEUE_H: f32 = 264.;
-const PANEL_FAV_H: f32 = 264.;
-/// 歌词面板只放一行（head 34 + 一行 56 + 底部 6）。
-const PANEL_LYRIC_H: f32 = 96.;
+/// 收藏面板 = 头部 34 + 搜索行 30 + 列表（比队列多一条搜索栏）
+const PANEL_FAV_H: f32 = 294.;
+/// 歌词面板：head 34 + 当前句 + 下一句（两行）。
+const PANEL_LYRIC_H: f32 = 110.;
 const PANEL_ACC_H: f32 = 244.;
 const PANEL_ACC_GUEST_H: f32 = 82.;
 const PANEL_LOGIN_H: f32 = 196.;
@@ -166,6 +173,36 @@ impl Bars {
     }
 }
 
+/// 迷你工具提示：控制条上模式图标的说明（"FM" / "收藏"）。
+///
+/// gpui 只负责把它画在光标旁边（下方放不下会自动翻到上方 —— 70px 高的播放条里
+/// 正好落在图标上方），气泡本身要自己画。
+struct TipView {
+    text: SharedString,
+    theme: crate::theme::Theme,
+}
+
+impl Render for TipView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(7.))
+            .py(px(2.))
+            .rounded(px(5.))
+            .bg(self.theme.bg_panel)
+            .border_1()
+            .border_color(self.theme.card_border)
+            .shadow(vec![BoxShadow {
+                color: alpha(0x3e4858, 0.28),
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(4.),
+                spread_radius: px(0.),
+            }])
+            .text_size(px(11.))
+            .text_color(self.theme.text)
+            .child(self.text.clone())
+    }
+}
+
 /// 面板展开 / 收起动画：只动窗口高度，内容被窗口裁掉自然「长出来」。
 #[derive(Debug, Clone, Copy)]
 struct PanelAnim {
@@ -176,11 +213,38 @@ struct PanelAnim {
     target: Panel,
 }
 
+/// 「我最喜爱」搜索结果里的一行。
+#[derive(Clone)]
+struct FavRow {
+    /// 在收藏列表里的**原下标** —— 播放要按它 `play_from`，
+    /// 不能用过滤后的位置（否则搜出 3 首时点第 1 首会播成收藏里的第 1 首）。
+    src_ix: usize,
+    song: echo_core::Song,
+    /// 歌名 / 歌手的拼音首字母（ASCII 部分原样保留）
+    title_py: String,
+    artist_py: String,
+    /// 原文（小写）：中文关键词直接命中原名
+    hay: String,
+}
+
+/// 「我最喜爱」的搜索缓存。
+///
+/// 关键词每敲一个字就变，但几百上千首的拼音串不该跟着重算 —— 只有**收藏列表变了**
+/// （长度变化 / 刷新）才重建索引；纯过滤只是在这份索引上做 `contains`。
+struct FavIndex {
+    /// 建索引时的收藏条数
+    src_len: usize,
+    /// 全量索引（按收藏顺序）
+    rows: Vec<FavRow>,
+    /// 上一次的关键词
+    query: String,
+    /// 该关键词的过滤结果（Arc 便于整块交给虚拟列表的闭包）
+    hits: std::sync::Arc<Vec<FavRow>>,
+}
+
 /// Lite 播放条视图（也是这个 app 的唯一窗口）。
 pub struct LiteView {
     store: Entity<AppStore>,
-    /// 置位后本窗口在下一帧自行关闭
-    closed: Arc<AtomicBool>,
     /// 置位后请求激活窗口
     focus: Arc<AtomicBool>,
     /// 窗口 HWND（首帧记录，hover 轮询用）
@@ -217,6 +281,12 @@ pub struct LiteView {
     anim: Option<PanelAnim>,
     /// 上一次写进窗口标题的「歌名 - 歌手」（变了才调一次 set_window_title）
     title_cache: String,
+    /// 「我最喜爱」搜索框的焦点句柄
+    search_focus: FocusHandle,
+    /// 搜索关键词（实时输入）
+    fav_query: String,
+    /// 收藏索引 + 过滤结果缓存
+    fav_index: Option<FavIndex>,
 }
 
 static LITE_WIN: OnceLock<Mutex<Option<WeakEntity<LiteView>>>> = OnceLock::new();
@@ -261,6 +331,9 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
     let window = cx.open_window(
         WindowOptions {
             titlebar: None,
+            // PopUp = 打上 WS_EX_TOOLWINDOW：**不出现在任务栏、不占 Alt-Tab 列表**，
+            // 就是一个浮在桌面上的迷你播放条（托盘 / 任务栏缩略图都不要了）。
+            kind: WindowKind::PopUp,
             // 透明窗口：圆角由根节点画，四角之外透出桌面
             window_background: WindowBackgroundAppearance::Transparent,
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -279,7 +352,6 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
                 cx.observe(&store_c, |_, _, cx| cx.notify()).detach();
                 LiteView {
                     store: store_c.clone(),
-                    closed: Arc::new(AtomicBool::new(false)),
                     focus: Arc::new(AtomicBool::new(false)),
                     hwnd_raw: 0,
                     hovered: false,
@@ -297,6 +369,9 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
                     cur_h: LITE_H,
                     anim: None,
                     title_cache: String::new(),
+                    search_focus: cx.focus_handle(),
+                    fav_query: String::new(),
+                    fav_index: None,
                 }
             })
         },
@@ -338,10 +413,52 @@ pub fn open(store: &Entity<AppStore>, cx: &mut App) -> Option<AnyWindowHandle> {
 /// 远程会话 / CI 里鼠标事件不可用（`GetCursorPos` 会被拒），靠它回归面板高度、
 /// 列表渲染与窗口 resize 这条链路；正常启动时这个任务直接返回。
 fn spawn_smoke_panels(handle: WindowHandle<LiteView>, cx: &mut App) {
-    if std::env::var("ECHO_SMOKE").ok().as_deref() != Some("panel") {
+    let target = std::env::var("ECHO_SMOKE").unwrap_or_default();
+    if target != "panel" && target != "fav" && target != "favsearch" {
         return;
     }
     cx.spawn(async move |cx: &mut AsyncApp| {
+        // 收藏面板 / 搜索回归：开面板 → 打字 → 打印命中数与前几条标题
+        if target == "fav" || target == "favsearch" {
+            smol::Timer::after(std::time::Duration::from_millis(1500)).await;
+            let _ = handle.update(cx, |v: &mut LiteView, window, cx| {
+                v.set_panel(Panel::Fav, window, cx);
+                if target == "favsearch" {
+                    v.fav_query = std::env::var("ECHO_SMOKE_Q").unwrap_or_else(|_| "cdr".into());
+                    // PowerShell 里设空环境变量等于删掉它，所以「空关键词」用 ALL 表示
+                    if v.fav_query == "ALL" {
+                        v.fav_query.clear();
+                    }
+                    // 自检时直接把焦点给搜索框（省掉合成点击的坐标问题）
+                    v.search_focus.focus(window);
+                }
+                v.sync_fav_index(cx);
+                let (n, total, head) = {
+                    let idx = v.fav_index.as_ref();
+                    let n = idx.map(|i| i.hits.len()).unwrap_or(0);
+                    let total = idx.map(|i| i.rows.len()).unwrap_or(0);
+                    let head: Vec<String> = idx
+                        .map(|i| {
+                            i.hits
+                                .iter()
+                                .take(3)
+                                .map(|r| format!("{}/{}", r.song.title, r.song.artist))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (n, total, head)
+                };
+                let b = window.bounds();
+                log::warn!(
+                    "[smoke-fav] q={:?} hits={n}/{total} first={:?} size={}x{}",
+                    v.fav_query,
+                    head,
+                    f32::from(b.size.width),
+                    f32::from(b.size.height)
+                );
+            });
+            return;
+        }
         for (name, panel) in [
             ("queue", Panel::Queue),
             ("lyric", Panel::Lyric),
@@ -452,6 +569,28 @@ fn spawn_hover_poll(weak: WeakEntity<LiteView>, cx: &mut App) {
     .detach();
 }
 
+/// 把窗口尺寸钉回 UI 期望值（宽 330 / 高 = 播放条 + 当前面板）。
+///
+/// 「调整窗口大小」这个能力整个去掉：拖边框倒是拖不动（PopUp 窗口没有
+/// WS_THICKFRAME），但 Win+方向键、系统吸附、Alt+Space →「大小」这些系统级
+/// 操作仍会把窗口拉大/最大化，UI 是固定几何布局，一拉就错位。这里每帧对一次，
+/// 差超过半像素就 `resize` 回来（SetWindowPos 同时会退出最大化状态）。
+fn enforce_window_size(window: &mut Window, want_h: f32) {
+    // 最大化状态单独处理：SetWindowPos 改不动最大化的窗口，得先还原
+    if crate::win::is_maximized(window) {
+        log::debug!("窗口被最大化 → 还原");
+        crate::win::restore(window);
+        window.resize(size(px(LITE_W), px(want_h)));
+        return;
+    }
+    let b = window.bounds();
+    let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
+    if (w - LITE_W).abs() > 0.5 || (h - want_h).abs() > 0.5 {
+        log::debug!("窗口尺寸被外部改动 {w}x{h} → 恢复 {LITE_W}x{want_h}");
+        window.resize(size(px(LITE_W), px(want_h)));
+    }
+}
+
 /// 波浪 / 彩虹猫要连续动，面板开合也要逐帧推高度，所以需要自己的帧泵
 /// （主循环的刷新跟着播放事件走，暂停时就没有了）。
 ///
@@ -461,6 +600,9 @@ fn spawn_anim_pump(handle: WindowHandle<LiteView>, cx: &mut App) {
         let pace = handle
             .update(cx, |v, window, cx| {
                 let animating = v.tick(window, cx);
+                // 窗口尺寸由 UI 独占：面板动画之外任何「变大小」（Win+方向键、
+                // 系统吸附、Alt+Space 的「大小」）都立刻改回来
+                enforce_window_size(window, v.cur_h);
                 if !animating {
                     let s = v.store.read(cx);
                     let bars = Bars::from_settings(&s.settings.get().lite_bar);
@@ -615,6 +757,8 @@ impl LiteView {
 
     /// 换面板：窗口高度做 0.26s 的缓出动画，内容由窗口裁切自然展开 / 收起。
     fn set_panel(&mut self, panel: Panel, window: &mut Window, cx: &mut Context<Self>) {
+        // 换面板先清焦点：搜索框的输入光标不该跟着跑到别的面板/收起后的播放条上
+        window.blur();
         let target_h = LITE_H + self.panel_height(panel, cx);
         // 展开：立刻换成新内容，让它跟着窗口一起长出来；
         // 收起：内容留到高度归零再撤，否则会先看到面板内容一空、再慢慢变矮。
@@ -687,10 +831,6 @@ impl LiteView {
 
 impl Render for LiteView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.closed.swap(false, Ordering::Relaxed) {
-            window.remove_window();
-            return div().into_any_element();
-        }
         if self.focus.swap(false, Ordering::Relaxed) {
             window.activate_window();
         }
@@ -768,10 +908,9 @@ impl Render for LiteView {
                 let bg = theme.bg_hover;
                 move |el| el.bg(bg)
             })
-            .on_click(cx.listener(|v: &mut LiteView, _, _, cx| {
-                // 没有托盘了：关闭即退出（面板高度不必收，进程马上就没了）
-                v.closed.store(true, Ordering::Relaxed);
-                cx.quit();
+            .on_click(cx.listener(|_v: &mut LiteView, _, window, _cx| {
+                // 收进托盘（托盘左键 / 右键「显示播放条」叫回来；退出走托盘菜单）
+                crate::win::hide_window(window);
             }))
             .child(crate::ui::icon("icons/close.svg", 13., theme.text_secondary));
 
@@ -1046,12 +1185,18 @@ impl Render for LiteView {
                     "icons/radio.svg"
                 },
                 13.,
-                if fav_mode {
-                    theme.accent
-                } else {
-                    theme.text_secondary
-                },
-            ));
+                theme.accent,
+            ))
+            // 悬停说明：现在这个图标代表哪个数据源（FM / 收藏）
+            .tooltip({
+                let label: SharedString = if fav_mode { "收藏".into() } else { "FM".into() };
+                let th = theme.clone();
+                move |_window, cx| {
+                    let text = label.clone();
+                    let th = th.clone();
+                    cx.new(|_| TipView { text, theme: th }).into()
+                }
+            });
 
         let meta = div()
             .id("lite-meta")
@@ -1107,12 +1252,16 @@ impl Render for LiteView {
                         .absolute()
                         .left(px(0.))
                         .right(px(0.))
-                        .top(px(0.))
+                        // 容器从 y=16 起：上面那条（歌名上方）不吃鼠标，
+                        // 指针落在那儿按下就是拖窗口（下面那层拖动区接住）
+                        .top(px(CTL_TOP))
                         .bottom(px(0.))
                         .flex()
                         .items_center()
                         .gap(px(4.))
-                        .pb(px(12.))
+                        // 原来 bottom 是 0 + pb(12)，整体上抬 12px 让中心压在 y≈29；
+                        // 现在容器顶下移 16，去掉 pb 后中心会掉到 45，所以补回一半
+                        .pb(px(26.))
                         .occlude()
                         .child(prev_btn)
                         .child(play_btn)
@@ -1152,6 +1301,9 @@ impl Render for LiteView {
         let like_btn = {
             let st = store.clone();
             let cur = song.clone();
+            // 未收藏时的颜色跟「队列」按钮一个色（text_secondary）：
+            // 之前是更浅的 text_tertiary，两颗灰色图标并排看着一深一浅
+            let tint = if fav { theme.accent } else { theme.text_secondary };
             act(
                 "lite-like",
                 crate::ui::icon(
@@ -1161,10 +1313,10 @@ impl Render for LiteView {
                         "icons/heart.svg"
                     },
                     19.,
-                    if fav { theme.accent } else { theme.text_tertiary },
+                    tint,
                 )
                 .into_any_element(),
-                if fav { theme.accent } else { theme.text_tertiary },
+                tint,
             )
             .on_click(move |_, _, cx| {
                 if let Some(s) = cur.clone() {
@@ -1366,7 +1518,7 @@ impl Render for LiteView {
             .child(pin)
             .child(wave);
 
-        let body = self.panel_body(cx);
+        let body = self.panel_body(window, cx);
 
         div()
             .id("lite-root")
@@ -1637,11 +1789,11 @@ fn scroll_wrap(
 }
 
 impl LiteView {
-    fn panel_body(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn panel_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         match self.panel {
             Panel::None => None,
             Panel::Queue => Some(self.queue_panel(cx)),
-            Panel::Fav => Some(self.fav_panel(cx)),
+            Panel::Fav => Some(self.fav_panel(window, cx)),
             Panel::Lyric => Some(self.lyric_panel(cx)),
             Panel::Account => Some(self.account_panel(cx)),
             Panel::Login => Some(self.login_panel(cx)),
@@ -1669,9 +1821,15 @@ impl LiteView {
     ///
     /// `from_favorites` 决定点击行为：队列里点行 = 在当前队列内跳转（`play_index`），
     /// 收藏里点行 = 先把队列换成收藏列表再播（否则会播到队列里同下标的另一首）。
+    ///
+    /// `row_ix` 是列表位置（只用来造元素 id，必须唯一）；
+    /// `label_ix` 是显示的序号；`jump_ix` 是点击后真正要跳到的源下标 ——
+    /// 收藏搜索时这三者不同：过滤后第 1 行可能是收藏里的第 47 首。
     fn list_row(
         store: &Entity<AppStore>,
-        ix: usize,
+        row_ix: usize,
+        label_ix: usize,
+        jump_ix: usize,
         song: &echo_core::Song,
         active: bool,
         from_favorites: bool,
@@ -1679,7 +1837,7 @@ impl LiteView {
     ) -> AnyElement {
         let st = store.clone();
         div()
-            .id(SharedString::from(format!("lite-row-{ix}")))
+            .id(SharedString::from(format!("lite-row-{row_ix}")))
             .h(px(ROW_H))
             .w_full()
             .flex_shrink_0()
@@ -1697,22 +1855,24 @@ impl LiteView {
             // 面板容器上挂着 on_mouse_up（滚动条收尾），子元素的 on_click 拿不到 up
             .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                 if from_favorites {
-                    crate::ui::play_from(&st, crate::ui::PlaySource::Favorites, ix, cx);
+                    crate::ui::play_from(&st, crate::ui::PlaySource::Favorites, jump_ix, cx);
                 } else {
-                    crate::ui::play_index(&st, ix, cx);
+                    crate::ui::play_index(&st, jump_ix, cx);
                 }
             })
             .child(
+                // 序号列固定 26：收藏上千首时三位数（835）在 16px 里会折成两行
                 div()
-                    .w(px(16.))
+                    .w(px(26.))
                     .flex_shrink_0()
+                    .truncate()
                     .text_size(px(11.))
                     .text_color(if active {
                         theme.accent
                     } else {
                         theme.text_tertiary
                     })
-                    .child(format!("{}", ix + 1)),
+                    .child(format!("{}", label_ix + 1)),
             )
             .child(
                 div()
@@ -1895,7 +2055,9 @@ impl LiteView {
                                 } else {
                                     active_ix == Some(ix)
                                 };
-                                Self::list_row(&rows_store, ix, &song, active, fav_mode, &theme)
+                                Self::list_row(
+                                    &rows_store, ix, ix, ix, &song, active, fav_mode, &theme,
+                                )
                             }
                             None => div().h(px(ROW_H)).into_any_element(),
                         }
@@ -2040,14 +2202,103 @@ impl LiteView {
             .into_any_element()
     }
 
-    fn fav_panel(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// 同步「我最喜爱」的搜索索引。
+    ///
+    /// - 收藏条数变了 → 重建全量索引（顺手算好每首的拼音首字母）
+    /// - 关键词变了 → 在索引上做 `contains` 过滤
+    ///
+    /// 只有这两件事发生时才干活：拖动窗口、波浪动画那些每秒几十次的重绘不受影响。
+    fn sync_fav_index(&mut self, cx: &App) {
+        let (src, q) = {
+            let s = self.store.read(cx);
+            (s.favorites_source(), self.fav_query.clone())
+        };
+        let stale = self
+            .fav_index
+            .as_ref()
+            .map(|i| i.src_len != src.len())
+            .unwrap_or(true);
+        if stale {
+            let mut rows = Vec::with_capacity(src.len());
+            for (i, song) in src.iter().enumerate() {
+                let mut title_py = String::new();
+                crate::pinyin::append_initials(&song.title, &mut title_py);
+                let mut artist_py = String::new();
+                crate::pinyin::append_initials(&song.artist, &mut artist_py);
+                rows.push(FavRow {
+                    src_ix: i,
+                    song: song.clone(),
+                    title_py,
+                    artist_py,
+                    hay: format!(
+                        "{} {}",
+                        song.title.to_lowercase(),
+                        song.artist.to_lowercase()
+                    ),
+                });
+            }
+            self.fav_index = Some(FavIndex {
+                src_len: src.len(),
+                rows,
+                // 哨兵：保证下面一定会重建 hits（空关键词也是有效关键词）
+                query: "\u{0}".to_string(),
+                hits: std::sync::Arc::new(Vec::new()),
+            });
+        }
+        let Some(idx) = self.fav_index.as_mut() else {
+            return;
+        };
+        if idx.query == q {
+            return;
+        }
+        let toks: Vec<String> = q.split_whitespace().map(|t| t.to_lowercase()).collect();
+        let mut hits = Vec::new();
+        for row in &idx.rows {
+            // 每个词都要命中（空格分词 = AND）：原文 / 歌名首字母 / 歌手首字母
+            let ok = toks.iter().all(|t| {
+                row.hay.contains(t.as_str())
+                    || row.title_py.contains(t.as_str())
+                    || row.artist_py.contains(t.as_str())
+            });
+            if ok {
+                hits.push(row.clone());
+            }
+        }
+        idx.query = q;
+        idx.hits = std::sync::Arc::new(hits);
+    }
+
+    /// 搜索框里回车：播过滤结果的第一首。
+    fn play_first_fav_hit(&mut self, cx: &mut Context<Self>) {
+        let Some(src_ix) = self
+            .fav_index
+            .as_ref()
+            .and_then(|i| i.hits.first())
+            .map(|r| r.src_ix)
+        else {
+            return;
+        };
+        let st = self.store.clone();
+        crate::ui::play_from(&st, crate::ui::PlaySource::Favorites, src_ix, cx);
+    }
+
+    fn fav_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.store.read(cx).theme();
         let (total, loading) = {
             let s = self.store.read(cx);
             (s.favorites_source().len(), s.remote_liked_loading)
         };
         let store = self.store.clone();
-        let count = total;
+        // 搜索索引 / 过滤（关键词、收藏条数都没变时这里是空操作）
+        self.sync_fav_index(cx);
+        let hits = self
+            .fav_index
+            .as_ref()
+            .map(|i| i.hits.clone())
+            .unwrap_or_default();
+        let count = hits.len();
+        let query = self.fav_query.clone();
+        let searching = !query.trim().is_empty();
 
         let head = div()
             .h(px(34.))
@@ -2094,7 +2345,12 @@ impl LiteView {
                     .flex_shrink_0()
                     .text_size(px(11.))
                     .text_color(theme.text_tertiary)
-                    .child(format!("{total} 首")),
+                    // 搜索时显示命中条数，不搜索时显示收藏总数
+                    .child(if searching {
+                        format!("{count} 首")
+                    } else {
+                        format!("{total} 首")
+                    }),
             )
             // 数量右边的刷新（灰色小按钮）：登录用户重拉云端红心，未登录重读本地
             .child({
@@ -2156,23 +2412,36 @@ impl LiteView {
                 .flex()
                 .items_center()
                 .justify_center()
+                .px(px(10.))
                 .text_size(px(12.))
                 .text_color(theme.text_tertiary)
-                .child("还没有收藏的歌曲，点 ♥ 即可加入")
+                .child(if searching {
+                    "没有找到匹配的歌曲"
+                } else {
+                    "还没有收藏的歌曲，点 ♥ 即可加入"
+                })
                 .into_any_element()
         } else {
             let rows_store = store.clone();
+            let rows = hits.clone();
             uniform_list("lite-fav-list", count, move |range, _w, cx: &mut App| {
                 let theme = rows_store.read(cx).theme();
-                let (cur_key, rows) = {
-                    let st = rows_store.read(cx);
-                    (st.player.current().map(|c| c.key()), st.favorites_source())
-                };
+                let cur_key = rows_store.read(cx).player.current().map(|c| c.key());
                 range
                     .map(|ix| match rows.get(ix) {
-                        Some(song) => {
-                            let active = cur_key.as_deref() == Some(song.key().as_str());
-                            Self::list_row(&rows_store, ix, song, active, true, &theme)
+                        Some(row) => {
+                            let active = cur_key.as_deref() == Some(row.song.key().as_str());
+                            // 序号显示「第几条结果」，点下去按收藏里的**原下标**跳
+                            Self::list_row(
+                                &rows_store,
+                                ix,
+                                ix,
+                                row.src_ix,
+                                &row.song,
+                                active,
+                                true,
+                                &theme,
+                            )
                         }
                         None => div().h(px(ROW_H)).into_any_element(),
                     })
@@ -2181,6 +2450,131 @@ impl LiteView {
             .track_scroll(handle.clone())
             .size_full()
             .into_any_element()
+        };
+
+        // ---------- 搜索行（纯前端：原文 / 拼音首字母，不调任何接口） ----------
+        let search = {
+            let focused = self.search_focus.is_focused(window);
+            let empty = query.is_empty();
+            div()
+                .id("lite-fav-search")
+                .h(px(26.))
+                .mt(px(4.))
+                .mx(px(4.))
+                .px(px(7.))
+                .flex_shrink_0()
+                .rounded(px(6.))
+                .flex()
+                .items_center()
+                .bg(theme.bg_hover)
+                .track_focus(&self.search_focus)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v: &mut LiteView, _, window, cx| {
+                        v.search_focus.focus(window);
+                        // 别让事件继续冒泡到面板根节点（那里会把刚拿到的焦点 blur 掉）
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .on_key_down(
+                    cx.listener(|v: &mut LiteView, ev: &KeyDownEvent, _window, cx| {
+                        let ks = &ev.keystroke;
+                        log::debug!("[search-key] key={:?} char={:?}", ks.key, ks.key_char);
+                        match ks.key.as_str() {
+                            "backspace" => {
+                                if v.fav_query.pop().is_some() {
+                                    v.fav_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                    cx.notify();
+                                }
+                            }
+                            "escape" => {
+                                if !v.fav_query.is_empty() {
+                                    v.fav_query.clear();
+                                    v.fav_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                    cx.notify();
+                                }
+                            }
+                            "enter" => v.play_first_fav_hit(cx),
+                            _ => {
+                                // 带 Ctrl / Alt / Win 的组合键留给快捷键，不当文字吃进来
+                                if ks.modifiers.control || ks.modifiers.platform || ks.modifiers.alt
+                                {
+                                    return;
+                                }
+                                let Some(ch) = ks.key_char.as_deref() else {
+                                    return;
+                                };
+                                let clean: String =
+                                    ch.chars().filter(|c| !c.is_control()).collect();
+                                if clean.is_empty() {
+                                    return;
+                                }
+                                v.fav_query.push_str(&clean);
+                                v.fav_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                cx.notify();
+                            }
+                        }
+                    }),
+                )
+                .child(crate::ui::icon("icons/search.svg", 11., theme.text_tertiary))
+                .child(
+                    // 宽度按内容走（不撑满），光标才能紧跟文字后面；
+                    // 超出面板宽度就截断，别把 ✕ 挤到看不见
+                    div()
+                        .ml(px(5.))
+                        .min_w_0()
+                        .max_w(px(236.))
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(if empty { theme.text_tertiary } else { theme.text })
+                        .child(if empty {
+                            "搜索歌曲 / 歌手".to_string()
+                        } else {
+                            query.clone()
+                        }),
+                )
+                // 光标：只有真聚焦时才画（gpui 没有内建输入框，这里自己画一根竖线）
+                .when(focused, |el| {
+                    el.child(
+                        div()
+                            .ml(px(1.))
+                            .w(px(1.))
+                            .h(px(12.))
+                            .flex_shrink_0()
+                            .bg(theme.accent),
+                    )
+                })
+                .child(div().flex_1())
+                .when(!empty, |el| {
+                    el.child(
+                        div()
+                            .id("lite-fav-search-clear")
+                            .ml(px(4.))
+                            .size(px(15.))
+                            .flex_shrink_0()
+                            .rounded(px(3.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover({
+                                let bg = theme.bg_hover;
+                                move |e| e.bg(bg)
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|v: &mut LiteView, _, window, cx| {
+                                    v.fav_query.clear();
+                                    v.fav_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                    v.search_focus.focus(window);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(crate::ui::icon("icons/close.svg", 9., theme.text_tertiary)),
+                    )
+                })
         };
 
         div()
@@ -2192,7 +2586,19 @@ impl LiteView {
             .flex_col()
             .px(px(4.))
             .pb(px(6.))
+            // 点面板里除搜索框以外的任何地方（列表行、返回、刷新…）都让搜索框失焦：
+            // 光标只在真激活时显示，不然它会在面板里一直闪
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|v: &mut LiteView, _, window, cx| {
+                    if v.search_focus.is_focused(window) {
+                        window.blur();
+                        cx.notify();
+                    }
+                }),
+            )
             .child(head)
+            .child(search)
             .child(scroll_wrap(list, handle, "lite-fav-sb", cx))
             .into_any_element()
     }
@@ -2209,8 +2615,8 @@ impl LiteView {
         };
         let head = Self::head("歌词", "", "", &theme, None);
 
-        // 只显示**当前这一句**（迷你面板放不下多行，也不要换行时的弹性缩放）。
-        // 逐字注水照旧 —— 那才是卡拉 OK 的观感来源。
+        // 显示**两行**：当前这一句（逐字注水）+ 下一句（灰色小字，预告）。
+        // 多行滚动不做 —— 迷你面板就这么高，两行足够跟得上。
         let body: AnyElement = match lyric.filter(|l| !l.is_empty()) {
             None => div()
                 .flex_1()
@@ -2240,8 +2646,7 @@ impl LiteView {
                         .into_any_element()
                 } else {
                     // 逐字注水，但**不套换行弹性**（`current_line` 会带 spring）
-                    let t_in_line =
-                        pos_ms + lyric.offset_ms as f64 - line.time_ms as f64;
+                    let t_in_line = pos_ms + lyric.offset_ms as f64 - line.time_ms as f64;
                     crate::amll::line_with_width(
                         crate::amll::line_words(line, t_in_line),
                         &cfg,
@@ -2250,16 +2655,43 @@ impl LiteView {
                     .into_any_element()
                 };
 
+                // 下一句：跳过空行（间奏那种 `[00:12]` 空文本），只预告真正有字的
+                let next_text = lyric.lines[cur + 1..]
+                    .iter()
+                    .take(3)
+                    .find(|l| !l.text.trim().is_empty())
+                    .map(|l| l.text.clone());
+
                 div()
                     .flex_1()
                     .min_h_0()
                     .px(px(10.))
                     .flex()
+                    .flex_col()
                     .items_center()
                     .justify_center()
-                    // 单行：超长句左右裁掉（不裁会画到窗口外面去，折行又变成两行）
+                    .gap(px(2.))
+                    // 超长句左右裁掉（不裁会画到窗口外面去，折行又变成两行）
                     .overflow_hidden()
-                    .child(row)
+                    .child(
+                        div()
+                            .flex()
+                            .justify_center()
+                            .overflow_hidden()
+                            .child(row),
+                    )
+                    .child(
+                        div()
+                            .h(px(18.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .text_size(px(13.))
+                            .text_color(theme.text_tertiary)
+                            .child(next_text.unwrap_or_default()),
+                    )
                     .into_any_element()
             }
         };

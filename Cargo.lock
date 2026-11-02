@@ -1702,6 +1702,7 @@ dependencies = [
  "echo-api",
  "echo-audio",
  "echo-core",
+ "encoding_rs",
  "env_logger",
  "futures",
  "gpui",
